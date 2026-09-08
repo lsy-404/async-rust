@@ -1,3 +1,5 @@
+mod auth_commands;
+mod oauth;
 mod stt;
 
 use std::{
@@ -78,6 +80,8 @@ impl Default for Settings {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Provider {
+    #[serde(default)]
+    pub auth_method: String,
     pub id: String,
     pub name: String,
     pub base_url: String,
@@ -172,6 +176,16 @@ fn open_database(path: &Path) -> Result<Connection, String> {
       CREATE TABLE IF NOT EXISTS providers(id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, models_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS settings(singleton INTEGER PRIMARY KEY CHECK(singleton=1), json TEXT NOT NULL);") .map_err(|e| e.to_string())?;
     db.execute("INSERT OR IGNORE INTO providers(id,name,base_url,models_json) VALUES('openai','OpenAI','https://api.openai.com/v1','[]')", []).map_err(|e| e.to_string())?;
+    for (id, name, base) in [
+        ("workbuddy", "WorkBuddy", "https://copilot.tencent.com/v2"),
+        ("traecode", "TraeCode", "https://www.trae.ai"),
+    ] {
+        db.execute(
+            "INSERT OR IGNORE INTO providers(id,name,base_url,models_json) VALUES(?,?,?,'[]')",
+            params![id, name, base],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     Ok(db)
 }
 
@@ -283,6 +297,12 @@ fn load_data(state: &AppState) -> Result<AppData, String> {
         let models =
             serde_json::from_str(&models).map_err(|_| format!("提供商 {id} 的模型数据已损坏。"))?;
         providers.push(Provider {
+            auth_method: if oauth::is_oauth(&id) {
+                "oauth"
+            } else {
+                "api-key"
+            }
+            .into(),
             has_key: state.has_key(&id)?,
             id,
             name,
@@ -470,16 +490,18 @@ fn import_material(
 }
 
 #[tauri::command]
-fn save_provider(
-    provider: Provider,
+async fn save_provider(
+    mut provider: Provider,
     api_key: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<Provider, String> {
-    if provider.id.trim().is_empty() || provider.base_url.trim().is_empty() {
-        return Err("提供商 ID 和地址不能为空。".into());
-    };
-    let parsed =
-        url::Url::parse(&provider.base_url).map_err(|_| "提供商地址必须是有效的 HTTP(S) URL。")?;
+    if oauth::is_oauth(&provider.id) {
+        return Err("请通过 OAuth 管理此供应商的授权。".into());
+    }
+    if provider.id.trim().is_empty() || provider.name.trim().is_empty() {
+        return Err("提供商 ID 和名称不能为空。".into());
+    }
+    let parsed = url::Url::parse(provider.base_url.trim()).map_err(|_| "提供商地址无效。")?;
     if !matches!(parsed.scheme(), "http" | "https")
         || parsed.host_str().is_none()
         || !parsed.username().is_empty()
@@ -489,46 +511,108 @@ fn save_provider(
     {
         return Err("提供商地址必须是没有凭据、查询参数或片段的 HTTP(S) 地址。".into());
     }
-    if let Some(key) = api_key {
-        let entry = state.key(&provider.id)?;
-        if key.trim().is_empty() {
-            match entry.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => {}
-                Err(e) => return Err(format!("无法删除系统 API Key：{e}")),
-            }
-        } else {
-            entry
-                .set_password(&key)
-                .map_err(|e| format!("无法写入系统 API Key：{e}"))?;
+    provider.base_url = parsed.as_str().trim_end_matches('/').into();
+    provider.auth_method = "api-key".into();
+    let trimmed = api_key.as_deref().map(str::trim);
+    if let Some(key) = trimmed.filter(|key| !key.is_empty()) {
+        let response = state
+            .client
+            .get(endpoint(&provider.base_url, "models"))
+            .bearer_auth(key)
+            .send()
+            .await
+            .map_err(|_| "无法连接模型供应商，请检查地址和网络。")?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "模型供应商拒绝了密钥验证（HTTP {}）。",
+                response.status().as_u16()
+            ));
+        }
+        let value: Value = response.json().await.map_err(|_| "模型列表格式无效。")?;
+        let values = value
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or("模型列表缺少 data 数组。")?;
+        provider.models = values
+            .iter()
+            .filter_map(|item| item.get("id").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect();
+        provider.models.sort();
+        provider.models.dedup();
+        if provider.models.is_empty() {
+            return Err("此密钥没有可用模型。".into());
         }
     }
-    state.db()?.execute("INSERT INTO providers(id,name,base_url,models_json) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,base_url=excluded.base_url,models_json=excluded.models_json",params![provider.id,provider.name,provider.base_url,serde_json::to_string(&provider.models).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
-    Ok(Provider {
-        has_key: state.has_key(&provider.id)?,
-        ..provider
-    })
+    let entry = state.key(&provider.id)?;
+    let previous = if trimmed.is_some() {
+        match entry.get_password() {
+            Ok(value) => Some(value),
+            Err(keyring::Error::NoEntry) => None,
+            Err(_) => return Err("无法读取系统凭据库。".into()),
+        }
+    } else {
+        None
+    };
+    let mut db = state.db()?;
+    let transaction = db.transaction().map_err(|e| e.to_string())?;
+    transaction.execute("INSERT INTO providers(id,name,base_url,models_json) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,base_url=excluded.base_url,models_json=excluded.models_json",params![provider.id,provider.name,provider.base_url,serde_json::to_string(&provider.models).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
+    if let Some(key) = trimmed {
+        if key.is_empty() {
+            match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => {}
+                Err(_) => return Err("无法删除系统凭据。".into()),
+            }
+        } else {
+            entry.set_password(key).map_err(|_| "无法保存系统凭据。")?;
+        }
+    }
+    if let Err(error) = transaction.commit() {
+        if trimmed.is_some() {
+            if let Some(value) = previous {
+                let _ = entry.set_password(&value);
+            } else {
+                let _ = entry.delete_credential();
+            }
+        }
+        return Err(error.to_string());
+    }
+    provider.has_key = state.has_key(&provider.id)?;
+    Ok(provider)
 }
 #[tauri::command]
 fn delete_provider(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    if id == "openai" {
-        return Err("默认 OpenAI 提供商不能删除。".into());
+    if id == "openai" || oauth::is_oauth(&id) {
+        return Err("内置供应商可移除授权，但不能删除。".into());
+    }
+    let entry = state.key(&id)?;
+    let previous = match entry.get_password() {
+        Ok(value) => Some(value),
+        Err(keyring::Error::NoEntry) => None,
+        Err(_) => return Err("无法读取系统凭据。".into()),
     };
-    state
-        .db()?
+    let mut db = state.db()?;
+    let transaction = db.transaction().map_err(|e| e.to_string())?;
+    transaction
         .execute("DELETE FROM providers WHERE id=?", [&id])
         .map_err(|e| e.to_string())?;
-    match state.key(&id)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(format!("无法删除系统 API Key：{e}")),
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => {}
+        Err(_) => return Err("无法删除系统凭据。".into()),
     }
+    if let Err(error) = transaction.commit() {
+        if let Some(value) = previous {
+            let _ = entry.set_password(&value);
+        }
+        return Err(error.to_string());
+    }
+    Ok(())
 }
+
 fn endpoint(base: &str, suffix: &str) -> String {
-    format!(
-        "{}/{}",
-        base.trim_end_matches('/').trim_end_matches("/v1"),
-        format!("v1/{suffix}").trim_start_matches("v1/v1/")
-    )
+    format!("{}/{suffix}", base.trim_end_matches('/'))
 }
+
 fn provider(state: &AppState, provider_id: &str) -> Result<Provider, String> {
     load_data(state)?
         .providers
@@ -541,6 +625,9 @@ async fn discover_models(
     provider_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<String>, String> {
+    if oauth::is_oauth(&provider_id) {
+        return auth_commands::models(&state, &provider_id).await;
+    }
     let p = provider(&state, &provider_id)?;
     let key = state.api_key(&provider_id)?;
     let url = endpoint(&p.base_url, "models");
@@ -651,6 +738,17 @@ async fn streamed_completion(
     if settings.model.trim().is_empty() {
         return Err("请先选择聊天模型。".into());
     };
+    if oauth::is_oauth(&p.id) {
+        return auth_commands::stream(
+            state,
+            &p.id,
+            &settings.model,
+            messages,
+            cancellation,
+            channel,
+        )
+        .await;
+    }
     let key = state.api_key(&p.id)?;
     let request = state
         .client
@@ -929,6 +1027,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            auth_commands::authorize_oauth,
+            auth_commands::cancel_oauth,
+            auth_commands::remove_oauth,
             load_state,
             create_workspace,
             delete_workspace,

@@ -18,6 +18,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == '/v1/models':
+            if self.headers.get('Authorization') != 'Bearer desktop-fixture-key':
+                self.send_json({'error': {'message': 'Invalid fixture key'}}, 401)
+                return
             self.send_json({'data': [{'id': 'classroom-test'}, {'id': 'whisper-1'}]})
         else:
             self.send_json({'error': {'message': 'Unknown fixture route'}}, 404)
@@ -26,12 +29,6 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(int(self.headers.get('Content-Length', 0)))
         if self.headers.get('Authorization') != 'Bearer desktop-fixture-key':
             self.send_json({'error': {'message': 'Invalid fixture key'}}, 401)
-            return
-        if self.path == '/v1/audio/transcriptions':
-            if b'filename=' not in raw or b'name="model"' not in raw:
-                self.send_json({'error': {'message': 'Missing audio or model'}}, 400)
-                return
-            self.send_json({'text': '课堂转写验收：水在标准大气压下的沸点是100摄氏度。'})
             return
         if self.path != '/v1/chat/completions':
             self.send_json({'error': {'message': 'Unknown fixture route'}}, 404)

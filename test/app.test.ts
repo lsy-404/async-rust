@@ -162,6 +162,26 @@ describe("desktop workbench interactions", () => {
     expect(wrapper.text()).not.toContain("导入 PDF");
   });
 
+  it("saves OAuth model settings without rewriting its secure provider", async () => {
+    data.providers[0] = {
+      ...data.providers[0]!,
+      id: "workbuddy",
+      authMethod: "oauth",
+    };
+    data.settings.providerId = "workbuddy";
+    const wrapper = mountApp();
+    await flushPromises();
+    expect(wrapper.find('input[aria-label="兼容 API 地址"]').exists()).toBe(
+      false,
+    );
+    await buttonWithText(wrapper, "保存设置").trigger("click");
+    await flushPromises();
+    expect(
+      invoke.mock.calls.some(([command]) => command === "save_provider"),
+    ).toBe(false);
+    expect(data.settings.providerId).toBe("workbuddy");
+  });
+
   it("removes a key through model-auth without deleting its provider", async () => {
     const wrapper = mountApp();
     await flushPromises();

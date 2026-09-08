@@ -387,7 +387,7 @@ async function uploadAudio() {
       filters: [
         {
           name: "Audio",
-          extensions: ["wav"],
+          extensions: ["wav", "mp3", "flac", "ogg", "m4a", "aac"],
         },
       ],
     });
@@ -482,7 +482,7 @@ async function toggleRecording() {
 }
 async function saveSettings() {
   try {
-    if (currentProvider.value)
+    if (currentProvider.value && currentProvider.value.authMethod !== "oauth")
       await invoke("save_provider", {
         provider: currentProvider.value,
         apiKey: null,
@@ -976,7 +976,7 @@ onUnmounted(() => {
         @remove-oauth="removeOAuth"
         @refresh-catalog="discover"
         @select-model="selectModel"
-        ><template v-if="authBusy" #footer
+        ><template v-if="authBusy && activeAuthProviderId" #footer
           ><div role="status">{{ authProgress || "正在连接…" }}</div>
           <FluentButton
             tone="danger"
