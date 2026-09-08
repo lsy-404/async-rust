@@ -296,3 +296,26 @@ textarea {
     justify-content: end;
   }
 }
+
+.app-shell {
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.titlebar,
+.panel-header,
+.composer,
+.transcript,
+.summary {
+  flex-shrink: 0;
+}
+.workbench {
+  flex: 1;
+  min-height: 0;
+  height: auto;
+}
+.chat-panel {
+  min-height: 0;
+  overflow: hidden;
+}
