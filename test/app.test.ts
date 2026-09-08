@@ -52,7 +52,6 @@ const state = (): AppData => ({
   settings: {
     providerId: "openai",
     model: "classroom-test",
-    transcriptionModel: "whisper-1",
     theme: "system",
     language: "zh",
   },
@@ -116,6 +115,13 @@ describe("desktop workbench interactions", () => {
     invoke.mockImplementation(
       async (command: string, args?: Record<string, unknown>) => {
         if (command === "load_state") return structuredClone(data);
+        if (command === "stt_status")
+          return {
+            ready: true,
+            modelName: "fixture",
+            modelPath: "/tmp/model",
+            sizeBytes: 1,
+          };
         if (command === "save_provider") {
           const provider = args?.provider as AppData["providers"][number];
           const index = data.providers.findIndex(
@@ -172,6 +178,13 @@ describe("desktop workbench interactions", () => {
   it("renders chat deltas before completion and keeps the user message on stream error", async () => {
     let rejectChat: (cause: Error) => void = () => undefined;
     invoke.mockImplementation((command: string, args?: Record<string, any>) => {
+      if (command === "stt_status")
+        return Promise.resolve({
+          ready: true,
+          modelName: "fixture",
+          modelPath: "/tmp/model",
+          sizeBytes: 1,
+        });
       if (command === "load_state")
         return Promise.resolve(structuredClone(data));
       if (command === "chat") {

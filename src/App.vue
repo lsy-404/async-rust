@@ -20,6 +20,7 @@ import type {
   Session,
   Settings,
   StreamEvent,
+  SttStatus,
   Workspace,
 } from "./types";
 import {
@@ -33,7 +34,6 @@ const md = new MarkdownIt({ html: false, linkify: true, breaks: true });
 const blankSettings: Settings = {
   providerId: "openai",
   model: "",
-  transcriptionModel: "",
   theme: "system",
   language: "zh",
 };
@@ -56,6 +56,15 @@ const summaryLoading = ref(false);
 const summaryStream = ref("");
 const transcriptionLoading = ref(false);
 const authBusy = ref(false);
+const authProgress = ref("");
+const stt = ref<SttStatus>({
+  ready: false,
+  modelName: "本地语音模型",
+  modelPath: "",
+  sizeBytes: 0,
+});
+const sttDownloading = ref(false);
+const sttProgress = ref({ downloaded: 0, total: 0 });
 const settingsOpen = ref(false);
 const authOpen = ref(false);
 const workspaceName = ref("");
@@ -112,22 +121,37 @@ const authProviders = computed<ModelAuthProvider[]>(() =>
     id: provider.id,
     name: provider.name,
     description: provider.baseUrl,
-    authMethods: ["api-key"],
+    authMethods: [provider.authMethod === "oauth" ? "oauth" : "api-key"],
     available: true,
     models: provider.models,
     apiKeyModels: provider.models,
-    apiKeyCredentials: provider.hasKey
-      ? [
-          {
-            id: "primary",
-            label: "API key",
-            healthy: true,
-            enabled: true,
-            weight: 1,
-            models: provider.models,
-          },
-        ]
-      : [],
+    apiKeyCredentials:
+      provider.authMethod !== "oauth" && provider.hasKey
+        ? [
+            {
+              id: "primary",
+              label: "API key",
+              healthy: true,
+              enabled: true,
+              weight: 1,
+              models: provider.models,
+            },
+          ]
+        : [],
+    oauthEnabled: provider.authMethod === "oauth",
+    oauthCredentials:
+      provider.authMethod === "oauth" && provider.hasKey
+        ? [
+            {
+              id: "primary",
+              label: "已连接",
+              healthy: true,
+              enabled: true,
+              weight: 1,
+              models: provider.models,
+            },
+          ]
+        : [],
   })),
 );
 const renderedMessages = computed(
@@ -146,6 +170,7 @@ async function refresh(preferred?: { providerId?: string; model?: string }) {
   error.value = "";
   try {
     data.value = await invoke<AppData>("load_state");
+    stt.value = await invoke<SttStatus>("stt_status");
     if (preferred?.providerId)
       data.value.settings.providerId = preferred.providerId;
     if (preferred?.model !== undefined)
@@ -371,6 +396,30 @@ async function uploadAudio() {
     transcriptionLoading.value = false;
   }
 }
+async function downloadStt() {
+  if (sttDownloading.value || stt.value.ready) return;
+  sttDownloading.value = true;
+  const channel = new Channel<{ downloaded: number; total: number }>();
+  channel.onmessage = (event) => {
+    sttProgress.value = event;
+  };
+  try {
+    stt.value = await invoke<SttStatus>("download_stt_model", {
+      onEvent: channel,
+    });
+  } catch (cause) {
+    report(cause);
+  } finally {
+    sttDownloading.value = false;
+  }
+}
+async function cancelStt() {
+  try {
+    await invoke("cancel_stt_download");
+  } catch (cause) {
+    report(cause);
+  }
+}
 async function toggleRecording() {
   if (
     !session.value ||
@@ -464,6 +513,42 @@ async function saveKey(payload: { providerId: string; apiKey: string }) {
       providerId: data.value.settings.providerId,
       model: data.value.settings.model,
     });
+  } catch (cause) {
+    report(cause);
+  } finally {
+    authBusy.value = false;
+  }
+}
+async function authorizeOAuth(providerId: string) {
+  authBusy.value = true;
+  authProgress.value = "正在打开供应商授权…";
+  const channel = new Channel<{ type: "status" | "url"; text: string }>();
+  channel.onmessage = (event) => {
+    authProgress.value = event.text;
+  };
+  try {
+    await invoke("authorize_oauth", { providerId, onEvent: channel });
+    await refresh();
+  } catch (cause) {
+    report(cause);
+  } finally {
+    authBusy.value = false;
+  }
+}
+async function removeOAuth(providerId: string) {
+  authBusy.value = true;
+  try {
+    await invoke("remove_oauth", { providerId });
+    await refresh();
+  } catch (cause) {
+    report(cause);
+  } finally {
+    authBusy.value = false;
+  }
+}
+async function cancelOAuth(providerId: string) {
+  try {
+    await invoke("cancel_oauth", { providerId });
   } catch (cause) {
     report(cause);
   } finally {
@@ -747,11 +832,35 @@ onUnmounted(() => recorder?.state === "recording" && recorder.stop());
               v-model="data.settings.model"
               label="对话模型"
               :options="modelOptions"
-            /><FluentField
-              v-model="data.settings.transcriptionModel"
-              label="转写模型"
-              placeholder="可选；由供应商决定"
             />
+            <section class="stt-status">
+              <strong>本地语音转写</strong>
+              <p>
+                {{
+                  stt.ready
+                    ? `已就绪：${stt.modelName}`
+                    : "下载本地模型后可离线转写音频，无需 API Key。"
+                }}
+              </p>
+              <progress
+                v-if="sttDownloading"
+                :value="sttProgress.downloaded"
+                :max="sttProgress.total || 1"
+              /><FluentButton
+                v-if="sttDownloading"
+                tone="danger"
+                @click="cancelStt"
+                >取消下载</FluentButton
+              ><FluentButton
+                v-else
+                tone="secondary"
+                :disabled="stt.ready"
+                @click="downloadStt"
+                >{{
+                  stt.ready ? "本地模型已就绪" : "下载本地转写模型"
+                }}</FluentButton
+              >
+            </section>
             <div class="settings-actions">
               <FluentButton tone="secondary" @click="authOpen = true"
                 >连接 API Key</FluentButton
@@ -831,6 +940,9 @@ onUnmounted(() => recorder?.state === "recording" && recorder.stop());
         @close="authOpen = false"
         @add-api-key="saveKey"
         @remove-api-key="removeKey"
+        @authorize-oauth="authorizeOAuth"
+        @reconnect-oauth="authorizeOAuth"
+        @remove-oauth="removeOAuth"
         @refresh-catalog="discover"
         @select-model="selectModel"
       />
