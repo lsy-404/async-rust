@@ -1,6 +1,7 @@
 mod auth_commands;
 mod credential_store;
 mod oauth;
+mod recording;
 mod stt;
 
 use std::{
@@ -108,6 +109,7 @@ pub struct StreamEvent {
 pub struct AppState {
     db_path: PathBuf,
     stt: stt::SttManager,
+    recording: recording::RecordingManager,
     client: reqwest::Client,
     cancellations: Mutex<HashMap<String, CancellationToken>>,
 }
@@ -120,6 +122,7 @@ impl AppState {
             .join("voice-models");
         let state = Self {
             stt: stt::SttManager::new(stt_root),
+            recording: recording::RecordingManager::new(),
             db_path,
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
@@ -1021,6 +1024,59 @@ async fn transcribe_bytes(
     transcribe(&state, &session_id, name, bytes).await
 }
 
+#[tauri::command]
+async fn start_recording(
+    session_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let exists: bool = state
+        .db()?
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?)",
+            [&session_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if !exists {
+        return Err("找不到会话。".into());
+    }
+    if state
+        .cancellations
+        .lock()
+        .map_err(|_| "任务状态不可用。")?
+        .contains_key(&session_id)
+    {
+        return Err("该会话已有任务运行中。".into());
+    }
+    state
+        .recording
+        .start(
+            &session_id,
+            state.db_path.parent().ok_or("本地数据路径无效。")?,
+        )
+        .await
+}
+#[tauri::command]
+async fn stop_recording(
+    session_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let path = state.recording.stop(&session_id).await?;
+    let result = transcribe_audio(session_id, path.to_string_lossy().into_owned(), state).await;
+    let cleanup = tokio::fs::remove_file(&path).await;
+    match result {
+        Ok(text) => {
+            cleanup.map_err(|_| "转写完成，但无法清理临时录音。")?;
+            Ok(text)
+        }
+        Err(error) => Err(error),
+    }
+}
+#[tauri::command]
+async fn cancel_recording(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.recording.cancel().await
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -1055,6 +1111,9 @@ pub fn run() {
             summarize,
             transcribe_audio,
             transcribe_bytes,
+            start_recording,
+            stop_recording,
+            cancel_recording,
             stt_status,
             download_stt_model,
             cancel_stt_download
