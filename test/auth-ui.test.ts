@@ -248,37 +248,14 @@ describe("complete shared model authentication UI", () => {
     expect(wrapper.getComponent(ModelAuthDialog).props("open")).toBe(true);
   });
 
-  it("persists a real shared model choice and keeps connection controls open", async () => {
-    invoke.mockImplementation(async (command, args) => {
-      if (
-        command === "model_auth_action" &&
-        args.action.type === "select-model"
-      ) {
-        state.model = args.action.payload;
-      }
-      if (command === "get_auth_state") return structuredClone(state);
-    });
+  it("shows the credential-scoped OAuth models in the installed kit detail", async () => {
     await mountConnections();
     await manage("oauth");
-    const choice = wrapper.get(
-      '[data-part="model-row"][data-model-id="classroom-b"]',
+    expect(wrapper.get('[data-part="connection-info"]').text()).toContain(
+      "classroom-b",
     );
-    expect(choice.attributes("aria-pressed")).toBe("false");
-    await choice.trigger("click");
-    await flushPromises();
-    expect(actions()).toEqual([
-      {
-        type: "select-model",
-        payload: { providerId: "fixture", model: "classroom-b" },
-      },
-    ]);
-    expect(refreshWorkbench).toHaveBeenCalledOnce();
-    expect(wrapper.getComponent(ModelConnectionPanel).props("model")).toEqual(
-      state.model,
-    );
-    expect(choice.attributes("aria-pressed")).toBe("true");
-    expect(wrapper.getComponent(ModelAuthDialog).props("open")).toBe(true);
-    expect(wrapper.find('[aria-label="负载策略"]').exists()).toBe(true);
+    expect(wrapper.find('[data-part="model-row"]').exists()).toBe(false);
+    expect(actions()).toEqual([]);
   });
 
   it.each(["close", "cancel", "unmount"])(

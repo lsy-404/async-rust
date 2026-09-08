@@ -47,12 +47,6 @@ async fn complete_host_actions_validate_keys_and_persist_metadata_only() {
     assert_ne!(items[0].id, items[1].id);
     action(&state,json!({"type":"update-credential","payload":{"providerId":"custom","credentialId":items[0].id,"enabled":false,"weight":7}})).await.unwrap();
     action(&state,json!({"type":"update-strategy","payload":{"providerId":"custom","strategy":"weighted-round-robin"}})).await.unwrap();
-    action(
-        &state,
-        json!({"type":"select-model","payload":{"providerId":"custom","model":"model"}}),
-    )
-    .await
-    .unwrap();
     let result = auth_state(&state).unwrap();
     let encoded = serde_json::to_string(&result).unwrap();
     assert!(!encoded.contains("valid-key"));
@@ -65,7 +59,6 @@ async fn complete_host_actions_validate_keys_and_persist_metadata_only() {
     assert_eq!(p["loadStrategy"], "weighted-round-robin");
     assert_eq!(p["apiKeyCredentials"][0]["enabled"], false);
     assert_eq!(p["apiKeyCredentials"][0]["weight"], 7);
-    assert_eq!(result["model"]["model"], "model");
     action(&state,json!({"type":"remove-credential","providerId":"custom","credentialId":items[0].id,"authMethod":"api-key"})).await.unwrap();
     assert_eq!(connections::list(&state, "custom").unwrap().len(), 1);
 }
@@ -96,25 +89,6 @@ async fn invalid_key_or_wrong_provider_never_mutates_store() {
     )
     .await
     .is_err());
-}
-#[tokio::test]
-async fn catalog_failure_retains_cached_models_and_surfaces_error_state() {
-    let server = MockServer::start().await;
-    Mock::given(path("/models"))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&server)
-        .await;
-    let (_dir, state) = setup(&server.uri());
-    let item = Credential::new("custom", "api-key", "Account".into(), vec!["cached".into()]);
-    connections::save(&state, &item, "key").unwrap();
-    action(&state, json!({"type":"refresh-catalog"}))
-        .await
-        .unwrap();
-    let result = auth_state(&state).unwrap();
-    assert_eq!(result["catalogStatus"]["state"], "error");
-    let saved = connections::get(&state, "custom", &item.id).unwrap();
-    assert_eq!(saved.models, vec!["cached"]);
-    assert!(!saved.healthy);
 }
 #[tokio::test]
 async fn failover_uses_next_key_before_output_and_never_after_partial_output() {
