@@ -212,19 +212,22 @@ describe("desktop workbench interactions", () => {
       getTracks: () => [{ stop: vi.fn() }],
     } as unknown as MediaStream;
     vi.stubGlobal(
-      "MediaRecorder",
+      "AudioContext",
       class {
-        state = "inactive";
-        mimeType = "audio/webm";
-        ondataavailable?: () => void;
-        onstop?: () => void;
-        constructor(_stream: MediaStream) {}
-        start() {
-          this.state = "recording";
+        sampleRate = 48_000;
+        destination = {};
+        createMediaStreamSource() {
+          return { connect: vi.fn(), disconnect: vi.fn() };
         }
-        stop() {
-          this.state = "inactive";
-          this.onstop?.();
+        createScriptProcessor() {
+          return {
+            connect: vi.fn(),
+            disconnect: vi.fn(),
+            onaudioprocess: undefined,
+          };
+        }
+        close() {
+          return Promise.resolve();
         }
       },
     );
