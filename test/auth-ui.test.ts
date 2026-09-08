@@ -219,7 +219,7 @@ describe("complete shared model authentication UI", () => {
     ]);
   });
 
-  it("forwards OAuth provider toggles, refresh and model selection using the kit host listeners", async () => {
+  it("forwards OAuth provider toggles, refresh and account removal using the kit host listeners", async () => {
     await mountConnections();
     await wrapper.get('[data-part="refresh-connections"]').trigger("click");
     await flushPromises();
@@ -231,13 +231,6 @@ describe("complete shared model authentication UI", () => {
     const row = wrapper.get('[data-part="oauth-credential"]');
     await row.get("button[data-confirmed]").trigger("click");
     await row.get("button[data-confirmed]").trigger("click");
-    await flushPromises();
-    wrapper
-      .getComponent(ModelAuthDialog)
-      .vm.$emit("select-model", {
-        providerId: "fixture",
-        model: "classroom-b",
-      });
     await flushPromises();
     expect(actions()).toEqual([
       { type: "refresh-catalog" },
@@ -251,12 +244,41 @@ describe("complete shared model authentication UI", () => {
         credentialId: "account-first",
         authMethod: "oauth",
       },
+    ]);
+    expect(wrapper.getComponent(ModelAuthDialog).props("open")).toBe(true);
+  });
+
+  it("persists a real shared model choice and keeps connection controls open", async () => {
+    invoke.mockImplementation(async (command, args) => {
+      if (
+        command === "model_auth_action" &&
+        args.action.type === "select-model"
+      ) {
+        state.model = args.action.payload;
+      }
+      if (command === "get_auth_state") return structuredClone(state);
+    });
+    await mountConnections();
+    await manage("oauth");
+    const choice = wrapper.get(
+      '[data-part="model-row"][data-model-id="classroom-b"]',
+    );
+    expect(choice.attributes("aria-pressed")).toBe("false");
+    await choice.trigger("click");
+    await flushPromises();
+    expect(actions()).toEqual([
       {
         type: "select-model",
         payload: { providerId: "fixture", model: "classroom-b" },
       },
     ]);
-    expect(wrapper.getComponent(ModelAuthDialog).props("open")).toBe(false);
+    expect(refreshWorkbench).toHaveBeenCalledOnce();
+    expect(wrapper.getComponent(ModelConnectionPanel).props("model")).toEqual(
+      state.model,
+    );
+    expect(choice.attributes("aria-pressed")).toBe("true");
+    expect(wrapper.getComponent(ModelAuthDialog).props("open")).toBe(true);
+    expect(wrapper.find('[aria-label="负载策略"]').exists()).toBe(true);
   });
 
   it.each(["close", "cancel", "unmount"])(
