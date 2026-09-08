@@ -93,7 +93,7 @@ const sidebarMode = ref<"session" | "knowledge">("session");
 const searchQuery = ref("");
 const activeSessionTab = ref<"chat" | "summary">("chat");
 const sidebarWidth = ref(264);
-const mainPanelWidth = ref(0);
+const mainPanelRatio = ref(0.62);
 const layoutRef = ref<HTMLElement>();
 const transcriptScrollRef = ref<HTMLElement>();
 
@@ -140,6 +140,12 @@ const filteredMaterials = computed(() => {
     item.name.toLowerCase().includes(term),
   );
 });
+const workspaceOptions = computed(() =>
+  workspaces.value.map((workspace) => ({
+    value: workspace.id,
+    label: workspace.name,
+  })),
+);
 const operationBusy = computed(
   () =>
     streaming.value ||
@@ -247,6 +253,19 @@ async function createSession() {
 async function createQuickSession() {
   if (!selectedWorkspaceId.value) return;
   sessionCreateOpen.value = true;
+}
+function selectWorkspace(workspaceId: string) {
+  if (operationBusy.value) return;
+  selectedWorkspaceId.value = workspaceId;
+  if (session.value?.workspaceId !== workspaceId) {
+    selectedSessionId.value = sessions.value[0]?.id ?? "";
+  }
+  selectedMaterialId.value = materials.value[0]?.id ?? "";
+}
+function selectSession(workspaceId: string, sessionId: string) {
+  if (operationBusy.value) return;
+  selectedWorkspaceId.value = workspaceId;
+  selectedSessionId.value = sessionId;
 }
 async function importMaterial() {
   if (!selectedWorkspaceId.value) return;
@@ -483,10 +502,10 @@ function beginResize(event: PointerEvent) {
   if (!layout) return;
   const bounds = layout.getBoundingClientRect();
   const startX = event.clientX;
-  const initial = mainPanelWidth.value || Math.round(bounds.width * 0.62);
+  const initial = Math.round(bounds.width * mainPanelRatio.value);
   const onMove = (move: PointerEvent) => {
     const next = initial + (move.clientX - startX);
-    mainPanelWidth.value = Math.max(360, Math.min(bounds.width - 310, next));
+    mainPanelRatio.value = Math.max(0.42, Math.min(0.7, next / bounds.width));
   };
   const onEnd = () => {
     window.removeEventListener("pointermove", onMove);
@@ -499,9 +518,12 @@ function resizeWithKeyboard(event: KeyboardEvent) {
   if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
   event.preventDefault();
   const width = layoutRef.value?.clientWidth ?? 900;
-  const current = mainPanelWidth.value || Math.round(width * 0.62);
+  const current = Math.round(width * mainPanelRatio.value);
   const delta = event.key === "ArrowLeft" ? -24 : 24;
-  mainPanelWidth.value = Math.max(360, Math.min(width - 310, current + delta));
+  mainPanelRatio.value = Math.max(
+    0.42,
+    Math.min(0.7, (current + delta) / width),
+  );
 }
 async function createProvider() {
   if (!providerName.value.trim() || !providerEndpoint.value.trim()) return;
@@ -523,8 +545,13 @@ async function createProvider() {
   }
 }
 watch(selectedWorkspaceId, () => {
-  if (!operationBusy.value) {
+  if (
+    !operationBusy.value &&
+    session.value?.workspaceId !== selectedWorkspaceId.value
+  ) {
     selectedSessionId.value = sessions.value[0]?.id ?? "";
+  }
+  if (!operationBusy.value) {
     selectedMaterialId.value = materials.value[0]?.id ?? "";
   }
 });
@@ -603,21 +630,25 @@ onUnmounted(() => {
               :key="workspace.id"
               class="workspace-node"
             >
-              <button
-                class="tree-workspace"
-                :class="{ active: workspace.id === selectedWorkspaceId }"
-                :disabled="operationBusy"
-                @click="selectedWorkspaceId = workspace.id"
-              >
-                <span>▾ {{ workspace.name }}</span
-                ><i
-                  @click.stop="
-                    askDelete('workspace', workspace.id, workspace.name)
-                  "
-                  >×</i
+              <div class="tree-row">
+                <button
+                  class="tree-workspace"
+                  :class="{ active: workspace.id === selectedWorkspaceId }"
+                  :disabled="operationBusy"
+                  @click="selectWorkspace(workspace.id)"
                 >
-              </button>
-              <button
+                  ▾ {{ workspace.name }}
+                </button>
+                <FluentButton
+                  class="tree-delete"
+                  tone="subtle"
+                  :disabled="operationBusy"
+                  :aria-label="`删除工作区 ${workspace.name}`"
+                  @click="askDelete('workspace', workspace.id, workspace.name)"
+                  >删除</FluentButton
+                >
+              </div>
+              <div
                 v-for="item in data.sessions.filter(
                   (candidate) =>
                     candidate.workspaceId === workspace.id &&
@@ -625,20 +656,35 @@ onUnmounted(() => {
                       candidate.title.toLowerCase().includes(normalizedSearch)),
                 )"
                 :key="item.id"
-                class="tree-session"
-                :class="{ active: item.id === selectedSessionId }"
-                :disabled="operationBusy"
-                @click="selectedSessionId = item.id"
+                class="tree-row"
               >
-                ▢ {{ item.title
-                }}<i @click.stop="askDelete('session', item.id, item.title)"
-                  >×</i
+                <button
+                  class="tree-session"
+                  :class="{ active: item.id === selectedSessionId }"
+                  :disabled="operationBusy"
+                  @click="selectSession(workspace.id, item.id)"
                 >
-              </button>
+                  ▢ {{ item.title }}
+                </button>
+                <FluentButton
+                  class="tree-delete"
+                  tone="subtle"
+                  :disabled="operationBusy"
+                  :aria-label="`删除会话 ${item.title}`"
+                  @click="askDelete('session', item.id, item.title)"
+                  >删除</FluentButton
+                >
+              </div>
             </section>
           </div>
           <div v-else class="sidebar-tree knowledge-tree">
             <div class="knowledge-head">
+              <FluentSelect
+                v-model="selectedWorkspaceId"
+                label="工作区"
+                :options="workspaceOptions"
+                :disabled="operationBusy"
+              />
               <span>本地材料</span
               ><FluentButton
                 tone="subtle"
@@ -651,15 +697,28 @@ onUnmounted(() => {
             <p v-else-if="!filteredMaterials.length" class="empty">
               导入 TXT、Markdown 或 DOCX 材料。
             </p>
-            <button
+            <div
               v-for="item in filteredMaterials"
               :key="item.id"
-              class="tree-session"
-              :class="{ active: item.id === selectedMaterialId }"
-              @click="selectedMaterialId = item.id"
+              class="tree-row"
             >
-              ▤ {{ item.name }}
-            </button>
+              <button
+                class="tree-session"
+                :class="{ active: item.id === selectedMaterialId }"
+                :disabled="operationBusy"
+                @click="selectedMaterialId = item.id"
+              >
+                ▤ {{ item.name }}
+              </button>
+              <FluentButton
+                class="tree-delete"
+                tone="subtle"
+                :disabled="operationBusy"
+                :aria-label="`删除材料 ${item.name}`"
+                @click="askDelete('material', item.id, item.name)"
+                >删除</FluentButton
+              >
+            </div>
             <template v-if="material"
               ><FluentTextArea
                 v-model="materialDraft"
@@ -702,7 +761,7 @@ onUnmounted(() => {
           ref="layoutRef"
           class="workbench-layout"
           :style="{
-            gridTemplateColumns: `${mainPanelWidth || 'minmax(360px, 1fr)'} 8px minmax(300px, 38%)`,
+            gridTemplateColumns: `minmax(0, ${mainPanelRatio}fr) 8px minmax(0, ${1 - mainPanelRatio}fr)`,
           }"
         >
           <header class="app-header">
@@ -798,7 +857,7 @@ onUnmounted(() => {
             tabindex="0"
             aria-label="调整转写面板宽度"
             aria-orientation="vertical"
-            :aria-valuenow="mainPanelWidth || 0"
+            :aria-valuenow="Math.round(mainPanelRatio * 100)"
             @pointerdown="beginResize"
             @keydown="resizeWithKeyboard"
           ></div>
