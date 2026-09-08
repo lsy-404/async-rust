@@ -138,7 +138,6 @@ describe("desktop workbench interactions", () => {
     );
     expect(invoke).toHaveBeenCalledWith("save_provider", {
       provider: expect.objectContaining({ id: "new-provider" }),
-      apiKey: null,
     });
     expect(wrapper.text()).toContain("TXT、Markdown 或 DOCX");
     expect(wrapper.text()).not.toContain("导入 PDF");

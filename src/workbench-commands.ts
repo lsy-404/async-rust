@@ -10,7 +10,7 @@ export async function saveNewProvider(
   provider: Provider,
   settings: Settings,
 ) {
-  await invoke("save_provider", { provider, apiKey: null });
+  await invoke("save_provider", { provider });
   await invoke("save_settings", {
     settings: { ...settings, providerId: provider.id, model: "" },
   });

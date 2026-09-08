@@ -33,15 +33,3 @@ fn sqlite_cascade_survives_reopen() {
         0
     );
 }
-
-#[test]
-fn sse_delta_handles_unicode_and_errors() {
-    assert_eq!(
-        sse_delta("{\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}").unwrap(),
-        Some("你好".into())
-    );
-    assert!(sse_delta("not-json").is_err());
-    assert!(sse_delta("{\"error\":{\"message\":\"bad\"}}")
-        .unwrap_err()
-        .contains("bad"));
-}

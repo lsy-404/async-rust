@@ -1,4 +1,5 @@
 mod auth_commands;
+mod connections;
 mod credential_store;
 mod oauth;
 mod recording;
@@ -14,8 +15,6 @@ use std::{
 };
 
 use credential_store::Entry;
-use eventsource_stream::Eventsource;
-use futures_util::StreamExt;
 use quick_xml::{events::Event, Reader};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -149,28 +148,6 @@ impl AppState {
         )
         .map_err(|e| format!("本地凭据文件不可用：{e}"))
     }
-    fn has_key(&self, id: &str) -> Result<bool, String> {
-        match self.key(id)?.get_password() {
-            Ok(k) => Ok(!k.trim().is_empty()),
-            Err(credential_store::Error::NoEntry) => Ok(false),
-            Err(e) => Err(format!("无法读取本地 API Key：{e}")),
-        }
-    }
-    fn api_key(&self, id: &str) -> Result<String, String> {
-        self.key(id)?
-            .get_password()
-            .map_err(|e| match e {
-                credential_store::Error::NoEntry => "尚未配置 API Key。".into(),
-                _ => format!("无法读取本地 API Key：{e}"),
-            })
-            .and_then(|v| {
-                if v.trim().is_empty() {
-                    Err("本地 API Key 为空。".into())
-                } else {
-                    Ok(v)
-                }
-            })
-    }
 }
 
 fn open_database(path: &Path) -> Result<Connection, String> {
@@ -196,6 +173,7 @@ fn open_database(path: &Path) -> Result<Connection, String> {
         )
         .map_err(|e| e.to_string())?;
     }
+    connections::initialize(&db)?;
     Ok(db)
 }
 
@@ -313,7 +291,7 @@ fn load_data(state: &AppState) -> Result<AppData, String> {
                 "api-key"
             }
             .into(),
-            has_key: state.has_key(&id)?,
+            has_key: connections::has_credential_db(&db, &id)?,
             id,
             name,
             base_url,
@@ -500,13 +478,12 @@ fn import_material(
 }
 
 #[tauri::command]
-async fn save_provider(
+fn save_provider(
     mut provider: Provider,
-    api_key: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<Provider, String> {
     if oauth::is_oauth(&provider.id) {
-        return Err("请通过 OAuth 管理此供应商的授权。".into());
+        return Err("OAuth 供应商地址由授权适配器管理。".into());
     }
     if provider.id.trim().is_empty() || provider.name.trim().is_empty() {
         return Err("提供商 ID 和名称不能为空。".into());
@@ -523,71 +500,8 @@ async fn save_provider(
     }
     provider.base_url = parsed.as_str().trim_end_matches('/').into();
     provider.auth_method = "api-key".into();
-    let trimmed = api_key.as_deref().map(str::trim);
-    if let Some(key) = trimmed.filter(|key| !key.is_empty()) {
-        let response = state
-            .client
-            .get(endpoint(&provider.base_url, "models"))
-            .bearer_auth(key)
-            .send()
-            .await
-            .map_err(|_| "无法连接模型供应商，请检查地址和网络。")?;
-        if !response.status().is_success() {
-            return Err(format!(
-                "模型供应商拒绝了密钥验证（HTTP {}）。",
-                response.status().as_u16()
-            ));
-        }
-        let value: Value = response.json().await.map_err(|_| "模型列表格式无效。")?;
-        let values = value
-            .get("data")
-            .and_then(Value::as_array)
-            .ok_or("模型列表缺少 data 数组。")?;
-        provider.models = values
-            .iter()
-            .filter_map(|item| item.get("id").and_then(Value::as_str))
-            .map(str::to_owned)
-            .collect();
-        provider.models.sort();
-        provider.models.dedup();
-        if provider.models.is_empty() {
-            return Err("此密钥没有可用模型。".into());
-        }
-    }
-    let entry = state.key(&provider.id)?;
-    let previous = if trimmed.is_some() {
-        match entry.get_password() {
-            Ok(value) => Some(value),
-            Err(credential_store::Error::NoEntry) => None,
-            Err(_) => return Err("无法读取本地凭据文件。".into()),
-        }
-    } else {
-        None
-    };
-    let mut db = state.db()?;
-    let transaction = db.transaction().map_err(|e| e.to_string())?;
-    transaction.execute("INSERT INTO providers(id,name,base_url,models_json) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,base_url=excluded.base_url,models_json=excluded.models_json",params![provider.id,provider.name,provider.base_url,serde_json::to_string(&provider.models).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
-    if let Some(key) = trimmed {
-        if key.is_empty() {
-            match entry.delete_credential() {
-                Ok(()) | Err(credential_store::Error::NoEntry) => {}
-                Err(_) => return Err("无法删除本地凭据。".into()),
-            }
-        } else {
-            entry.set_password(key).map_err(|_| "无法保存本地凭据。")?;
-        }
-    }
-    if let Err(error) = transaction.commit() {
-        if trimmed.is_some() {
-            if let Some(value) = previous {
-                let _ = entry.set_password(&value);
-            } else {
-                let _ = entry.delete_credential();
-            }
-        }
-        return Err(error.to_string());
-    }
-    provider.has_key = state.has_key(&provider.id)?;
+    state.db()?.execute("INSERT INTO providers(id,name,base_url,models_json) VALUES(?,?,?,'[]') ON CONFLICT(id) DO UPDATE SET name=excluded.name,base_url=excluded.base_url",params![provider.id,provider.name,provider.base_url]).map_err(|e|e.to_string())?;
+    provider.has_key = connections::has_credential(&state, &provider.id)?;
     Ok(provider)
 }
 #[tauri::command]
@@ -595,27 +509,13 @@ fn delete_provider(id: String, state: tauri::State<'_, AppState>) -> Result<(), 
     if id == "openai" || oauth::is_oauth(&id) {
         return Err("内置供应商可移除授权，但不能删除。".into());
     }
-    let entry = state.key(&id)?;
-    let previous = match entry.get_password() {
-        Ok(value) => Some(value),
-        Err(credential_store::Error::NoEntry) => None,
-        Err(_) => return Err("无法读取本地凭据。".into()),
-    };
-    let mut db = state.db()?;
-    let transaction = db.transaction().map_err(|e| e.to_string())?;
-    transaction
+    for credential in connections::list(&state, &id)? {
+        connections::remove(&state, &id, &credential.id, &credential.auth_method)?;
+    }
+    state
+        .db()?
         .execute("DELETE FROM providers WHERE id=?", [&id])
         .map_err(|e| e.to_string())?;
-    match entry.delete_credential() {
-        Ok(()) | Err(credential_store::Error::NoEntry) => {}
-        Err(_) => return Err("无法删除本地凭据。".into()),
-    }
-    if let Err(error) = transaction.commit() {
-        if let Some(value) = previous {
-            let _ = entry.set_password(&value);
-        }
-        return Err(error.to_string());
-    }
     Ok(())
 }
 
@@ -635,44 +535,7 @@ async fn discover_models(
     provider_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<String>, String> {
-    if oauth::is_oauth(&provider_id) {
-        return auth_commands::models(&state, &provider_id).await;
-    }
-    let p = provider(&state, &provider_id)?;
-    let key = state.api_key(&provider_id)?;
-    let url = endpoint(&p.base_url, "models");
-    let value: Value = state
-        .client
-        .get(url)
-        .bearer_auth(key)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut models = value
-        .get("data")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|v| v.get("id").and_then(Value::as_str).map(ToOwned::to_owned))
-        .collect::<Vec<_>>();
-    models.sort();
-    models.dedup();
-    state
-        .db()?
-        .execute(
-            "UPDATE providers SET models_json=? WHERE id=?",
-            params![
-                serde_json::to_string(&models).map_err(|e| e.to_string())?,
-                provider_id
-            ],
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(models)
+    auth_commands::models(&state, &provider_id).await
 }
 
 fn session_context(
@@ -714,19 +577,6 @@ fn persist_message(
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())
 }
-fn sse_delta(data: &str) -> Result<Option<String>, String> {
-    if data == "[DONE]" {
-        return Ok(None);
-    }
-    let value: Value = serde_json::from_str(data).map_err(|_| "模型流返回了无效事件。")?;
-    if let Some(message) = value.pointer("/error/message").and_then(Value::as_str) {
-        return Err(format!("模型请求失败：{message}"));
-    }
-    Ok(value
-        .pointer("/choices/0/delta/content")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned))
-}
 fn generation_token(state: &AppState, session_id: &str) -> Result<CancellationToken, String> {
     let mut active = state.cancellations.lock().map_err(|_| "生成状态不可用。")?;
     if active.contains_key(session_id) {
@@ -744,61 +594,15 @@ async fn streamed_completion(
     cancellation: CancellationToken,
 ) -> Result<String, String> {
     let (_, _, settings) = session_context(state, session_id)?;
-    let p = provider(state, &settings.provider_id)?;
-    if settings.model.trim().is_empty() {
-        return Err("请先选择聊天模型。".into());
-    };
-    if oauth::is_oauth(&p.id) {
-        return auth_commands::stream(
-            state,
-            &p.id,
-            &settings.model,
-            messages,
-            cancellation,
-            channel,
-        )
-        .await;
-    }
-    let key = state.api_key(&p.id)?;
-    let request = state
-        .client
-        .post(endpoint(&p.base_url, "chat/completions"))
-        .bearer_auth(key)
-        .json(&json!({"model":settings.model,"messages":messages,"stream":true}));
-    let response = tokio::select! { _ = cancellation.cancelled() => return Ok(String::new()), response = request.send() => response.map_err(|e|e.to_string())? }
-        .error_for_status()
-        .map_err(|e| e.to_string())?;
-    let mut stream = response.bytes_stream().eventsource();
-    let mut answer = String::new();
-    let mut complete = false;
-    while !complete {
-        let next =
-            tokio::select! { _ = cancellation.cancelled() => break, next = stream.next() => next };
-        let Some(next) = next else {
-            break;
-        };
-        let event = next.map_err(|e| e.to_string())?;
-        if event.data == "[DONE]" {
-            complete = true;
-            continue;
-        }
-        if let Some(delta) = sse_delta(&event.data)? {
-            answer.push_str(&delta);
-            channel
-                .send(StreamEvent {
-                    kind: "delta".into(),
-                    text: delta,
-                })
-                .map_err(|e| e.to_string())?;
-        }
-    }
-    channel
-        .send(StreamEvent {
-            kind: "done".into(),
-            text: String::new(),
-        })
-        .map_err(|e| e.to_string())?;
-    Ok(answer)
+    auth_commands::stream(
+        state,
+        &settings.provider_id,
+        &settings.model,
+        messages,
+        cancellation,
+        channel,
+    )
+    .await
 }
 #[tauri::command]
 async fn chat(
@@ -1090,9 +894,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            auth_commands::authorize_oauth,
-            auth_commands::cancel_oauth,
-            auth_commands::remove_oauth,
+            auth_commands::get_auth_state,
+            auth_commands::model_auth_action,
+            auth_commands::cancel_model_auth,
             load_state,
             create_workspace,
             delete_workspace,
