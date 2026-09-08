@@ -277,8 +277,11 @@ textarea {
 .settings h2 {
   margin: 0;
 }
-.settings-actions {
-  justify-content: flex-start;
+.custom-provider-settings[open] > :not(summary) {
+  margin-top: 12px;
+}
+.custom-provider-settings > summary {
+  cursor: pointer;
 }
 .material-actions {
   margin-top: 8px;

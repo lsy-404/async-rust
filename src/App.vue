@@ -9,6 +9,7 @@ import {
   FluentDialog,
   FluentField,
   FluentNotice,
+  FluentProgressBar,
   FluentSelect,
   FluentTextArea,
   FluentTheme,
@@ -692,8 +693,10 @@ onUnmounted(() => {
                     : "下载本地模型后可离线转写音频，无需 API Key。"
                 }}
               </p>
-              <progress
+              <FluentProgressBar
                 v-if="sttDownloading"
+                label="本地语音模型下载进度"
+                :indeterminate="!sttProgress.total"
                 :value="sttProgress.downloaded"
                 :max="sttProgress.total || 1"
               /><FluentButton
