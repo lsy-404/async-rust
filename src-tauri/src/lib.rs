@@ -1,3 +1,5 @@
+mod stt;
+
 use std::{
     collections::HashMap,
     fs,
@@ -11,7 +13,6 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use keyring::Entry;
 use quick_xml::{events::Event, Reader};
-use reqwest::multipart;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -61,7 +62,6 @@ pub struct Material {
 pub struct Settings {
     pub provider_id: String,
     pub model: String,
-    pub transcription_model: String,
     pub theme: String,
     pub language: String,
 }
@@ -70,7 +70,6 @@ impl Default for Settings {
         Self {
             provider_id: "openai".into(),
             model: String::new(),
-            transcription_model: "whisper-1".into(),
             theme: "system".into(),
             language: "zh".into(),
         }
@@ -104,13 +103,19 @@ pub struct StreamEvent {
 
 pub struct AppState {
     db_path: PathBuf,
+    stt: stt::SttManager,
     client: reqwest::Client,
     cancellations: Mutex<HashMap<String, CancellationToken>>,
 }
 
 impl AppState {
     pub fn open(db_path: PathBuf) -> Result<Self, String> {
+        let stt_root = db_path
+            .parent()
+            .ok_or("本地数据路径无效。")?
+            .join("voice-models");
         let state = Self {
+            stt: stt::SttManager::new(stt_root),
             db_path,
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
@@ -793,56 +798,31 @@ async fn summarize(
     Ok(())
 }
 
-async fn transcribe(
-    state: &AppState,
-    session_id: &str,
-    name: String,
-    bytes: Vec<u8>,
-) -> Result<String, String> {
-    let (_, _, settings) = session_context(state, session_id)?;
-    let p = provider(state, &settings.provider_id)?;
-    let key = state.api_key(&p.id)?;
-    let mime = match Path::new(&name)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "wav" => "audio/wav",
-        "mp3" => "audio/mpeg",
-        "m4a" => "audio/mp4",
-        "ogg" => "audio/ogg",
-        "webm" => "audio/webm",
-        _ => "application/octet-stream",
-    };
-    let part = multipart::Part::bytes(bytes)
-        .file_name(name)
-        .mime_str(mime)
-        .map_err(|e| e.to_string())?;
-    let form = multipart::Form::new()
-        .text("model", settings.transcription_model)
-        .part("file", part);
-    let value: Value = state
-        .client
-        .post(endpoint(&p.base_url, "audio/transcriptions"))
-        .bearer_auth(key)
-        .multipart(form)
-        .send()
+#[tauri::command]
+async fn stt_status(state: tauri::State<'_, AppState>) -> Result<stt::SttStatus, String> {
+    state.stt.status().await
+}
+#[tauri::command]
+async fn download_stt_model(
+    on_event: Channel<stt::DownloadProgress>,
+    state: tauri::State<'_, AppState>,
+) -> Result<stt::SttStatus, String> {
+    state
+        .stt
+        .install(move |progress| {
+            let _ = on_event.send(progress);
+        })
         .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
-    let text = value
-        .get("text")
-        .and_then(Value::as_str)
-        .ok_or("转录服务未返回 text。")?
-        .to_string();
-    let db = state.db()?;
-    let existing = db
+}
+#[tauri::command]
+fn cancel_stt_download(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.stt.cancel_download()
+}
+
+fn append_transcription(state: &AppState, session_id: &str, text: &str) -> Result<String, String> {
+    let mut db = state.db()?;
+    let tx = db.transaction().map_err(|e| e.to_string())?;
+    let existing = tx
         .query_row(
             "SELECT transcription FROM sessions WHERE id=?",
             [session_id],
@@ -853,14 +833,50 @@ async fn transcribe(
         .ok_or("找不到会话。")?;
     let combined = match existing.filter(|value| !value.trim().is_empty()) {
         Some(previous) => format!("{previous}\n\n{text}"),
-        None => text,
+        None => text.to_owned(),
     };
-    db.execute(
+    tx.execute(
         "UPDATE sessions SET transcription=? WHERE id=?",
         params![combined, session_id],
     )
     .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(combined)
+}
+
+async fn transcribe(
+    state: &AppState,
+    session_id: &str,
+    name: String,
+    bytes: Vec<u8>,
+) -> Result<String, String> {
+    let exists: bool = state
+        .db()?
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?)",
+            [session_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if !exists {
+        return Err("找不到会话。".into());
+    }
+    let cancellation = generation_token(state, session_id)?;
+    let result = state
+        .stt
+        .transcribe(name, bytes, cancellation.clone())
+        .await;
+    let output = match result {
+        Ok(text) if !cancellation.is_cancelled() => append_transcription(state, session_id, &text),
+        Ok(_) => Err("语音任务已取消。".into()),
+        Err(error) => Err(error),
+    };
+    state
+        .cancellations
+        .lock()
+        .map_err(|_| "生成状态不可用。")?
+        .remove(session_id);
+    output
 }
 #[tauri::command]
 async fn transcribe_audio(
@@ -873,7 +889,21 @@ async fn transcribe_audio(
         .and_then(|v| v.to_str())
         .unwrap_or("recording")
         .to_string();
-    let bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > stt::MAX_AUDIO_BYTES {
+        return Err("音频为空、不是普通文件或超过 512 MiB。".into());
+    }
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    tokio::fs::File::open(path)
+        .await
+        .map_err(|e| e.to_string())?
+        .take(stt::MAX_AUDIO_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|e| e.to_string())?;
     transcribe(&state, &session_id, name, bytes).await
 }
 #[tauri::command]
@@ -916,7 +946,10 @@ pub fn run() {
             cancel_generation,
             summarize,
             transcribe_audio,
-            transcribe_bytes
+            transcribe_bytes,
+            stt_status,
+            download_stt_model,
+            cancel_stt_download
         ])
         .run(tauri::generate_context!())
         .expect("error while running Async");
