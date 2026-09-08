@@ -34,12 +34,28 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          version="$(node - <<'NODE'
+          const fs = require('node:fs');
+          const packageVersion = JSON.parse(fs.readFileSync('package.json', 'utf8')).version;
+          const cargo = fs.readFileSync('src-tauri/Cargo.toml', 'utf8');
+          const cargoVersion = cargo.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+          const tauri = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
+          const tauriVersion = tauri.version;
+          if (!packageVersion || !cargoVersion || !tauriVersion || new Set([packageVersion, cargoVersion, tauriVersion]).size !== 1) {
+            throw new Error(`Version mismatch: package=${packageVersion}, cargo=${cargoVersion}, tauri=${tauriVersion}`);
+          }
+          if (process.env.RELEASE_BUILD === 'true' && process.env.GITHUB_REF_NAME !== `v${packageVersion}`) {
+            throw new Error(`Release tag ${process.env.GITHUB_REF_NAME} must match v${packageVersion}`);
+          }
+          process.stdout.write(packageVersion);
+          NODE
+          )"
           if [[ "${{ inputs.release }}" == "true" ]]; then
-            version="${GITHUB_REF_NAME#v}"
-          else
-            version="0.0.0-dev.${GITHUB_SHA::7}"
+            test "$GITHUB_REF_NAME" = "v$version"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+        env:
+          RELEASE_BUILD: ${{ inputs.release }}
       - name: Install frontend dependencies
         run: npm ci --no-audit --no-fund
       - name: Build frontend
