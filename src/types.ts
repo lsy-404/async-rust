@@ -29,13 +29,19 @@ export interface Provider {
   baseUrl: string;
   models: string[];
   hasKey: boolean;
+  authMethod?: "oauth" | "api-key";
 }
 export interface Settings {
   providerId: string;
   model: string;
-  transcriptionModel: string;
   theme: Theme;
   language: "zh" | "en";
+}
+export interface SttStatus {
+  ready: boolean;
+  modelName: string;
+  modelPath: string;
+  sizeBytes: number;
 }
 export interface AppData {
   workspaces: Workspace[];
