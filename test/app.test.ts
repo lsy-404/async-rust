@@ -213,6 +213,41 @@ describe("desktop workbench interactions", () => {
     expect(wrapper.text()).toContain("fixture unavailable");
   });
 
+  it("shows native download progress through Fluent and forwards cancellation", async () => {
+    const implementation = invoke.getMockImplementation()!;
+    let rejectDownload: (error: Error) => void = () => undefined;
+    invoke.mockImplementation((command, args) => {
+      if (command === "stt_status")
+        return Promise.resolve({
+          ready: false,
+          modelName: "fixture",
+          modelPath: "",
+          sizeBytes: 0,
+        });
+      if (command === "download_stt_model") {
+        args.onEvent.onmessage({ downloaded: 25, total: 100 });
+        return new Promise((_, reject) => {
+          rejectDownload = reject;
+        });
+      }
+      if (command === "cancel_stt_download")
+        rejectDownload(new Error("download cancelled"));
+      return implementation(command, args);
+    });
+    const wrapper = mountApp();
+    await flushPromises();
+    await buttonWithText(wrapper, "下载本地转写模型").trigger("click");
+    await flushPromises();
+    const progress = wrapper.get("progress.fluent-progress-bar");
+    expect(progress.attributes("value")).toBe("25");
+    expect(progress.attributes("aria-label")).toBe("本地语音模型下载进度");
+    await buttonWithText(wrapper, "取消下载").trigger("click");
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("cancel_stt_download");
+    expect(wrapper.find("progress.fluent-progress-bar").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
   it("pins native microphone capture to the original session and unlocks after a stop error", async () => {
     const implementation = invoke.getMockImplementation()!;
     invoke.mockImplementation((command, args) =>
