@@ -227,39 +227,27 @@ describe("desktop workbench interactions", () => {
     expect(wrapper.text()).toContain("fixture unavailable");
   });
 
-  it("locks workspace navigation while microphone capture is active", async () => {
-    const stream = {
-      getTracks: () => [{ stop: vi.fn() }],
-    } as unknown as MediaStream;
-    vi.stubGlobal(
-      "AudioContext",
-      class {
-        sampleRate = 48_000;
-        destination = {};
-        createMediaStreamSource() {
-          return { connect: vi.fn(), disconnect: vi.fn() };
-        }
-        createScriptProcessor() {
-          return {
-            connect: vi.fn(),
-            disconnect: vi.fn(),
-            onaudioprocess: undefined,
-          };
-        }
-        close() {
-          return Promise.resolve();
-        }
-      },
+  it("pins native microphone capture to the original session and unlocks after a stop error", async () => {
+    const implementation = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command, args) =>
+      command === "stop_recording"
+        ? Promise.reject(new Error("native microphone failed"))
+        : implementation(command, args),
     );
-    Object.defineProperty(navigator, "mediaDevices", {
-      configurable: true,
-      value: { getUserMedia: vi.fn().mockResolvedValue(stream) },
-    });
     const wrapper = mountApp();
     await flushPromises();
     await buttonWithText(wrapper, "录音转写").trigger("click");
     await flushPromises();
-    const rows = wrapper.findAll("button.nav-row");
-    expect(rows[1]?.attributes("disabled")).toBeDefined();
+    expect(invoke).toHaveBeenCalledWith("start_recording", { sessionId: "s1" });
+    expect(
+      wrapper.findAll("button.nav-row")[1]?.attributes("disabled"),
+    ).toBeDefined();
+    await buttonWithText(wrapper, "停止录音").trigger("click");
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("stop_recording", { sessionId: "s1" });
+    expect(wrapper.text()).toContain("native microphone failed");
+    expect(
+      wrapper.findAll("button.nav-row")[1]?.attributes("disabled"),
+    ).toBeUndefined();
   });
 });

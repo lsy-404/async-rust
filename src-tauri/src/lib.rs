@@ -1,4 +1,5 @@
 mod auth_commands;
+mod credential_store;
 mod oauth;
 mod stt;
 
@@ -11,9 +12,9 @@ use std::{
     time::Duration,
 };
 
+use credential_store::Entry;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
-use keyring::Entry;
 use quick_xml::{events::Event, Reader};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -23,7 +24,6 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zip::ZipArchive;
 
-const KEYRING_SERVICE: &str = "dev.async.desktop.api-key";
 const CONTEXT_LIMIT: usize = 48_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -137,25 +137,32 @@ impl AppState {
         open_database(&self.db_path)
     }
     fn key(&self, id: &str) -> Result<Entry, String> {
-        Entry::new(KEYRING_SERVICE, id).map_err(|e| format!("系统凭据库不可用：{e}"))
+        Entry::new(
+            self.db_path
+                .parent()
+                .ok_or("本地数据路径无效。")?
+                .join("credentials"),
+            id,
+        )
+        .map_err(|e| format!("本地凭据文件不可用：{e}"))
     }
     fn has_key(&self, id: &str) -> Result<bool, String> {
         match self.key(id)?.get_password() {
             Ok(k) => Ok(!k.trim().is_empty()),
-            Err(keyring::Error::NoEntry) => Ok(false),
-            Err(e) => Err(format!("无法读取系统 API Key：{e}")),
+            Err(credential_store::Error::NoEntry) => Ok(false),
+            Err(e) => Err(format!("无法读取本地 API Key：{e}")),
         }
     }
     fn api_key(&self, id: &str) -> Result<String, String> {
         self.key(id)?
             .get_password()
             .map_err(|e| match e {
-                keyring::Error::NoEntry => "尚未配置 API Key。".into(),
-                _ => format!("无法读取系统 API Key：{e}"),
+                credential_store::Error::NoEntry => "尚未配置 API Key。".into(),
+                _ => format!("无法读取本地 API Key：{e}"),
             })
             .and_then(|v| {
                 if v.trim().is_empty() {
-                    Err("系统 API Key 为空。".into())
+                    Err("本地 API Key 为空。".into())
                 } else {
                     Ok(v)
                 }
@@ -548,8 +555,8 @@ async fn save_provider(
     let previous = if trimmed.is_some() {
         match entry.get_password() {
             Ok(value) => Some(value),
-            Err(keyring::Error::NoEntry) => None,
-            Err(_) => return Err("无法读取系统凭据库。".into()),
+            Err(credential_store::Error::NoEntry) => None,
+            Err(_) => return Err("无法读取本地凭据文件。".into()),
         }
     } else {
         None
@@ -560,11 +567,11 @@ async fn save_provider(
     if let Some(key) = trimmed {
         if key.is_empty() {
             match entry.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => {}
-                Err(_) => return Err("无法删除系统凭据。".into()),
+                Ok(()) | Err(credential_store::Error::NoEntry) => {}
+                Err(_) => return Err("无法删除本地凭据。".into()),
             }
         } else {
-            entry.set_password(key).map_err(|_| "无法保存系统凭据。")?;
+            entry.set_password(key).map_err(|_| "无法保存本地凭据。")?;
         }
     }
     if let Err(error) = transaction.commit() {
@@ -588,8 +595,8 @@ fn delete_provider(id: String, state: tauri::State<'_, AppState>) -> Result<(), 
     let entry = state.key(&id)?;
     let previous = match entry.get_password() {
         Ok(value) => Some(value),
-        Err(keyring::Error::NoEntry) => None,
-        Err(_) => return Err("无法读取系统凭据。".into()),
+        Err(credential_store::Error::NoEntry) => None,
+        Err(_) => return Err("无法读取本地凭据。".into()),
     };
     let mut db = state.db()?;
     let transaction = db.transaction().map_err(|e| e.to_string())?;
@@ -597,8 +604,8 @@ fn delete_provider(id: String, state: tauri::State<'_, AppState>) -> Result<(), 
         .execute("DELETE FROM providers WHERE id=?", [&id])
         .map_err(|e| e.to_string())?;
     match entry.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => {}
-        Err(_) => return Err("无法删除系统凭据。".into()),
+        Ok(()) | Err(credential_store::Error::NoEntry) => {}
+        Err(_) => return Err("无法删除本地凭据。".into()),
     }
     if let Err(error) = transaction.commit() {
         if let Some(value) = previous {

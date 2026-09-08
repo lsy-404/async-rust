@@ -55,7 +55,7 @@ pub async fn authorize_oauth(
     state
         .key(&provider_id)?
         .set_password(&serde_json::to_string(&credential).map_err(|e| e.to_string())?)
-        .map_err(|_| "无法把供应商凭据保存到系统凭据库。")?;
+        .map_err(|_| "无法把供应商凭据保存到本地凭据文件。")?;
     match oauth::models(&provider_id, &credential).await {
         Ok(models) => store_models(&state, &provider_id, &models)?,
         Err(_) => {
@@ -90,8 +90,8 @@ pub fn remove_oauth(provider_id: String, state: State<'_, AppState>) -> Result<(
     }
     cancel_oauth(provider_id.clone(), state.clone())?;
     match state.key(&provider_id)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(_) => Err("无法从系统凭据库删除授权。".into()),
+        Ok(()) | Err(crate::credential_store::Error::NoEntry) => Ok(()),
+        Err(_) => Err("无法从本地凭据文件删除授权。".into()),
     }
 }
 

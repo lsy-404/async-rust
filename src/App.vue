@@ -29,7 +29,6 @@ import {
   saveNewProvider,
   streamCommand,
 } from "./workbench-commands";
-import { encodeMonoWav } from "./audio";
 
 const md = new MarkdownIt({ html: false, linkify: true, breaks: true });
 const blankSettings: Settings = {
@@ -80,11 +79,8 @@ const deleteTarget = ref<{
   id: string;
   label: string;
 }>();
-let audioContext: AudioContext | undefined;
-let audioProcessor: ScriptProcessorNode | undefined;
-let audioSource: MediaStreamAudioSourceNode | undefined;
-let recordingStream: MediaStream | undefined;
-let pcmChunks: Float32Array[] = [];
+const recordingStarting = ref(false);
+const recordingSessionId = ref("");
 
 const workspaces = computed(() => data.value.workspaces);
 const sessions = computed(() =>
@@ -113,7 +109,8 @@ const operationBusy = computed(
     streaming.value ||
     summaryLoading.value ||
     transcriptionLoading.value ||
-    recording.value,
+    recording.value ||
+    recordingStarting.value,
 );
 const modelOptions = computed(() =>
   (currentProvider.value?.models ?? []).map((model) => ({
@@ -204,7 +201,7 @@ async function refresh(preferred?: { providerId?: string; model?: string }) {
   }
 }
 async function createWorkspace() {
-  if (!workspaceName.value.trim()) return;
+  if (!workspaceName.value.trim() || operationBusy.value) return;
   try {
     const workspace = await invoke<Workspace>("create_workspace", {
       name: workspaceName.value.trim(),
@@ -430,54 +427,36 @@ async function toggleRecording() {
     !session.value ||
     streaming.value ||
     summaryLoading.value ||
-    transcriptionLoading.value
+    transcriptionLoading.value ||
+    recordingStarting.value
   )
     return;
-  if (audioProcessor && recording.value) {
-    audioProcessor.disconnect();
-    audioSource?.disconnect();
-    recordingStream?.getTracks().forEach((track) => track.stop());
+  if (recording.value) {
+    const sessionId = recordingSessionId.value;
     recording.value = false;
     transcriptionLoading.value = true;
     try {
-      await invoke("transcribe_bytes", {
-        sessionId: session.value.id,
-        name: "recording.wav",
-        bytes: Array.from(
-          encodeMonoWav(pcmChunks, audioContext?.sampleRate ?? 48000),
-        ),
-      });
+      await invoke("stop_recording", { sessionId });
       await refresh();
     } catch (cause) {
       report(cause);
     } finally {
       transcriptionLoading.value = false;
-      await audioContext?.close();
-      audioContext = undefined;
-      audioProcessor = undefined;
-      audioSource = undefined;
-      recordingStream = undefined;
+      recordingSessionId.value = "";
     }
     return;
   }
   const sessionId = session.value.id;
+  recordingStarting.value = true;
+  error.value = "";
   try {
-    recordingStream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1 },
-    });
-    audioContext = new AudioContext();
-    audioSource = audioContext.createMediaStreamSource(recordingStream);
-    audioProcessor = audioContext.createScriptProcessor(4096, 1, 1);
-    pcmChunks = [];
-    audioProcessor.onaudioprocess = (event) =>
-      pcmChunks.push(new Float32Array(event.inputBuffer.getChannelData(0)));
-    audioSource.connect(audioProcessor);
-    audioProcessor.connect(audioContext.destination);
+    await invoke("start_recording", { sessionId });
+    recordingSessionId.value = sessionId;
     recording.value = true;
   } catch (cause) {
-    recordingStream?.getTracks().forEach((track) => track.stop());
-    await audioContext?.close();
-    report(`Microphone permission is required: ${String(cause)}`);
+    report(cause);
+  } finally {
+    recordingStarting.value = false;
   }
 }
 async function saveSettings() {
@@ -627,10 +606,8 @@ watch(
 );
 onMounted(refresh);
 onUnmounted(() => {
-  audioProcessor?.disconnect();
-  audioSource?.disconnect();
-  recordingStream?.getTracks().forEach((track) => track.stop());
-  void audioContext?.close();
+  if (recording.value || recordingStarting.value)
+    void invoke("cancel_recording").catch(() => undefined);
 });
 </script>
 
@@ -739,13 +716,21 @@ onUnmounted(() => {
                   @click="summarize"
                   >生成摘要</FluentButton
                 ><FluentButton
+                  v-if="transcriptionLoading"
+                  tone="danger"
+                  @click="cancel"
+                  >取消本地转写</FluentButton
+                ><FluentButton
                   tone="subtle"
                   :busy="transcriptionLoading"
                   :disabled="operationBusy"
                   @click="uploadAudio"
-                  >导入音频</FluentButton
+                  >{{
+                    transcriptionLoading ? "本地转写中…" : "导入音频"
+                  }}</FluentButton
                 ><FluentButton
                   :tone="recording ? 'danger' : 'subtle'"
+                  :busy="recordingStarting"
                   :disabled="
                     streaming || summaryLoading || transcriptionLoading
                   "
