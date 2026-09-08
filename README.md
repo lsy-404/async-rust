@@ -1,2 +1,10 @@
 # async-rust
-Local-first classroom assistant built with Rust and Tauri. BYOK, no account or invitation required.
+
+本地优先的课堂助手，计划采用 Tauri 2 + Rust + Vue，接入 toolkit 的模型授权和完整 Fluent 样式与控件。
+
+- 无需注册、登录或邀请码。
+- 全部采用 BYOK，由用户配置自己的模型供应商凭据。
+- 工作区、材料、会话与摘要保存在本地。
+- 模型服务使用用户配置的供应商；本地程序不代表模型推理离线运行。
+
+当前处于项目初始化阶段，尚无可运行的桌面版本。
