@@ -58,6 +58,7 @@ const summaryStream = ref("");
 const transcriptionLoading = ref(false);
 const authBusy = ref(false);
 const authProgress = ref("");
+const activeAuthProviderId = ref("");
 const stt = ref<SttStatus>({
   ready: false,
   modelName: "本地语音模型",
@@ -527,6 +528,7 @@ async function saveKey(payload: { providerId: string; apiKey: string }) {
   }
 }
 async function authorizeOAuth(providerId: string) {
+  activeAuthProviderId.value = providerId;
   authBusy.value = true;
   authProgress.value = "正在打开供应商授权…";
   const channel = new Channel<{ type: "status" | "url"; text: string }>();
@@ -540,6 +542,7 @@ async function authorizeOAuth(providerId: string) {
     report(cause);
   } finally {
     authBusy.value = false;
+    activeAuthProviderId.value = "";
   }
 }
 async function removeOAuth(providerId: string) {
@@ -561,6 +564,14 @@ async function cancelOAuth(providerId: string) {
   } finally {
     authBusy.value = false;
   }
+}
+function closeAuth() {
+  if (authBusy.value && activeAuthProviderId.value)
+    void cancelOAuth(activeAuthProviderId.value);
+  authOpen.value = false;
+}
+function handleComposerEnter(event: KeyboardEvent) {
+  if (!event.isComposing) void send();
 }
 async function createProvider() {
   if (!providerName.value.trim() || !providerEndpoint.value.trim()) return;
@@ -767,7 +778,7 @@ onUnmounted(() => {
                 v-model="draft"
                 :disabled="operationBusy"
                 placeholder="输入问题，Enter 发送，Shift+Enter 换行"
-                @keydown.enter.exact.prevent="send"
+                @keydown.enter.exact.prevent="handleComposerEnter"
               ></textarea
               ><FluentButton v-if="streaming" tone="danger" @click="cancel"
                 >停止</FluentButton
@@ -836,7 +847,7 @@ onUnmounted(() => {
                 data.providers.map((p) => ({ value: p.id, label: p.name }))
               "
             /><FluentField
-              v-if="currentProvider"
+              v-if="currentProvider && currentProvider.authMethod !== 'oauth'"
               v-model="currentProvider.baseUrl"
               label="兼容 API 地址"
               placeholder="https://…/v1"
@@ -875,11 +886,15 @@ onUnmounted(() => {
             </section>
             <div class="settings-actions">
               <FluentButton tone="secondary" @click="authOpen = true"
-                >连接 API Key</FluentButton
+                >连接模型</FluentButton
               ><FluentButton tone="subtle" @click="discover"
                 >获取模型</FluentButton
               ><FluentButton
-                v-if="currentProvider && currentProvider.id !== 'openai'"
+                v-if="
+                  currentProvider &&
+                  currentProvider.id !== 'openai' &&
+                  currentProvider.authMethod !== 'oauth'
+                "
                 tone="danger"
                 @click="
                   askDelete(
@@ -947,9 +962,9 @@ onUnmounted(() => {
         :theme="data.settings.theme"
         initial-method="api-key"
         :busy="authBusy"
-        :error="error || null"
+        :error="authProgress || error || null"
         :catalog-status="{ state: 'ready', source: 'cached' }"
-        @close="authOpen = false"
+        @close="closeAuth"
         @add-api-key="saveKey"
         @remove-api-key="removeKey"
         @authorize-oauth="authorizeOAuth"
