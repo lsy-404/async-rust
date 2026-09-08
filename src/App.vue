@@ -700,7 +700,7 @@ onUnmounted(() => recorder?.state === "recording" && recorder.stop());
             >
           </header>
           <div v-if="selectedWorkspaceId && !materials.length" class="empty">
-            导入 PDF、文档或文本材料，供会话参考。
+            导入 TXT、Markdown 或 DOCX 材料，供会话参考。
           </div>
           <button
             v-for="item in materials"
