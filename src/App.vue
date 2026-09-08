@@ -516,7 +516,11 @@ async function saveKey(payload: { providerId: string; apiKey: string }) {
   try {
     await invoke("save_provider", { provider, apiKey: payload.apiKey });
     await invoke("save_settings", { settings: data.value.settings });
-    await discover();
+    const models = await invoke<string[]>("discover_models", {
+      providerId: provider.id,
+    });
+    provider.models = models;
+    if (!data.value.settings.model) data.value.settings.model = models[0] ?? "";
     await refresh({
       providerId: data.value.settings.providerId,
       model: data.value.settings.model,
@@ -962,7 +966,7 @@ onUnmounted(() => {
         :theme="data.settings.theme"
         initial-method="api-key"
         :busy="authBusy"
-        :error="authProgress || error || null"
+        :error="error || null"
         :catalog-status="{ state: 'ready', source: 'cached' }"
         @close="closeAuth"
         @add-api-key="saveKey"
@@ -972,7 +976,15 @@ onUnmounted(() => {
         @remove-oauth="removeOAuth"
         @refresh-catalog="discover"
         @select-model="selectModel"
-      />
+        ><template v-if="authBusy" #footer
+          ><div role="status">{{ authProgress || "正在连接…" }}</div>
+          <FluentButton
+            tone="danger"
+            @click="activeAuthProviderId && cancelOAuth(activeAuthProviderId)"
+            >取消授权</FluentButton
+          ></template
+        ></ModelAuthDialog
+      >
     </main>
   </FluentTheme>
 </template>
