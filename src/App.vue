@@ -894,10 +894,16 @@ onUnmounted(() => {
             </div>
             <footer class="recording-bar">
               <span class="recording-state">{{
-                recording ? "正在本地录音与转写…" : "准备就绪"
+                recordingStarting
+                  ? "正在加载本地模型…"
+                  : recording
+                    ? "正在本地录音与转写…"
+                    : transcriptionLoading
+                      ? "正在完成转写…"
+                      : "准备就绪"
               }}</span
               ><FluentButton
-                v-if="transcriptionLoading"
+                v-if="transcriptionLoading && !recordingSessionId"
                 tone="danger"
                 @click="cancel"
                 >取消转写</FluentButton
