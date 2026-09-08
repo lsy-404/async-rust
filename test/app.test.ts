@@ -139,6 +139,7 @@ describe("desktop workbench interactions", () => {
     expect(invoke).toHaveBeenCalledWith("save_provider", {
       provider: expect.objectContaining({ id: "new-provider" }),
     });
+    await buttonWithText(wrapper, "知识库").trigger("click");
     expect(wrapper.text()).toContain("TXT、Markdown 或 DOCX");
     expect(wrapper.text()).not.toContain("导入 PDF");
   });
@@ -256,45 +257,65 @@ describe("desktop workbench interactions", () => {
     );
     const wrapper = mountApp();
     await flushPromises();
-    await buttonWithText(wrapper, "录音转写").trigger("click");
+    await buttonWithText(wrapper, "开始录音").trigger("click");
     await flushPromises();
     expect(invoke).toHaveBeenCalledWith("start_recording", {
       sessionId: "s1",
       onEvent: expect.objectContaining({ onmessage: expect.any(Function) }),
     });
     expect(
-      wrapper.findAll("button.nav-row")[1]?.attributes("disabled"),
+      wrapper.findAll("button.tree-workspace")[1]?.attributes("disabled"),
     ).toBeDefined();
     await buttonWithText(wrapper, "停止录音").trigger("click");
     await flushPromises();
     expect(invoke).toHaveBeenCalledWith("stop_recording", { sessionId: "s1" });
     expect(wrapper.text()).toContain("native microphone failed");
     expect(
-      wrapper.findAll("button.nav-row")[1]?.attributes("disabled"),
+      wrapper.findAll("button.tree-workspace")[1]?.attributes("disabled"),
     ).toBeUndefined();
   });
 
   it("renders native transcript updates before stop and ignores foreign or stale events", async () => {
     const wrapper = mountApp();
     await flushPromises();
-    await buttonWithText(wrapper, "录音转写").trigger("click");
+    await buttonWithText(wrapper, "开始录音").trigger("click");
     await flushPromises();
-    const start = invoke.mock.calls.find(([command]) => command === "start_recording")!;
+    const start = invoke.mock.calls.find(
+      ([command]) => command === "start_recording",
+    )!;
     const channel = start[1].onEvent;
-    channel.onmessage({ type: "transcript", sessionId: "s1", text: "录音中的第一句话。" });
+    channel.onmessage({
+      type: "transcript",
+      sessionId: "s1",
+      text: "录音中的第一句话。",
+    });
     await nextTick();
     expect(wrapper.text()).toContain("录音中的第一句话。");
-    expect(invoke.mock.calls.some(([command]) => command === "stop_recording")).toBe(false);
-    channel.onmessage({ type: "transcript", sessionId: "foreign", text: "其他会话的内容" });
+    expect(
+      invoke.mock.calls.some(([command]) => command === "stop_recording"),
+    ).toBe(false);
+    channel.onmessage({
+      type: "transcript",
+      sessionId: "foreign",
+      text: "其他会话的内容",
+    });
     await nextTick();
     expect(wrapper.text()).not.toContain("其他会话的内容");
     data.sessions[0].transcription = "录音中的第一句话。第二句话。";
-    channel.onmessage({ type: "transcript", sessionId: "s1", text: data.sessions[0].transcription });
+    channel.onmessage({
+      type: "transcript",
+      sessionId: "s1",
+      text: data.sessions[0].transcription,
+    });
     await nextTick();
     expect(wrapper.text().match(/录音中的第一句话/g)).toHaveLength(1);
     await buttonWithText(wrapper, "停止录音").trigger("click");
     await flushPromises();
-    channel.onmessage({ type: "transcript", sessionId: "s1", text: "过期事件" });
+    channel.onmessage({
+      type: "transcript",
+      sessionId: "s1",
+      text: "过期事件",
+    });
     await nextTick();
     expect(wrapper.text()).toContain("第二句话。");
     expect(wrapper.text()).not.toContain("过期事件");
@@ -304,15 +325,22 @@ describe("desktop workbench interactions", () => {
   it("surfaces an asynchronous recording error and unlocks recording", async () => {
     const wrapper = mountApp();
     await flushPromises();
-    await buttonWithText(wrapper, "录音转写").trigger("click");
+    await buttonWithText(wrapper, "开始录音").trigger("click");
     await flushPromises();
-    const start = invoke.mock.calls.find(([command]) => command === "start_recording")!;
-    start[1].onEvent.onmessage({ type: "error", sessionId: "s1", text: "音频处理队列已满" });
+    const start = invoke.mock.calls.find(
+      ([command]) => command === "start_recording",
+    )!;
+    start[1].onEvent.onmessage({
+      type: "error",
+      sessionId: "s1",
+      text: "音频处理队列已满",
+    });
     await flushPromises();
     expect(wrapper.text()).toContain("音频处理队列已满");
     expect(invoke).toHaveBeenCalledWith("cancel_recording");
-    expect(buttonWithText(wrapper, "录音转写").attributes("disabled")).toBeUndefined();
+    expect(
+      buttonWithText(wrapper, "开始录音").attributes("disabled"),
+    ).toBeUndefined();
     wrapper.unmount();
   });
-
 });

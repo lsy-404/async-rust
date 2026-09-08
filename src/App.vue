@@ -440,7 +440,8 @@ async function toggleRecording() {
   const onEvent = new Channel<RecordingEvent>();
   recordingSessionId.value = sessionId;
   onEvent.onmessage = (event) => {
-    if (generation !== recordingGeneration || event.sessionId !== sessionId) return;
+    if (generation !== recordingGeneration || event.sessionId !== sessionId)
+      return;
     if (event.type === "error") {
       report(event.text);
       recording.value = false;
