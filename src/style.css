@@ -297,7 +297,12 @@ textarea {
   border-radius: 8px;
   background: var(--fluent-surface);
 }
+.composer > .fluent-field {
+  flex: 1;
+  min-width: 0;
+}
 .composer textarea {
+  width: 100%;
   flex: 1;
   min-height: 54px;
   max-height: 180px;
