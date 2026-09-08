@@ -29,6 +29,7 @@ import {
   saveNewProvider,
   streamCommand,
 } from "./workbench-commands";
+import { encodeMonoWav } from "./audio";
 
 const md = new MarkdownIt({ html: false, linkify: true, breaks: true });
 const blankSettings: Settings = {
@@ -78,8 +79,11 @@ const deleteTarget = ref<{
   id: string;
   label: string;
 }>();
-let recorder: MediaRecorder | undefined;
-let chunks: Blob[] = [];
+let audioContext: AudioContext | undefined;
+let audioProcessor: ScriptProcessorNode | undefined;
+let audioSource: MediaStreamAudioSourceNode | undefined;
+let recordingStream: MediaStream | undefined;
+let pcmChunks: Float32Array[] = [];
 
 const workspaces = computed(() => data.value.workspaces);
 const sessions = computed(() =>
@@ -382,7 +386,7 @@ async function uploadAudio() {
       filters: [
         {
           name: "Audio",
-          extensions: ["mp3", "m4a", "mp4", "wav", "webm", "ogg"],
+          extensions: ["wav"],
         },
       ],
     });
@@ -428,47 +432,50 @@ async function toggleRecording() {
     transcriptionLoading.value
   )
     return;
-  if (recorder && recording.value) {
-    recorder.stop();
+  if (audioProcessor && recording.value) {
+    audioProcessor.disconnect();
+    audioSource?.disconnect();
+    recordingStream?.getTracks().forEach((track) => track.stop());
+    recording.value = false;
+    transcriptionLoading.value = true;
+    try {
+      await invoke("transcribe_bytes", {
+        sessionId: session.value.id,
+        name: "recording.wav",
+        bytes: Array.from(
+          encodeMonoWav(pcmChunks, audioContext?.sampleRate ?? 48000),
+        ),
+      });
+      await refresh();
+    } catch (cause) {
+      report(cause);
+    } finally {
+      transcriptionLoading.value = false;
+      await audioContext?.close();
+      audioContext = undefined;
+      audioProcessor = undefined;
+      audioSource = undefined;
+      recordingStream = undefined;
+    }
     return;
   }
   const sessionId = session.value.id;
-  let stream: MediaStream | undefined;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    chunks = [];
-    recorder = new MediaRecorder(stream);
-    recorder.ondataavailable = (event) => chunks.push(event.data);
-    recorder.onstop = async () => {
-      recording.value = false;
-      transcriptionLoading.value = true;
-      stream?.getTracks().forEach((track) => track.stop());
-      const mime = recorder?.mimeType || "audio/webm";
-      const extension = mime.includes("mp4")
-        ? "m4a"
-        : mime.includes("ogg")
-          ? "ogg"
-          : "webm";
-      try {
-        const bytes = Array.from(
-          new Uint8Array(await new Blob(chunks, { type: mime }).arrayBuffer()),
-        );
-        await invoke("transcribe_bytes", {
-          sessionId,
-          name: `recording.${extension}`,
-          bytes,
-        });
-        await refresh();
-      } catch (cause) {
-        report(cause);
-      } finally {
-        transcriptionLoading.value = false;
-      }
-    };
-    recorder.start();
+    recordingStream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1 },
+    });
+    audioContext = new AudioContext();
+    audioSource = audioContext.createMediaStreamSource(recordingStream);
+    audioProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+    pcmChunks = [];
+    audioProcessor.onaudioprocess = (event) =>
+      pcmChunks.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+    audioSource.connect(audioProcessor);
+    audioProcessor.connect(audioContext.destination);
     recording.value = true;
   } catch (cause) {
-    stream?.getTracks().forEach((track) => track.stop());
+    recordingStream?.getTracks().forEach((track) => track.stop());
+    await audioContext?.close();
     report(`Microphone permission is required: ${String(cause)}`);
   }
 }
@@ -604,7 +611,12 @@ watch(
   { immediate: true },
 );
 onMounted(refresh);
-onUnmounted(() => recorder?.state === "recording" && recorder.stop());
+onUnmounted(() => {
+  audioProcessor?.disconnect();
+  audioSource?.disconnect();
+  recordingStream?.getTracks().forEach((track) => track.stop());
+  void audioContext?.close();
+});
 </script>
 
 <template>
