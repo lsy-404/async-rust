@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use keyring::Entry;
 use quick_xml::{events::Event, Reader};
@@ -611,38 +612,18 @@ fn persist_message(
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())
 }
-pub fn parse_sse_payload(payload: &str) -> Vec<String> {
-    payload
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter(|value| *value != "[DONE]")
-        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
-        .filter_map(|v| {
-            v.pointer("/choices/0/delta/content")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-        .collect()
-}
-fn process_sse_line(line: &str) -> Result<(Vec<String>, bool), String> {
-    let Some(data) = line.strip_prefix("data: ") else {
-        return Ok((vec![], false));
-    };
+fn sse_delta(data: &str) -> Result<Option<String>, String> {
     if data == "[DONE]" {
-        return Ok((vec![], true));
+        return Ok(None);
     }
     let value: Value = serde_json::from_str(data).map_err(|_| "模型流返回了无效事件。")?;
     if let Some(message) = value.pointer("/error/message").and_then(Value::as_str) {
         return Err(format!("模型请求失败：{message}"));
     }
-    Ok((
-        value
-            .pointer("/choices/0/delta/content")
-            .and_then(Value::as_str)
-            .map(|v| vec![v.to_string()])
-            .unwrap_or_default(),
-        false,
-    ))
+    Ok(value
+        .pointer("/choices/0/delta/content")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned))
 }
 fn generation_token(state: &AppState, session_id: &str) -> Result<CancellationToken, String> {
     let mut active = state.cancellations.lock().map_err(|_| "生成状态不可用。")?;
@@ -652,23 +633,6 @@ fn generation_token(state: &AppState, session_id: &str) -> Result<CancellationTo
     let token = CancellationToken::new();
     active.insert(session_id.into(), token.clone());
     Ok(token)
-}
-pub fn parse_sse_chunks(chunks: impl IntoIterator<Item = Vec<u8>>) -> Result<Vec<String>, String> {
-    let mut pending = Vec::new();
-    let mut deltas = Vec::new();
-    for chunk in chunks {
-        pending.extend(chunk);
-        while let Some(index) = pending.iter().position(|byte| *byte == b'\n') {
-            let line = pending.drain(..=index).collect::<Vec<_>>();
-            let line = std::str::from_utf8(&line).map_err(|_| "模型流返回了无效 UTF-8。")?;
-            deltas.extend(parse_sse_payload(line.trim()));
-        }
-    }
-    if !pending.is_empty() {
-        let line = std::str::from_utf8(&pending).map_err(|_| "模型流返回了无效 UTF-8。")?;
-        deltas.extend(parse_sse_payload(line));
-    }
-    Ok(deltas)
 }
 async fn streamed_completion(
     state: &AppState,
@@ -691,8 +655,7 @@ async fn streamed_completion(
     let response = tokio::select! { _ = cancellation.cancelled() => return Ok(String::new()), response = request.send() => response.map_err(|e|e.to_string())? }
         .error_for_status()
         .map_err(|e| e.to_string())?;
-    let mut stream = response.bytes_stream();
-    let mut pending = Vec::new();
+    let mut stream = response.bytes_stream().eventsource();
     let mut answer = String::new();
     let mut complete = false;
     while !complete {
@@ -701,27 +664,12 @@ async fn streamed_completion(
         let Some(next) = next else {
             break;
         };
-        pending.extend(next.map_err(|e| e.to_string())?);
-        while let Some(index) = pending.iter().position(|byte| *byte == b'\n') {
-            let line = pending.drain(..=index).collect::<Vec<_>>();
-            let line = std::str::from_utf8(&line).map_err(|_| "模型流返回了无效 UTF-8。")?;
-            let (deltas, done) = process_sse_line(line.trim())?;
-            complete |= done;
-            for delta in deltas {
-                answer.push_str(&delta);
-                channel
-                    .send(StreamEvent {
-                        kind: "delta".into(),
-                        text: delta,
-                    })
-                    .map_err(|e| e.to_string())?;
-            }
+        let event = next.map_err(|e| e.to_string())?;
+        if event.data == "[DONE]" {
+            complete = true;
+            continue;
         }
-    }
-    if !pending.is_empty() {
-        let line = std::str::from_utf8(&pending).map_err(|_| "模型流返回了无效 UTF-8。")?;
-        let (deltas, _) = process_sse_line(line)?;
-        for delta in deltas {
+        if let Some(delta) = sse_delta(&event.data)? {
             answer.push_str(&delta);
             channel
                 .send(StreamEvent {
@@ -893,14 +841,26 @@ async fn transcribe(
         .and_then(Value::as_str)
         .ok_or("转录服务未返回 text。")?
         .to_string();
-    state
-        .db()?
-        .execute(
-            "UPDATE sessions SET transcription=? WHERE id=?",
-            params![text, session_id],
+    let db = state.db()?;
+    let existing = db
+        .query_row(
+            "SELECT transcription FROM sessions WHERE id=?",
+            [session_id],
+            |row| row.get::<_, Option<String>>(0),
         )
-        .map_err(|e| e.to_string())?;
-    Ok(text)
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or("找不到会话。")?;
+    let combined = match existing.filter(|value| !value.trim().is_empty()) {
+        Some(previous) => format!("{previous}\n\n{text}"),
+        None => text,
+    };
+    db.execute(
+        "UPDATE sessions SET transcription=? WHERE id=?",
+        params![combined, session_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(combined)
 }
 #[tauri::command]
 async fn transcribe_audio(
@@ -961,3 +921,7 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running Async");
 }
+
+#[cfg(test)]
+#[path = "../../test/backend_core.rs"]
+mod backend_core_tests;
