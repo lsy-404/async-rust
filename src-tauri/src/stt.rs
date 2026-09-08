@@ -83,8 +83,7 @@ pub struct SttManager {
     inference: Arc<Semaphore>,
 }
 
-/// A single recording keeps these native objects alive for its whole lifetime.
-/// VAD emits complete phrases while audio is still being captured.
+// Keep native models warm throughout the recording.
 pub struct LiveTranscriber {
     recognizer: OfflineRecognizer,
     vad: VoiceActivityDetector,
@@ -426,7 +425,7 @@ impl LiveTranscriber {
     fn accept_samples(&mut self, samples: &[f32]) -> Result<Vec<String>, String> {
         self.carry.extend_from_slice(samples);
         let complete = self.carry.len() / VAD_WINDOW * VAD_WINDOW;
-        for chunk in self.carry[..complete].chunks_exact(VAD_WINDOW) {
+        for chunk in self.carry[..complete].as_chunks::<VAD_WINDOW>().0 {
             self.vad.accept_waveform(chunk);
         }
         if complete > 0 {

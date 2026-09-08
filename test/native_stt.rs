@@ -461,9 +461,8 @@ fn actual_live_transcriber_emits_segments_before_finish_and_flushes_tail() {
         }
         // This proves a segment was published while capture was still active;
         // continuous speech is bounded by the configured eight-second VAD cut.
-        let first = first_segment_at.expect(&format!(
-            "no transcript before recording finished at {rate} Hz"
-        ));
+        let first = first_segment_at
+            .unwrap_or_else(|| panic!("no transcript before recording finished at {rate} Hz"));
         assert!(
             first as f32 / (rate as f32) < 9.0,
             "rate={rate}, first={first}"

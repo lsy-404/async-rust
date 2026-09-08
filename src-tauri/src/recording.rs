@@ -515,9 +515,7 @@ fn recording_worker(
     let transcription = transcript_worker
         .join()
         .map_err(|_| "本地转写线程意外停止。")?;
-    if let Err(error) = outcome {
-        return Err(error);
-    }
+    outcome?;
     transcription?;
     if !stop {
         return Ok(None);
