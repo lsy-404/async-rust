@@ -92,7 +92,7 @@ let recordingGeneration = 0;
 const sidebarMode = ref<"session" | "knowledge">("session");
 const searchQuery = ref("");
 const activeSessionTab = ref<"chat" | "summary">("chat");
-const sidebarWidth = ref(264);
+const sidebarOpen = ref(true);
 const mainPanelRatio = ref(0.62);
 const layoutRef = ref<HTMLElement>();
 const transcriptScrollRef = ref<HTMLElement>();
@@ -600,7 +600,7 @@ onUnmounted(() => {
       >
       <div v-if="loading" class="loading">正在加载本地课堂数据…</div>
       <div v-else class="desktop-shell">
-        <aside class="app-sidebar" :style="{ width: `${sidebarWidth}px` }">
+        <aside v-if="sidebarOpen" class="app-sidebar">
           <div class="sidebar-search">
             <FluentField
               v-model="searchQuery"
@@ -765,6 +765,13 @@ onUnmounted(() => {
           }"
         >
           <header class="app-header">
+            <FluentButton
+              tone="subtle"
+              :aria-expanded="sidebarOpen"
+              aria-label="切换侧栏"
+              @click="sidebarOpen = !sidebarOpen"
+              >☰</FluentButton
+            >
             <h1>{{ session?.title || "Async" }}</h1>
             <div class="header-actions">
               <span class="status">{{

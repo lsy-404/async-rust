@@ -117,6 +117,10 @@ describe("original workbench layout", () => {
     await sessions[2]!.trigger("click");
     expect(wrapper.find(".app-header h1").text()).toBe("第三节");
     expect(wrapper.find(".transcript-content").exists()).toBe(true);
+    await wrapper.get('[aria-label="切换侧栏"]').trigger("click");
+    expect(wrapper.find(".app-sidebar").exists()).toBe(false);
+    await wrapper.get('[aria-label="切换侧栏"]').trigger("click");
+    expect(wrapper.find(".app-sidebar").exists()).toBe(true);
     await wrapper
       .findAll("button")
       .find((item) => item.text() === "知识库")!
