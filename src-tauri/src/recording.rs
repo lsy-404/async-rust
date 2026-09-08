@@ -22,7 +22,6 @@ use crate::stt::{LiveTranscriber, SttManager};
 
 const CHUNK_FRAMES: usize = 4096;
 const QUEUE_CHUNKS: usize = 32;
-const TRANSCRIPT_QUEUE_CHUNKS: usize = 48;
 const MAX_WAV_BYTES: u64 = 512 * 1024 * 1024;
 const FAILURE_OVERFLOW: u8 = 1;
 const FAILURE_DEVICE: u8 = 2;
@@ -346,6 +345,28 @@ where
         .map_err(|e| format!("无法开启麦克风，请检查权限和设备：{e}"))
 }
 
+fn forward_transcript_audio(
+    pending: &mut Vec<i16>,
+    input: &[i16],
+    sender: &SyncSender<Vec<i16>>,
+    final_chunk: bool,
+) -> Result<(), String> {
+    pending.extend_from_slice(input);
+    while pending.len() >= CHUNK_FRAMES {
+        let rest = pending.split_off(CHUNK_FRAMES);
+        let chunk = std::mem::replace(pending, rest);
+        sender.try_send(chunk).map_err(|_| {
+            String::from("本地转写队列溢出，录音已停止；请关闭占用资源的程序后重试。")
+        })?;
+    }
+    if final_chunk && !pending.is_empty() {
+        sender.try_send(std::mem::take(pending)).map_err(|_| {
+            String::from("本地转写队列溢出，录音已停止；请关闭占用资源的程序后重试。")
+        })?;
+    }
+    Ok(())
+}
+
 fn recording_worker(
     path: PathBuf,
     commands: Receiver<Control>,
@@ -379,7 +400,9 @@ fn recording_worker(
             )),
         }?;
         let mut live = SttManager::from_root(stt_root).live_transcriber(config.sample_rate)?;
-        let (transcript_sender, transcript_audio) = mpsc::sync_channel(TRANSCRIPT_QUEUE_CHUNKS);
+        let transcript_queue_chunks =
+            ((config.sample_rate as usize * 8).div_ceil(CHUNK_FRAMES)).max(48);
+        let (transcript_sender, transcript_audio) = mpsc::sync_channel(transcript_queue_chunks);
         let transcription_cancel = canceled.clone();
         let transcript_worker = thread::Builder::new()
             .name("local-live-transcriber".into())
@@ -418,6 +441,7 @@ fn recording_worker(
         return Ok(None);
     }
     let mut outcome: Result<bool, String> = Ok(false);
+    let mut pending_transcript_audio = Vec::with_capacity(CHUNK_FRAMES);
     loop {
         match commands.try_recv() {
             Ok(Control::Stop) => {
@@ -434,9 +458,12 @@ fn recording_worker(
         match audio.recv_timeout(Duration::from_millis(10)) {
             Ok(samples) => {
                 if let Err(error) = writer.write(&samples).and_then(|_| {
-                    transcript_sender.try_send(samples).map_err(|_| {
-                        "本地转写队列溢出，录音已停止；请关闭占用资源的程序后重试。".into()
-                    })
+                    forward_transcript_audio(
+                        &mut pending_transcript_audio,
+                        &samples,
+                        &transcript_sender,
+                        false,
+                    )
                 }) {
                     outcome = Err(error);
                     break;
@@ -458,12 +485,25 @@ fn recording_worker(
         if outcome.is_ok() {
             for samples in audio.try_iter() {
                 if let Err(error) = writer.write(&samples).and_then(|_| {
-                    transcript_sender.try_send(samples).map_err(|_| {
-                        "本地转写队列溢出，录音已停止；请关闭占用资源的程序后重试。".into()
-                    })
+                    forward_transcript_audio(
+                        &mut pending_transcript_audio,
+                        &samples,
+                        &transcript_sender,
+                        false,
+                    )
                 }) {
                     outcome = Err(error);
                     break;
+                }
+            }
+            if outcome.is_ok() {
+                if let Err(error) = forward_transcript_audio(
+                    &mut pending_transcript_audio,
+                    &[],
+                    &transcript_sender,
+                    true,
+                ) {
+                    outcome = Err(error);
                 }
             }
         }

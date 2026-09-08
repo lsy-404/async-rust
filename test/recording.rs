@@ -29,6 +29,25 @@ fn callback_is_bounded_and_reports_overflow_or_invalid_samples() {
 }
 
 #[test]
+fn transcript_handoff_aggregates_small_callbacks_and_flushes_stop_tail() {
+    let (sender, receiver) = mpsc::sync_channel(4);
+    let mut pending = Vec::new();
+    let input: Vec<i16> = (0..(CHUNK_FRAMES * 2 + 317))
+        .map(|value| value as i16)
+        .collect();
+    for part in input.chunks(512) {
+        forward_transcript_audio(&mut pending, part, &sender, false).unwrap();
+    }
+    forward_transcript_audio(&mut pending, &[], &sender, true).unwrap();
+    let chunks: Vec<Vec<i16>> = receiver.try_iter().collect();
+    assert_eq!(
+        chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![CHUNK_FRAMES, CHUNK_FRAMES, 317]
+    );
+    assert_eq!(chunks.concat(), input);
+}
+
+#[test]
 fn wav_writer_persists_source_rate_and_cleans_canceled_or_oversized_file() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("capture.wav");
