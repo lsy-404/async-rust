@@ -54,3 +54,9 @@ export interface StreamEvent {
   type: "delta" | "done";
   text: string;
 }
+
+export interface RecordingEvent {
+  type: "transcript" | "error";
+  sessionId: string;
+  text: string;
+}

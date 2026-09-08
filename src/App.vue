@@ -22,6 +22,7 @@ import type {
   Settings,
   StreamEvent,
   SttStatus,
+  RecordingEvent,
   Workspace,
 } from "./types";
 import {
@@ -78,6 +79,7 @@ const deleteTarget = ref<{
 }>();
 const recordingStarting = ref(false);
 const recordingSessionId = ref("");
+let recordingGeneration = 0;
 
 const workspaces = computed(() => data.value.workspaces);
 const sessions = computed(() =>
@@ -386,17 +388,36 @@ async function toggleRecording() {
     } finally {
       transcriptionLoading.value = false;
       recordingSessionId.value = "";
+      recordingGeneration += 1;
     }
     return;
   }
   const sessionId = session.value.id;
   recordingStarting.value = true;
   error.value = "";
+  const generation = ++recordingGeneration;
+  const onEvent = new Channel<RecordingEvent>();
+  recordingSessionId.value = sessionId;
+  onEvent.onmessage = (event) => {
+    if (generation !== recordingGeneration || event.sessionId !== sessionId) return;
+    if (event.type === "error") {
+      report(event.text);
+      recording.value = false;
+      recordingSessionId.value = "";
+      recordingGeneration += 1;
+      void invoke("cancel_recording").catch(report);
+      return;
+    }
+    const target = data.value.sessions.find((item) => item.id === sessionId);
+    if (target) target.transcription = event.text;
+  };
   try {
-    await invoke("start_recording", { sessionId });
-    recordingSessionId.value = sessionId;
+    await invoke("start_recording", { sessionId, onEvent });
+    if (generation !== recordingGeneration) return;
     recording.value = true;
   } catch (cause) {
+    recordingSessionId.value = "";
+    recordingGeneration += 1;
     report(cause);
   } finally {
     recordingStarting.value = false;
@@ -456,6 +477,7 @@ watch(
 );
 onMounted(refresh);
 onUnmounted(() => {
+  recordingGeneration += 1;
   if (recording.value || recordingStarting.value)
     void invoke("cancel_recording").catch(() => undefined);
 });
