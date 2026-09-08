@@ -104,6 +104,14 @@ pub struct StreamEvent {
     pub kind: String,
     pub text: String,
 }
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingEvent {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub session_id: String,
+    pub text: String,
+}
 
 pub struct AppState {
     db_path: PathBuf,
@@ -732,7 +740,15 @@ fn cancel_stt_download(state: tauri::State<'_, AppState>) -> Result<(), String> 
 }
 
 fn append_transcription(state: &AppState, session_id: &str, text: &str) -> Result<String, String> {
-    let mut db = state.db()?;
+    append_transcription_at(&state.db_path, session_id, text)
+}
+
+fn append_transcription_at(
+    database_path: &Path,
+    session_id: &str,
+    text: &str,
+) -> Result<String, String> {
+    let mut db = open_database(database_path)?;
     let tx = db.transaction().map_err(|e| e.to_string())?;
     let existing = tx
         .query_row(
@@ -831,6 +847,7 @@ async fn transcribe_bytes(
 #[tauri::command]
 async fn start_recording(
     session_id: String,
+    on_event: Channel<RecordingEvent>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     let exists: bool = state
@@ -844,21 +861,49 @@ async fn start_recording(
     if !exists {
         return Err("找不到会话。".into());
     }
-    if state
-        .cancellations
-        .lock()
-        .map_err(|_| "任务状态不可用。")?
-        .contains_key(&session_id)
-    {
-        return Err("该会话已有任务运行中。".into());
-    }
-    state
+    let database = state.db_path.clone();
+    let active_session = session_id.clone();
+    let channel = on_event.clone();
+    let on_transcript = std::sync::Arc::new(move |segment: String| {
+        let text = append_transcription_at(&database, &active_session, &segment)?;
+        channel
+            .send(RecordingEvent {
+                kind: "transcript".into(),
+                session_id: active_session.clone(),
+                text,
+            })
+            .map_err(|_| "转写状态通道已关闭。".into())
+    });
+    let error_session = session_id.clone();
+    let error_channel = on_event.clone();
+    let on_error = std::sync::Arc::new(move |text: String| {
+        let _ = error_channel.send(RecordingEvent {
+            kind: "error".into(),
+            session_id: error_session.clone(),
+            text,
+        });
+    });
+    match state
         .recording
         .start(
             &session_id,
             state.db_path.parent().ok_or("本地数据路径无效。")?,
+            &state.stt,
+            on_transcript,
+            on_error,
         )
         .await
+    {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = on_event.send(RecordingEvent {
+                kind: "error".into(),
+                session_id,
+                text: error.clone(),
+            });
+            Err(error)
+        }
+    }
 }
 #[tauri::command]
 async fn stop_recording(
@@ -866,15 +911,17 @@ async fn stop_recording(
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
     let path = state.recording.stop(&session_id).await?;
-    let result = transcribe_audio(session_id, path.to_string_lossy().into_owned(), state).await;
-    let cleanup = tokio::fs::remove_file(&path).await;
-    match result {
-        Ok(text) => {
-            cleanup.map_err(|_| "转写完成，但无法清理临时录音。")?;
-            Ok(text)
-        }
-        Err(error) => Err(error),
-    }
+    tokio::fs::remove_file(&path)
+        .await
+        .map_err(|_| "转写完成，但无法清理临时录音。")?;
+    state
+        .db()?
+        .query_row(
+            "SELECT COALESCE(transcription, '') FROM sessions WHERE id=?",
+            [&session_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())
 }
 #[tauri::command]
 async fn cancel_recording(state: tauri::State<'_, AppState>) -> Result<(), String> {

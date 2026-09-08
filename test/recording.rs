@@ -70,8 +70,33 @@ fn fake_active(session_id: &str, canceled: Arc<AtomicU8>) -> ActiveRecording {
     ActiveRecording {
         session_id: session_id.into(),
         control,
+        canceled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        callback_gate: Arc::new(StdMutex::new(())),
         worker: Some(worker),
     }
+}
+
+#[test]
+fn cancellation_gate_rejects_late_transcript_persistence() {
+    let canceled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gate = Arc::new(StdMutex::new(()));
+    let persisted = Arc::new(StdMutex::new(Vec::new()));
+    let destination = persisted.clone();
+    let callback = guarded_callback(
+        canceled.clone(),
+        gate.clone(),
+        Arc::new(move |text| {
+            destination.lock().unwrap().push(text);
+            Ok(())
+        }),
+    );
+    callback("before".into()).unwrap();
+    {
+        let _guard = gate.lock().unwrap();
+        canceled.store(true, Ordering::Release);
+    }
+    callback("after".into()).unwrap();
+    assert_eq!(&*persisted.lock().unwrap(), &["before"]);
 }
 
 #[tokio::test]
@@ -85,7 +110,13 @@ async fn lifecycle_pins_session_and_cancel_or_drop_joins_worker() {
         .unwrap_err()
         .contains("其他会话"));
     assert!(manager
-        .start("new", Path::new("unused"))
+        .start(
+            "new",
+            Path::new("unused"),
+            &SttManager::new(PathBuf::from("unused")),
+            Arc::new(|_| Ok(())),
+            Arc::new(|_| {}),
+        )
         .await
         .unwrap_err()
         .contains("已有"));

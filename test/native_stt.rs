@@ -47,6 +47,50 @@ fn decodes_and_resamples_real_capture_rates_and_stereo() {
 }
 
 #[test]
+fn streaming_resampler_preserves_one_shot_audio_for_capture_chunk_sizes() {
+    let source: Vec<f32> = (0..(16_000 * 3))
+        .map(|index| {
+            let t = index as f32 / 16_000.0;
+            (t * 2.0 * std::f32::consts::PI * 440.0).sin() * 0.6
+        })
+        .collect();
+    for rate in [44_100, 48_000] {
+        let expected = LinearResampler::create(rate, 16_000).unwrap().resample(
+            &LinearResampler::create(16_000, rate)
+                .unwrap()
+                .resample(&source, true),
+            true,
+        );
+        let captured = LinearResampler::create(16_000, rate)
+            .unwrap()
+            .resample(&source, true);
+        for chunk_size in [512, 1_024, 4_096] {
+            let resampler = LinearResampler::create(rate, 16_000).unwrap();
+            let mut streamed = Vec::new();
+            for chunk in captured.chunks(chunk_size) {
+                streamed.extend(resampler.resample(chunk, false));
+            }
+            streamed.extend(resampler.resample(&[], true));
+            assert!(
+                (streamed.len() as isize - expected.len() as isize).abs() <= 1,
+                "rate={rate}, chunk={chunk_size}, streamed={}, expected={}",
+                streamed.len(),
+                expected.len()
+            );
+            let error = streamed
+                .iter()
+                .zip(&expected)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                error < 0.002,
+                "rate={rate}, chunk={chunk_size}, error={error}"
+            );
+        }
+    }
+}
+
+#[test]
 fn rejects_invalid_audio_and_observes_cancellation() {
     assert!(decode_audio("broken.wav", vec![0; 64], &CancellationToken::new()).is_err());
     let canceled = CancellationToken::new();
@@ -374,4 +418,67 @@ async fn actual_whisper_jfk_recognizes_capture_rates_and_persists_without_key() 
         .await
         .unwrap_err()
         .contains("未检测到"));
+}
+
+#[test]
+#[ignore = "Set ASYNC_STT_MODEL_ROOT and ASYNC_STT_JFK_WAV to run against an installed local model"]
+fn actual_live_transcriber_emits_segments_before_finish_and_flushes_tail() {
+    let model_root = PathBuf::from(std::env::var("ASYNC_STT_MODEL_ROOT").unwrap());
+    let source = PathBuf::from(std::env::var("ASYNC_STT_JFK_WAV").unwrap());
+    let bytes = fs::read(source).unwrap();
+    let samples = decode_audio("jfk.wav", bytes, &CancellationToken::new()).unwrap();
+    let rates = std::env::var("ASYNC_STT_TEST_RATE")
+        .ok()
+        .map(|value| vec![value.parse::<i32>().unwrap()])
+        .unwrap_or_else(|| vec![16_000, 44_100, 48_000]);
+    for rate in rates {
+        let captured = if rate == 16_000 {
+            samples.clone()
+        } else {
+            LinearResampler::create(16_000, rate)
+                .unwrap()
+                .resample(&samples, true)
+        };
+        let mut live = SttManager::new(model_root.clone())
+            .live_transcriber(rate as u32)
+            .unwrap();
+        let mut output = Vec::new();
+        let mut first_segment_at = None;
+        let mut first_decode_elapsed = None;
+        let started = std::time::Instant::now();
+        // Match the bounded CPAL handoff chunk used by RecordingManager.
+        for (index, chunk) in captured.chunks(4_096).enumerate() {
+            let pcm: Vec<i16> = chunk
+                .iter()
+                .map(|sample| (sample.clamp(-1.0, 1.0) * 32767.0) as i16)
+                .collect();
+            let segments = live.accept_i16(&pcm).unwrap();
+            if !segments.is_empty() && first_segment_at.is_none() {
+                first_segment_at = Some((index + 1) * 4_096);
+                first_decode_elapsed = Some(started.elapsed());
+            }
+            output.extend(segments);
+        }
+        // This proves a segment was published while capture was still active;
+        // continuous speech is bounded by the configured eight-second VAD cut.
+        let first = first_segment_at.expect(&format!(
+            "no transcript before recording finished at {rate} Hz"
+        ));
+        assert!(
+            first as f32 / (rate as f32) < 9.0,
+            "rate={rate}, first={first}"
+        );
+        output.extend(live.finish().unwrap());
+        let text = output.join(" ").to_lowercase();
+        let elapsed = started.elapsed();
+        eprintln!(
+            "live {rate} Hz: first-input={:.2}s, first-decode={:.2}s, total={:.2}s, rtf={:.2}; {text}",
+            first as f32 / rate as f32,
+            first_decode_elapsed.unwrap().as_secs_f32(),
+            elapsed.as_secs_f32(),
+            elapsed.as_secs_f32() / (captured.len() as f32 / rate as f32),
+        );
+        assert!(text.contains("your country can do for you"));
+        assert!(text.contains("what you can do for your country"));
+    }
 }

@@ -83,6 +83,15 @@ pub struct SttManager {
     inference: Arc<Semaphore>,
 }
 
+/// A single recording keeps these native objects alive for its whole lifetime.
+/// VAD emits complete phrases while audio is still being captured.
+pub struct LiveTranscriber {
+    recognizer: OfflineRecognizer,
+    vad: VoiceActivityDetector,
+    resampler: Option<LinearResampler>,
+    carry: Vec<f32>,
+}
+
 struct DownloadGuard<'a>(&'a Mutex<Option<CancellationToken>>);
 impl Drop for DownloadGuard<'_> {
     fn drop(&mut self) {
@@ -162,8 +171,20 @@ impl SttManager {
             inference: Arc::new(Semaphore::new(1)),
         }
     }
+    pub(crate) fn from_root(root: PathBuf) -> Self {
+        Self::new(root)
+    }
+    pub(crate) fn clone_root(&self) -> PathBuf {
+        self.root.clone()
+    }
     fn model_path(&self) -> PathBuf {
         self.root.join("whisper-tiny-multilingual-int8")
+    }
+
+    pub(crate) fn live_transcriber(&self, source_rate: u32) -> Result<LiveTranscriber, String> {
+        let root = self.model_path();
+        verified_install(&root, &CancellationToken::new())?;
+        LiveTranscriber::create(root, source_rate)
     }
     pub async fn status(&self) -> Result<SttStatus, String> {
         let root = self.model_path();
@@ -310,6 +331,124 @@ impl SttManager {
         })
         .await
         .map_err(|e| e.to_string())?
+    }
+}
+
+impl LiveTranscriber {
+    fn create(root: PathBuf, source_rate: u32) -> Result<Self, String> {
+        if !(8_000..=192_000).contains(&source_rate) {
+            return Err("麦克风采样率不受支持。".into());
+        }
+        let path = |name: &str| root.join(name).to_string_lossy().into_owned();
+        let config = OfflineRecognizerConfig {
+            model_config: OfflineModelConfig {
+                whisper: OfflineWhisperModelConfig {
+                    encoder: Some(path(EXPECTED_FILES[0])),
+                    decoder: Some(path(EXPECTED_FILES[1])),
+                    language: Some(String::new()),
+                    task: Some("transcribe".into()),
+                    tail_paddings: -1,
+                    ..Default::default()
+                },
+                tokens: Some(path(EXPECTED_FILES[2])),
+                num_threads: 2,
+                provider: Some("cpu".into()),
+                ..Default::default()
+            },
+            decoding_method: Some("greedy_search".into()),
+            ..Default::default()
+        };
+        let recognizer =
+            OfflineRecognizer::create(&config).ok_or("无法启动 Whisper 本地识别引擎。")?;
+        let vad_config = VadModelConfig {
+            silero_vad: SileroVadModelConfig {
+                model: Some(path(EXPECTED_FILES[3])),
+                threshold: 0.5,
+                min_speech_duration: 0.25,
+                min_silence_duration: 0.65,
+                window_size: VAD_WINDOW as i32,
+                // Bound continuous speech so a lecturer does not need to pause
+                // before the first result can be produced.
+                max_speech_duration: 8.0,
+            },
+            sample_rate: SAMPLE_RATE,
+            num_threads: 1,
+            provider: Some("cpu".into()),
+            ..Default::default()
+        };
+        let vad = VoiceActivityDetector::create(&vad_config, 30.0)
+            .ok_or("无法启动 Silero 语音检测引擎。")?;
+        let resampler = if source_rate == SAMPLE_RATE as u32 {
+            None
+        } else {
+            Some(
+                LinearResampler::create(source_rate as i32, SAMPLE_RATE)
+                    .ok_or("无法启动本地音频重采样器。")?,
+            )
+        };
+        Ok(Self {
+            recognizer,
+            vad,
+            resampler,
+            carry: Vec::new(),
+        })
+    }
+
+    pub(crate) fn accept_i16(&mut self, samples: &[i16]) -> Result<Vec<String>, String> {
+        let samples: Vec<f32> = samples
+            .iter()
+            .map(|sample| *sample as f32 / 32768.0)
+            .collect();
+        let converted = match &self.resampler {
+            Some(resampler) => resampler.resample(&samples, false),
+            None => samples,
+        };
+        self.accept_samples(&converted)
+    }
+
+    pub(crate) fn finish(&mut self) -> Result<Vec<String>, String> {
+        let mut output = Vec::new();
+        if let Some(resampler) = &self.resampler {
+            let trailing = resampler.resample(&[], true);
+            output.extend(self.accept_samples(&trailing)?);
+        }
+        if !self.carry.is_empty() {
+            let mut last = [0.0; VAD_WINDOW];
+            last[..self.carry.len()].copy_from_slice(&self.carry);
+            self.vad.accept_waveform(&last);
+            self.carry.clear();
+        }
+        self.vad.flush();
+        output.extend(self.drain()?);
+        Ok(output)
+    }
+
+    fn accept_samples(&mut self, samples: &[f32]) -> Result<Vec<String>, String> {
+        self.carry.extend_from_slice(samples);
+        let complete = self.carry.len() / VAD_WINDOW * VAD_WINDOW;
+        for chunk in self.carry[..complete].chunks_exact(VAD_WINDOW) {
+            self.vad.accept_waveform(chunk);
+        }
+        if complete > 0 {
+            self.carry.drain(..complete);
+        }
+        self.drain()
+    }
+
+    fn drain(&self) -> Result<Vec<String>, String> {
+        let mut output = Vec::new();
+        while let Some(segment) = self.vad.front() {
+            let stream = self.recognizer.create_stream();
+            stream.accept_waveform(SAMPLE_RATE, segment.samples());
+            self.recognizer.decode(&stream);
+            let result = stream.get_result().ok_or("本地识别引擎没有返回结果。")?;
+            let text = result.text.trim();
+            if !text.is_empty() {
+                output.push(text.to_owned());
+            }
+            self.vad.pop();
+        }
+        Ok(output)
     }
 }
 

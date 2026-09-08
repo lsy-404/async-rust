@@ -5,7 +5,7 @@ use std::{
     sync::{
         atomic::{AtomicU8, Ordering},
         mpsc::{self, Receiver, Sender, SyncSender, TryRecvError},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -18,8 +18,11 @@ use cpal::{
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::stt::{LiveTranscriber, SttManager};
+
 const CHUNK_FRAMES: usize = 4096;
 const QUEUE_CHUNKS: usize = 32;
+const TRANSCRIPT_QUEUE_CHUNKS: usize = 48;
 const MAX_WAV_BYTES: u64 = 512 * 1024 * 1024;
 const FAILURE_OVERFLOW: u8 = 1;
 const FAILURE_DEVICE: u8 = 2;
@@ -30,14 +33,22 @@ enum Control {
     Cancel,
 }
 type WorkerResult = Result<Option<PathBuf>, String>;
+type TranscriptCallback = Arc<dyn Fn(String) -> Result<(), String> + Send + Sync>;
+type ErrorCallback = Arc<dyn Fn(String) + Send + Sync>;
 
 struct ActiveRecording {
     session_id: String,
     control: Sender<Control>,
+    canceled: Arc<std::sync::atomic::AtomicBool>,
+    callback_gate: Arc<StdMutex<()>>,
     worker: Option<JoinHandle<WorkerResult>>,
 }
 impl ActiveRecording {
     fn finish(mut self, command: Control) -> WorkerResult {
+        if matches!(command, Control::Cancel) {
+            let _gate = self.callback_gate.lock().map_err(|_| "录音状态不可用。")?;
+            self.canceled.store(true, Ordering::Release);
+        }
         let _ = self.control.send(command);
         self.worker
             .take()
@@ -48,6 +59,9 @@ impl ActiveRecording {
 }
 impl Drop for ActiveRecording {
     fn drop(&mut self) {
+        if let Ok(_gate) = self.callback_gate.lock() {
+            self.canceled.store(true, Ordering::Release);
+        }
         let _ = self.control.send(Control::Cancel);
         if let Some(worker) = self.worker.take() {
             if let Ok(Ok(Some(path))) = worker.join() {
@@ -86,7 +100,14 @@ impl RecordingManager {
         }
     }
 
-    pub async fn start(&self, session_id: &str, data_root: &Path) -> Result<(), String> {
+    pub async fn start(
+        &self,
+        session_id: &str,
+        data_root: &Path,
+        stt: &SttManager,
+        on_transcript: TranscriptCallback,
+        on_error: ErrorCallback,
+    ) -> Result<(), String> {
         if session_id.trim().is_empty() {
             return Err("找不到录音会话。".into());
         }
@@ -99,13 +120,35 @@ impl RecordingManager {
             .join(format!("recording-{}.wav", Uuid::new_v4()));
         let (control, commands) = mpsc::channel();
         let (ready, startup) = mpsc::sync_channel(1);
+        let canceled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_gate = Arc::new(StdMutex::new(()));
+        let guarded_transcript =
+            guarded_callback(canceled.clone(), callback_gate.clone(), on_transcript);
+        let stt_root = stt.clone_root();
+        let worker_canceled = canceled.clone();
+        let worker_error = on_error.clone();
         let worker = thread::Builder::new()
             .name("microphone-writer".into())
-            .spawn(move || recording_worker(path, commands, ready))
+            .spawn(move || {
+                let result = recording_worker(
+                    path,
+                    commands,
+                    ready,
+                    stt_root,
+                    guarded_transcript,
+                    worker_canceled,
+                );
+                if let Err(error) = &result {
+                    worker_error(error.clone());
+                }
+                result
+            })
             .map_err(|e| e.to_string())?;
         let active = ActiveRecording {
             session_id: session_id.into(),
             control,
+            canceled,
+            callback_gate,
             worker: Some(worker),
         };
         tokio::task::spawn_blocking(move || startup.recv())
@@ -138,6 +181,20 @@ impl RecordingManager {
         }
         Ok(())
     }
+}
+
+fn guarded_callback(
+    canceled: Arc<std::sync::atomic::AtomicBool>,
+    callback_gate: Arc<StdMutex<()>>,
+    callback: TranscriptCallback,
+) -> TranscriptCallback {
+    Arc::new(move |text| {
+        let _gate = callback_gate.lock().map_err(|_| "录音状态不可用。")?;
+        if canceled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        callback(text)
+    })
 }
 impl Drop for RecordingManager {
     fn drop(&mut self) {
@@ -293,6 +350,9 @@ fn recording_worker(
     path: PathBuf,
     commands: Receiver<Control>,
     ready: SyncSender<Result<(), String>>,
+    stt_root: PathBuf,
+    on_transcript: TranscriptCallback,
+    canceled: Arc<std::sync::atomic::AtomicBool>,
 ) -> WorkerResult {
     let initialize = || {
         let host = cpal::default_host();
@@ -318,41 +378,140 @@ fn recording_worker(
                 "麦克风格式 {format:?} 不受支持，请选择 PCM16 或 Float32 输入。"
             )),
         }?;
+        let mut live = SttManager::from_root(stt_root).live_transcriber(config.sample_rate)?;
+        let (transcript_sender, transcript_audio) = mpsc::sync_channel(TRANSCRIPT_QUEUE_CHUNKS);
+        let transcription_cancel = canceled.clone();
+        let transcript_worker = thread::Builder::new()
+            .name("local-live-transcriber".into())
+            .spawn(move || {
+                transcription_worker(
+                    &mut live,
+                    transcript_audio,
+                    on_transcript,
+                    transcription_cancel,
+                )
+            })
+            .map_err(|e| e.to_string())?;
         stream.play().map_err(|e| format!("无法启动麦克风：{e}"))?;
-        Ok::<_, String>((stream, writer, audio, failure))
+        Ok::<_, String>((
+            stream,
+            writer,
+            audio,
+            transcript_sender,
+            transcript_worker,
+            failure,
+        ))
     };
-    let (stream, mut writer, audio, failure) = match initialize() {
-        Ok(value) => value,
-        Err(error) => {
-            let _ = ready.send(Err(error.clone()));
-            return Err(error);
-        }
-    };
+    let (stream, mut writer, audio, transcript_sender, transcript_worker, failure) =
+        match initialize() {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = ready.send(Err(error.clone()));
+                return Err(error);
+            }
+        };
     if ready.send(Ok(())).is_err() {
+        canceled.store(true, Ordering::Release);
+        drop(stream);
+        drop(transcript_sender);
+        let _ = transcript_worker.join();
         return Ok(None);
     }
-    let stop = loop {
+    let mut outcome: Result<bool, String> = Ok(false);
+    loop {
         match commands.try_recv() {
-            Ok(Control::Stop) => break true,
-            Ok(Control::Cancel) | Err(TryRecvError::Disconnected) => break false,
+            Ok(Control::Stop) => {
+                outcome = Ok(true);
+                break;
+            }
+            Ok(Control::Cancel) | Err(TryRecvError::Disconnected) => break,
             Err(TryRecvError::Empty) => {}
         }
-        failure_message(&failure)?;
-        match audio.recv_timeout(Duration::from_millis(10)) {
-            Ok(samples) => writer.write(&samples)?,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("麦克风采集意外停止。".into()),
+        if let Err(error) = failure_message(&failure) {
+            outcome = Err(error);
+            break;
         }
-    };
+        match audio.recv_timeout(Duration::from_millis(10)) {
+            Ok(samples) => {
+                if let Err(error) = writer.write(&samples).and_then(|_| {
+                    transcript_sender.try_send(samples).map_err(|_| {
+                        "本地转写队列溢出，录音已停止；请关闭占用资源的程序后重试。".into()
+                    })
+                }) {
+                    outcome = Err(error);
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                outcome = Err("麦克风采集意外停止。".into());
+                break;
+            }
+        }
+    }
     drop(stream);
+    let stop = matches!(outcome, Ok(true));
+    if stop {
+        if let Err(error) = failure_message(&failure) {
+            outcome = Err(error);
+        }
+        if outcome.is_ok() {
+            for samples in audio.try_iter() {
+                if let Err(error) = writer.write(&samples).and_then(|_| {
+                    transcript_sender.try_send(samples).map_err(|_| {
+                        "本地转写队列溢出，录音已停止；请关闭占用资源的程序后重试。".into()
+                    })
+                }) {
+                    outcome = Err(error);
+                    break;
+                }
+            }
+        }
+    }
+    if !matches!(outcome, Ok(true)) {
+        canceled.store(true, Ordering::Release);
+    }
+    drop(transcript_sender);
+    let transcription = transcript_worker
+        .join()
+        .map_err(|_| "本地转写线程意外停止。")?;
+    if let Err(error) = outcome {
+        return Err(error);
+    }
+    transcription?;
     if !stop {
         return Ok(None);
     }
-    failure_message(&failure)?;
-    for samples in audio.try_iter() {
-        writer.write(&samples)?;
-    }
     writer.finish().map(Some)
+}
+
+fn transcription_worker(
+    live: &mut LiveTranscriber,
+    audio: Receiver<Vec<i16>>,
+    on_transcript: TranscriptCallback,
+    canceled: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
+    for samples in audio {
+        if canceled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        for text in live.accept_i16(&samples)? {
+            if canceled.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            on_transcript(text)?;
+        }
+    }
+    if canceled.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    for text in live.finish()? {
+        if canceled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        on_transcript(text)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
