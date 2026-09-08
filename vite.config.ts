@@ -6,5 +6,8 @@ export default defineConfig({
   clearScreen: false,
   server: { port: 1420, strictPort: true, host: "127.0.0.1" },
   envPrefix: ["VITE_"],
-  test: { environment: "jsdom" },
+  test: {
+    environment: "jsdom",
+    server: { deps: { inline: ["@model-auth/vue", "@platform-kit/fluent"] } },
+  },
 });

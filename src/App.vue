@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import MarkdownIt from "markdown-it";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { ModelAuthDialog, type ModelAuthProvider } from "@model-auth/vue";
+import ModelConnections from "./components/ModelConnections.vue";
 import {
   FluentButton,
   FluentDialog,
@@ -25,7 +25,6 @@ import type {
 } from "./types";
 import {
   cancelStream,
-  removeProviderKey,
   saveNewProvider,
   streamCommand,
 } from "./workbench-commands";
@@ -55,9 +54,6 @@ const streaming = ref(false);
 const summaryLoading = ref(false);
 const summaryStream = ref("");
 const transcriptionLoading = ref(false);
-const authBusy = ref(false);
-const authProgress = ref("");
-const activeAuthProviderId = ref("");
 const stt = ref<SttStatus>({
   ready: false,
   modelName: "本地语音模型",
@@ -67,7 +63,7 @@ const stt = ref<SttStatus>({
 const sttDownloading = ref(false);
 const sttProgress = ref({ downloaded: 0, total: 0 });
 const settingsOpen = ref(false);
-const authOpen = ref(false);
+const modelConnections = ref<InstanceType<typeof ModelConnections>>();
 const workspaceName = ref("");
 const sessionTitle = ref("");
 const materialDraft = ref("");
@@ -75,7 +71,7 @@ const recording = ref(false);
 const providerName = ref("");
 const providerEndpoint = ref("");
 const deleteTarget = ref<{
-  kind: "workspace" | "session" | "material" | "provider";
+  kind: "workspace" | "session" | "material";
   id: string;
   label: string;
 }>();
@@ -112,50 +108,6 @@ const operationBusy = computed(
     recording.value ||
     recordingStarting.value,
 );
-const modelOptions = computed(() =>
-  (currentProvider.value?.models ?? []).map((model) => ({
-    value: model,
-    label: model,
-  })),
-);
-const authProviders = computed<ModelAuthProvider[]>(() =>
-  data.value.providers.map((provider) => ({
-    id: provider.id,
-    name: provider.name,
-    description: provider.baseUrl,
-    authMethods: [provider.authMethod === "oauth" ? "oauth" : "api-key"],
-    available: true,
-    models: provider.models,
-    apiKeyModels: provider.models,
-    apiKeyCredentials:
-      provider.authMethod !== "oauth" && provider.hasKey
-        ? [
-            {
-              id: "primary",
-              label: "API key",
-              healthy: true,
-              enabled: true,
-              weight: 1,
-              models: provider.models,
-            },
-          ]
-        : [],
-    oauthEnabled: provider.authMethod === "oauth",
-    oauthCredentials:
-      provider.authMethod === "oauth" && provider.hasKey
-        ? [
-            {
-              id: "primary",
-              label: "已连接",
-              healthy: true,
-              enabled: true,
-              weight: 1,
-              models: provider.models,
-            },
-          ]
-        : [],
-  })),
-);
 const renderedMessages = computed(
   () =>
     session.value?.messages.map((message) => ({
@@ -167,16 +119,12 @@ const renderedMessages = computed(
 function report(message: unknown) {
   error.value = String(message);
 }
-async function refresh(preferred?: { providerId?: string; model?: string }) {
+async function refresh() {
   loading.value = true;
   error.value = "";
   try {
     data.value = await invoke<AppData>("load_state");
     stt.value = await invoke<SttStatus>("stt_status");
-    if (preferred?.providerId)
-      data.value.settings.providerId = preferred.providerId;
-    if (preferred?.model !== undefined)
-      data.value.settings.model = preferred.model;
     if (
       !selectedWorkspaceId.value ||
       !data.value.workspaces.some(
@@ -200,6 +148,12 @@ async function refresh(preferred?: { providerId?: string; model?: string }) {
     loading.value = false;
   }
 }
+async function refreshModelSettings() {
+  const updated = await invoke<AppData>("load_state");
+  data.value.providers = updated.providers;
+  data.value.settings.providerId = updated.settings.providerId;
+  data.value.settings.model = updated.settings.model;
+}
 async function createWorkspace() {
   if (!workspaceName.value.trim() || operationBusy.value) return;
   try {
@@ -214,7 +168,7 @@ async function createWorkspace() {
   }
 }
 function askDelete(
-  kind: "workspace" | "session" | "material" | "provider",
+  kind: "workspace" | "session" | "material",
   id: string,
   label: string,
 ) {
@@ -230,8 +184,6 @@ async function confirmDelete() {
       await invoke("delete_session", { id: target.id });
     if (target.kind === "material")
       await invoke("delete_material", { id: target.id });
-    if (target.kind === "provider")
-      await invoke("delete_provider", { id: target.id });
     deleteTarget.value = undefined;
     await refresh();
   } catch (cause) {
@@ -285,16 +237,6 @@ async function saveMaterial() {
     } catch (cause) {
       report(cause);
     }
-}
-async function removeKey(providerId: string) {
-  const provider = data.value.providers.find((item) => item.id === providerId);
-  if (!provider) return;
-  try {
-    await removeProviderKey(invoke, provider);
-    await refresh();
-  } catch (cause) {
-    report(cause);
-  }
 }
 async function send() {
   if (
@@ -461,11 +403,6 @@ async function toggleRecording() {
 }
 async function saveSettings() {
   try {
-    if (currentProvider.value && currentProvider.value.authMethod !== "oauth")
-      await invoke("save_provider", {
-        provider: currentProvider.value,
-        apiKey: null,
-      });
     await invoke("save_settings", { settings: data.value.settings });
     settingsOpen.value = false;
     notice.value = "Settings saved locally.";
@@ -473,85 +410,6 @@ async function saveSettings() {
   } catch (cause) {
     report(cause);
   }
-}
-async function discover() {
-  if (!currentProvider.value) return;
-  try {
-    const models = await invoke<string[]>("discover_models", {
-      providerId: currentProvider.value.id,
-    });
-    currentProvider.value.models = models;
-    if (!data.value.settings.model) data.value.settings.model = models[0] ?? "";
-  } catch (cause) {
-    report(cause);
-  }
-}
-async function saveKey(payload: { providerId: string; apiKey: string }) {
-  const provider = data.value.providers.find(
-    (item) => item.id === payload.providerId,
-  );
-  if (!provider) return;
-  authBusy.value = true;
-  try {
-    await invoke("save_provider", { provider, apiKey: payload.apiKey });
-    await invoke("save_settings", { settings: data.value.settings });
-    const models = await invoke<string[]>("discover_models", {
-      providerId: provider.id,
-    });
-    provider.models = models;
-    if (!data.value.settings.model) data.value.settings.model = models[0] ?? "";
-    await refresh({
-      providerId: data.value.settings.providerId,
-      model: data.value.settings.model,
-    });
-  } catch (cause) {
-    report(cause);
-  } finally {
-    authBusy.value = false;
-  }
-}
-async function authorizeOAuth(providerId: string) {
-  activeAuthProviderId.value = providerId;
-  authBusy.value = true;
-  authProgress.value = "正在打开供应商授权…";
-  const channel = new Channel<{ type: "status" | "url"; text: string }>();
-  channel.onmessage = (event) => {
-    authProgress.value = event.text;
-  };
-  try {
-    await invoke("authorize_oauth", { providerId, onEvent: channel });
-    await refresh();
-  } catch (cause) {
-    report(cause);
-  } finally {
-    authBusy.value = false;
-    activeAuthProviderId.value = "";
-  }
-}
-async function removeOAuth(providerId: string) {
-  authBusy.value = true;
-  try {
-    await invoke("remove_oauth", { providerId });
-    await refresh();
-  } catch (cause) {
-    report(cause);
-  } finally {
-    authBusy.value = false;
-  }
-}
-async function cancelOAuth(providerId: string) {
-  try {
-    await invoke("cancel_oauth", { providerId });
-  } catch (cause) {
-    report(cause);
-  } finally {
-    authBusy.value = false;
-  }
-}
-function closeAuth() {
-  if (authBusy.value && activeAuthProviderId.value)
-    void cancelOAuth(activeAuthProviderId.value);
-  authOpen.value = false;
 }
 function handleComposerEnter(event: KeyboardEvent) {
   if (!event.isComposing) void send();
@@ -569,17 +427,8 @@ async function createProvider() {
     await saveNewProvider(invoke, provider, data.value.settings);
     providerName.value = "";
     providerEndpoint.value = "";
-    data.value.settings.providerId = provider.id;
-    await refresh({ providerId: provider.id });
-  } catch (cause) {
-    report(cause);
-  }
-}
-async function selectModel(selection: { providerId: string; model: string }) {
-  data.value.settings.providerId = selection.providerId;
-  data.value.settings.model = selection.model;
-  try {
-    await invoke("save_settings", { settings: data.value.settings });
+    await refresh();
+    await modelConnections.value?.refresh();
   } catch (cause) {
     report(cause);
   }
@@ -829,21 +678,10 @@ onUnmounted(() => {
         ><template #default
           ><div class="settings">
             <h2>模型与外观</h2>
-            <FluentSelect
-              v-model="data.settings.providerId"
-              label="模型供应商"
-              :options="
-                data.providers.map((p) => ({ value: p.id, label: p.name }))
-              "
-            /><FluentField
-              v-if="currentProvider && currentProvider.authMethod !== 'oauth'"
-              v-model="currentProvider.baseUrl"
-              label="兼容 API 地址"
-              placeholder="https://…/v1"
-            /><FluentSelect
-              v-model="data.settings.model"
-              label="对话模型"
-              :options="modelOptions"
+            <ModelConnections
+              ref="modelConnections"
+              :theme="data.settings.theme"
+              :refresh-workbench="refreshModelSettings"
             />
             <section class="stt-status">
               <strong>本地语音转写</strong>
@@ -873,42 +711,24 @@ onUnmounted(() => {
                 }}</FluentButton
               >
             </section>
-            <div class="settings-actions">
-              <FluentButton tone="secondary" @click="authOpen = true"
-                >连接模型</FluentButton
-              ><FluentButton tone="subtle" @click="discover"
-                >获取模型</FluentButton
-              ><FluentButton
-                v-if="
-                  currentProvider &&
-                  currentProvider.id !== 'openai' &&
-                  currentProvider.authMethod !== 'oauth'
-                "
-                tone="danger"
-                @click="
-                  askDelete(
-                    'provider',
-                    currentProvider.id,
-                    currentProvider.name,
-                  )
-                "
-                >删除供应商</FluentButton
+            <details class="custom-provider-settings">
+              <summary>自定义供应商</summary>
+              <FluentField
+                v-model="providerName"
+                label="新增供应商名称"
+                placeholder="例如本地模型服务"
+              /><FluentField
+                v-model="providerEndpoint"
+                label="新增供应商 API 地址"
+                placeholder="https://…/v1"
+              /><FluentButton
+                tone="secondary"
+                :disabled="!providerName.trim() || !providerEndpoint.trim()"
+                @click="createProvider"
+                >新增供应商</FluentButton
               >
-            </div>
-            <FluentField
-              v-model="providerName"
-              label="新增供应商名称"
-              placeholder="例如本地模型服务"
-            /><FluentField
-              v-model="providerEndpoint"
-              label="新增供应商 API 地址"
-              placeholder="https://…/v1"
-            /><FluentButton
-              tone="secondary"
-              :disabled="!providerName.trim() || !providerEndpoint.trim()"
-              @click="createProvider"
-              >新增供应商</FluentButton
-            ><FluentSelect
+            </details>
+            <FluentSelect
               v-model="data.settings.theme"
               label="主题"
               :options="[
@@ -940,35 +760,6 @@ onUnmounted(() => {
             >删除</FluentButton
           ></template
         ></FluentDialog
-      >
-      <ModelAuthDialog
-        :open="authOpen"
-        :providers="authProviders"
-        :model="{
-          providerId: data.settings.providerId,
-          model: data.settings.model,
-        }"
-        :theme="data.settings.theme"
-        initial-method="api-key"
-        :busy="authBusy"
-        :error="error || null"
-        :catalog-status="{ state: 'ready', source: 'cached' }"
-        @close="closeAuth"
-        @add-api-key="saveKey"
-        @remove-api-key="removeKey"
-        @authorize-oauth="authorizeOAuth"
-        @reconnect-oauth="authorizeOAuth"
-        @remove-oauth="removeOAuth"
-        @refresh-catalog="discover"
-        @select-model="selectModel"
-        ><template v-if="authBusy && activeAuthProviderId" #footer
-          ><div role="status">{{ authProgress || "正在连接…" }}</div>
-          <FluentButton
-            tone="danger"
-            @click="activeAuthProviderId && cancelOAuth(activeAuthProviderId)"
-            >取消授权</FluentButton
-          ></template
-        ></ModelAuthDialog
       >
     </main>
   </FluentTheme>

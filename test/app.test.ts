@@ -2,6 +2,7 @@ import { flushPromises, mount } from "@vue/test-utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { nextTick } from "vue";
 import App from "../src/App.vue";
+import ModelConnections from "../src/components/ModelConnections.vue";
 import type { AppData } from "../src/types";
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
@@ -12,27 +13,6 @@ vi.mock("@tauri-apps/api/core", () => ({
   },
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
-vi.mock("@model-auth/vue", async () => {
-  const { defineComponent, h } = await import("vue");
-  return {
-    ModelAuthDialog: defineComponent({
-      props: ["providers"],
-      emits: ["remove-api-key"],
-      setup(props, { emit }) {
-        return () =>
-          h(
-            "button",
-            {
-              "data-test": "remove-key",
-              onClick: () => emit("remove-api-key", props.providers?.[0]?.id),
-            },
-            "remove",
-          );
-      },
-    }),
-  };
-});
-
 const state = (): AppData => ({
   workspaces: [
     { id: "w1", name: "Class A" },
@@ -89,11 +69,10 @@ const stubs = {
     template:
       "<label>{{ label }}<select :aria-label='label' :value='modelValue' @change='$emit(\"update:modelValue\", $event.target.value)'><option v-for='option in options' :value='option.value'>{{ option.label }}</option></select></label>",
   },
-  ModelAuthDialog: {
-    props: ["providers"],
-    emits: ["remove-api-key"],
-    template:
-      "<button data-test='remove-key' @click='$emit(\"remove-api-key\", providers[0].id)'>remove</button>",
+  ModelConnections: {
+    props: ["theme", "refreshWorkbench"],
+    methods: { refresh: () => Promise.resolve(true) },
+    template: "<div data-test='model-connections' />",
   },
 };
 
@@ -152,17 +131,20 @@ describe("desktop workbench interactions", () => {
     await buttonWithText(wrapper, "新增供应商").trigger("click");
     await flushPromises();
     expect(data.settings.providerId).toBe("new-provider");
-    expect(
-      (
-        wrapper.get('select[aria-label="模型供应商"]')
-          .element as HTMLSelectElement
-      ).value,
-    ).toBe("new-provider");
+    expect(data.settings.model).toBe("");
+    expect(wrapper.find('[data-test="model-connections"]').exists()).toBe(true);
+    expect(wrapper.find('select[aria-label="模型供应商"]').exists()).toBe(
+      false,
+    );
+    expect(invoke).toHaveBeenCalledWith("save_provider", {
+      provider: expect.objectContaining({ id: "new-provider" }),
+      apiKey: null,
+    });
     expect(wrapper.text()).toContain("TXT、Markdown 或 DOCX");
     expect(wrapper.text()).not.toContain("导入 PDF");
   });
 
-  it("saves OAuth model settings without rewriting its secure provider", async () => {
+  it("saves appearance settings without rewriting the OAuth provider", async () => {
     data.providers[0] = {
       ...data.providers[0]!,
       id: "workbuddy",
@@ -182,17 +164,21 @@ describe("desktop workbench interactions", () => {
     expect(data.settings.providerId).toBe("workbuddy");
   });
 
-  it("removes a key through model-auth without deleting its provider", async () => {
+  it("refreshes the active model after native auth without dropping an unsaved theme", async () => {
     const wrapper = mountApp();
     await flushPromises();
-    await wrapper.get('[data-test="remove-key"]').trigger("click");
+    await wrapper.get('select[aria-label="主题"]').setValue("dark");
+    data.settings.model = "native-model";
+    data.providers[0]!.name = "Native connection";
+    const connections = wrapper.getComponent(ModelConnections);
+    await connections.props("refreshWorkbench")();
     await flushPromises();
-    expect(data.providers).toHaveLength(1);
-    expect(data.providers[0]?.hasKey).toBe(false);
-    expect(invoke).toHaveBeenCalledWith("save_provider", {
-      provider: expect.objectContaining({ id: "openai" }),
-      apiKey: "",
-    });
+    expect(wrapper.get(".status").text()).toBe("Native connection");
+    expect(connections.props("theme")).toBe("dark");
+    await buttonWithText(wrapper, "保存设置").trigger("click");
+    await flushPromises();
+    expect(data.settings.model).toBe("native-model");
+    expect(data.settings.theme).toBe("dark");
   });
 
   it("renders chat deltas before completion and keeps the user message on stream error", async () => {

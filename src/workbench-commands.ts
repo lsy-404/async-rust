@@ -5,10 +5,6 @@ export type Invoke = <T>(
   args?: Record<string, unknown>,
 ) => Promise<T>;
 
-export async function removeProviderKey(invoke: Invoke, provider: Provider) {
-  await invoke("save_provider", { provider, apiKey: "" });
-}
-
 export async function saveNewProvider(
   invoke: Invoke,
   provider: Provider,
@@ -16,7 +12,7 @@ export async function saveNewProvider(
 ) {
   await invoke("save_provider", { provider, apiKey: null });
   await invoke("save_settings", {
-    settings: { ...settings, providerId: provider.id },
+    settings: { ...settings, providerId: provider.id, model: "" },
   });
 }
 
