@@ -1,6 +1,7 @@
 mod auth_commands;
 mod connections;
 mod credential_store;
+mod models_catalog;
 mod oauth;
 mod recording;
 mod stt;
@@ -170,7 +171,6 @@ fn open_database(path: &Path) -> Result<Connection, String> {
       CREATE TABLE IF NOT EXISTS materials(id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE, name TEXT NOT NULL, content TEXT NOT NULL, path TEXT);
       CREATE TABLE IF NOT EXISTS providers(id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, models_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS settings(singleton INTEGER PRIMARY KEY CHECK(singleton=1), json TEXT NOT NULL);") .map_err(|e| e.to_string())?;
-    db.execute("INSERT OR IGNORE INTO providers(id,name,base_url,models_json) VALUES('openai','OpenAI','https://api.openai.com/v1','[]')", []).map_err(|e| e.to_string())?;
     for (id, name, base) in [
         ("workbuddy", "WorkBuddy", "https://copilot.tencent.com/v2"),
         ("traecode", "TraeCode", "https://www.trae.ai"),

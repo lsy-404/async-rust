@@ -183,14 +183,6 @@ fn sync_models(db: &Connection, provider_id: &str) -> Result<Vec<String>, String
         .collect();
     models.sort();
     models.dedup();
-    db.execute(
-        "UPDATE providers SET models_json=? WHERE id=?",
-        params![
-            serde_json::to_string(&models).map_err(|_| "模型编码失败。")?,
-            provider_id
-        ],
-    )
-    .map_err(storage)?;
     Ok(models)
 }
 fn previous_secret(state: &AppState, id: &str) -> Result<Option<String>, String> {

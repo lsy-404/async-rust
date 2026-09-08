@@ -269,6 +269,7 @@ async fn execute_action(
             Ok(())
         }
         Action::RefreshCatalog => {
+            let catalog_error = crate::models_catalog::refresh(state).await.err();
             let providers = load_data(state)?.providers;
             let mut failures = 0usize;
             for p in providers {
@@ -278,9 +279,9 @@ async fn execute_action(
                 let (_, failed) = discover(state, &p.id, cancel.clone()).await?;
                 failures += failed;
             }
-            if failures > 0 {
+            if failures > 0 || catalog_error.is_some() {
                 on_status(format!(
-                    "{failures} 个凭据未能刷新模型，已保留原目录并更新连接状态。"
+                    "models.dev 或 {failures} 个凭据未能刷新模型，已保留缓存目录并更新连接状态。"
                 ))?;
             }
             Ok(())
