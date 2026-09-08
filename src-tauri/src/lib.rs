@@ -486,33 +486,6 @@ fn import_material(
 }
 
 #[tauri::command]
-fn save_provider(
-    mut provider: Provider,
-    state: tauri::State<'_, AppState>,
-) -> Result<Provider, String> {
-    if oauth::is_oauth(&provider.id) {
-        return Err("OAuth 供应商地址由授权适配器管理。".into());
-    }
-    if provider.id.trim().is_empty() || provider.name.trim().is_empty() {
-        return Err("提供商 ID 和名称不能为空。".into());
-    }
-    let parsed = url::Url::parse(provider.base_url.trim()).map_err(|_| "提供商地址无效。")?;
-    if !matches!(parsed.scheme(), "http" | "https")
-        || parsed.host_str().is_none()
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        return Err("提供商地址必须是没有凭据、查询参数或片段的 HTTP(S) 地址。".into());
-    }
-    provider.base_url = parsed.as_str().trim_end_matches('/').into();
-    provider.auth_method = "api-key".into();
-    state.db()?.execute("INSERT INTO providers(id,name,base_url,models_json) VALUES(?,?,?,'[]') ON CONFLICT(id) DO UPDATE SET name=excluded.name,base_url=excluded.base_url",params![provider.id,provider.name,provider.base_url]).map_err(|e|e.to_string())?;
-    provider.has_key = connections::has_credential(&state, &provider.id)?;
-    Ok(provider)
-}
-#[tauri::command]
 fn delete_provider(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     if id == "openai" || oauth::is_oauth(&id) {
         return Err("内置供应商可移除授权，但不能删除。".into());
@@ -954,7 +927,6 @@ pub fn run() {
             save_material,
             delete_material,
             save_settings,
-            save_provider,
             delete_provider,
             discover_models,
             chat,

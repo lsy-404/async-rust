@@ -413,12 +413,6 @@ textarea {
 .settings h2 {
   margin: 0;
 }
-.custom-provider-settings[open] > :not(summary) {
-  margin-top: 12px;
-}
-.custom-provider-settings > summary {
-  cursor: pointer;
-}
 @media (max-width: 1050px) {
   .app-sidebar {
     width: 220px !important;

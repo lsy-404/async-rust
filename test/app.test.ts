@@ -51,12 +51,6 @@ const stubs = {
   FluentButton: { template: "<button v-bind='$attrs'><slot /></button>" },
   FluentNotice: { template: "<div><slot /></div>" },
   FluentDialog: { template: "<div><slot /><slot name='footer' /></div>" },
-  FluentField: {
-    props: ["modelValue", "label"],
-    emits: ["update:modelValue"],
-    template:
-      "<label>{{ label }}<input :aria-label='label' :value='modelValue' @input='$emit(\"update:modelValue\", $event.target.value)' /></label>",
-  },
   FluentTextArea: {
     props: ["modelValue", "label"],
     emits: ["update:modelValue"],
@@ -101,44 +95,23 @@ describe("desktop workbench interactions", () => {
             modelPath: "/tmp/model",
             sizeBytes: 1,
           };
-        if (command === "save_provider") {
-          const provider = args?.provider as AppData["providers"][number];
-          const index = data.providers.findIndex(
-            (item) => item.id === provider.id,
-          );
-          const saved = {
-            ...provider,
-            hasKey: args?.apiKey === "" ? false : provider.hasKey,
-          };
-          if (index < 0) data.providers.push(saved);
-          else data.providers[index] = saved;
-        }
         if (command === "save_settings")
           data.settings = args?.settings as AppData["settings"];
         return undefined;
       },
     );
-    vi.stubGlobal("crypto", { randomUUID: () => "new-provider" });
   });
 
-  it("persists a new provider selection across the refresh after creation", async () => {
+  it("uses the Kit connection panel as the only model-provider entry point", async () => {
     const wrapper = mountApp();
     await flushPromises();
-    await wrapper.get('input[aria-label="新增供应商名称"]').setValue("Fixture");
-    await wrapper
-      .get('input[aria-label="新增供应商 API 地址"]')
-      .setValue("http://fixture/v1");
-    await buttonWithText(wrapper, "新增供应商").trigger("click");
-    await flushPromises();
-    expect(data.settings.providerId).toBe("new-provider");
-    expect(data.settings.model).toBe("");
     expect(wrapper.find('[data-test="model-connections"]').exists()).toBe(true);
+    expect(wrapper.find('[aria-label="新增供应商名称"]').exists()).toBe(false);
+    expect(wrapper.find('[aria-label="新增供应商 API 地址"]').exists()).toBe(false);
+    expect(wrapper.text()).not.toContain("新增供应商");
     expect(wrapper.find('select[aria-label="模型供应商"]').exists()).toBe(
       false,
     );
-    expect(invoke).toHaveBeenCalledWith("save_provider", {
-      provider: expect.objectContaining({ id: "new-provider" }),
-    });
     await buttonWithText(wrapper, "知识库").trigger("click");
     expect(wrapper.text()).toContain("TXT、Markdown 或 DOCX");
     expect(wrapper.text()).not.toContain("导入 PDF");

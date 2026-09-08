@@ -25,7 +25,6 @@ import {
 import type {
   AppData,
   Material,
-  Provider,
   Session,
   Settings,
   StreamEvent,
@@ -35,7 +34,6 @@ import type {
 } from "./types";
 import {
   cancelStream,
-  saveNewProvider,
   streamCommand,
 } from "./workbench-commands";
 
@@ -73,14 +71,11 @@ const stt = ref<SttStatus>({
 const sttDownloading = ref(false);
 const sttProgress = ref({ downloaded: 0, total: 0 });
 const settingsOpen = ref(false);
-const modelConnections = ref<InstanceType<typeof ModelConnections>>();
 const workspaceName = ref("");
 const sessionTitle = ref("");
 const sessionCreateOpen = ref(false);
 const materialDraft = ref("");
 const recording = ref(false);
-const providerName = ref("");
-const providerEndpoint = ref("");
 const deleteTarget = ref<{
   kind: "workspace" | "session" | "material";
   id: string;
@@ -525,25 +520,6 @@ function resizeWithKeyboard(event: KeyboardEvent) {
     Math.min(0.7, (current + delta) / width),
   );
 }
-async function createProvider() {
-  if (!providerName.value.trim() || !providerEndpoint.value.trim()) return;
-  const provider: Provider = {
-    id: crypto.randomUUID(),
-    name: providerName.value.trim(),
-    baseUrl: providerEndpoint.value.trim(),
-    models: [],
-    hasKey: false,
-  };
-  try {
-    await saveNewProvider(invoke, provider, data.value.settings);
-    providerName.value = "";
-    providerEndpoint.value = "";
-    await refresh();
-    await modelConnections.value?.refresh();
-  } catch (cause) {
-    report(cause);
-  }
-}
 watch(selectedWorkspaceId, () => {
   if (
     !operationBusy.value &&
@@ -949,7 +925,6 @@ onUnmounted(() => {
           ><div class="settings">
             <h2>模型与外观</h2>
             <ModelConnections
-              ref="modelConnections"
               :theme="data.settings.theme"
               :refresh-workbench="refreshModelSettings"
             />
@@ -983,23 +958,6 @@ onUnmounted(() => {
                 }}</FluentButton
               >
             </section>
-            <details class="custom-provider-settings">
-              <summary>自定义供应商</summary>
-              <FluentField
-                v-model="providerName"
-                label="新增供应商名称"
-                placeholder="例如本地模型服务"
-              /><FluentField
-                v-model="providerEndpoint"
-                label="新增供应商 API 地址"
-                placeholder="https://…/v1"
-              /><FluentButton
-                tone="secondary"
-                :disabled="!providerName.trim() || !providerEndpoint.trim()"
-                @click="createProvider"
-                >新增供应商</FluentButton
-              >
-            </details>
             <FluentSelect
               v-model="data.settings.theme"
               label="主题"
