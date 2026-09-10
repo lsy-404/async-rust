@@ -119,9 +119,6 @@ pub fn get(state: &AppState, provider_id: &str, credential_id: &str) -> Result<C
         .find(|item| item.id == credential_id)
         .ok_or_else(|| "凭据不存在或不属于此供应商。".into())
 }
-pub fn has_credential(state: &AppState, provider_id: &str) -> Result<bool, String> {
-    has_credential_db(&state.db()?, provider_id)
-}
 pub fn has_credential_db(db: &Connection, provider_id: &str) -> Result<bool, String> {
     let prefs = preferences_db(db, provider_id)?;
     Ok(list_db(db, provider_id)?.iter().any(|item| {

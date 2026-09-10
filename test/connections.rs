@@ -105,12 +105,12 @@ fn eligibility_filters_disabled_unhealthy_cooling_models_and_oauth_toggle() {
     report_success(&state, "first", &b.id).unwrap();
     assert!(candidates(&state, "first", "absent").unwrap().is_empty());
     report_error(&state, "first", &b.id, Failure::Authentication).unwrap();
-    assert!(!has_credential(&state, "first").unwrap());
+    assert!(!has_credential_db(&state.db().unwrap(), "first").unwrap());
     let item = Credential::new("workbuddy", "oauth", "Account".into(), vec!["model".into()]);
     save(&state, &item, "{}").unwrap();
-    assert!(has_credential(&state, "workbuddy").unwrap());
+    assert!(has_credential_db(&state.db().unwrap(), "workbuddy").unwrap());
     set_oauth_enabled(&state, "workbuddy", false).unwrap();
-    assert!(!has_credential(&state, "workbuddy").unwrap());
+    assert!(!has_credential_db(&state.db().unwrap(), "workbuddy").unwrap());
     assert!(candidates(&state, "workbuddy", "model").unwrap().is_empty());
 }
 #[test]
@@ -122,7 +122,7 @@ fn metadata_reads_do_not_require_secret_file_and_failed_refresh_preserves_models
         "invalid file",
     )
     .unwrap();
-    assert!(has_credential(&state, "first").unwrap());
+    assert!(has_credential_db(&state.db().unwrap(), "first").unwrap());
     report_error(&state, "first", &item.id, Failure::Authentication).unwrap();
     catalog_result(&state, "first", 1).unwrap();
     assert_eq!(

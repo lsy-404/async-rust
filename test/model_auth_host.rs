@@ -215,7 +215,7 @@ fn unreadable_secret_returns_auth_error_metadata_without_blocking_offline_state(
     connections::save(&state, &item, "key").unwrap();
     std::fs::write(dir.path().join("credentials/credentials.json"), "corrupt").unwrap();
     assert!(load_data(&state).is_ok());
-    assert!(connections::has_credential(&state, "custom").unwrap());
+    assert!(connections::has_credential_db(&state.db().unwrap(), "custom").unwrap());
     let result = auth_state(&state).unwrap();
     assert_eq!(result["catalogStatus"]["state"], "error");
     let p = result["providers"]
