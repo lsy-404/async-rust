@@ -1,0 +1,151 @@
+export default {
+  common: {
+    confirm: "Confirm",
+    cancel: "Cancel",
+    save: "Save",
+    delete: "Delete",
+    close: "Close",
+    settings: "Settings",
+  },
+  sidebar: {
+    tabs: {
+      sessions: "Sessions",
+      knowledge: "Knowledge",
+    },
+    search: "Search",
+    searchPlaceholder: "Search workspaces, sessions, or knowledge",
+    emptyWorkspaces: "Create a workspace to start organizing your class.",
+    menu: {
+      rename: "Rename",
+      delete: "Delete",
+    },
+    deleteWorkspaceAria: "Delete workspace {name}",
+    deleteSessionAria: "Delete session {name}",
+    deleteMaterialAria: "Delete material {name}",
+    knowledge: {
+      workspaceLabel: "Workspace",
+      localMaterials: "Local materials",
+      import: "Import",
+      selectWorkspaceFirst: "Select a workspace first.",
+      emptyMaterials: "Import TXT, Markdown, or DOCX materials.",
+      materialContent: "Material content",
+    },
+    newWorkspacePlaceholder: "New workspace",
+    createWorkspace: "New workspace",
+    createSession: "New session",
+  },
+  workspacePicker: {
+    title: "Choose a workspace",
+    description: "Select a workspace to create the session in.",
+  },
+  sessionCreate: {
+    title: "New session",
+    label: "Session title",
+    placeholder: "e.g. Lesson 3 discussion",
+    submit: "Create",
+  },
+  rename: {
+    title: "Rename",
+    label: "Name",
+  },
+  header: {
+    toggleSidebar: "Toggle sidebar",
+    needsConnection: "Model connection required",
+  },
+  session: {
+    tabs: {
+      chat: "Chat",
+      summary: "Summary",
+    },
+    you: "You",
+    assistant: "Class assistant",
+    emptyChat:
+      "Ask the class assistant a question. It draws on this workspace's materials and transcript.",
+    inputLabel: "Ask",
+    inputPlaceholder: "Type a question. Enter to send, Shift+Enter for a new line",
+    stop: "Stop",
+    send: "Send",
+    empty: "Select or create a session to start a class conversation.",
+    actions: {
+      copy: "Copy",
+      delete: "Delete",
+      regenerate: "Regenerate",
+    },
+  },
+  summary: {
+    title: "Class summary",
+    description: "Generated from the current conversation, materials, and transcript.",
+    stop: "Stop summary",
+    generate: "Generate summary",
+    generating: "Generating summary…",
+    empty: "No class summary yet.",
+    updatedAt: "Updated: {time}",
+  },
+  transcript: {
+    title: "Class transcript",
+    readyHint: "Local model is ready",
+    notReadyHint: "Download the local model to transcribe offline",
+    import: "Import audio",
+    empty: "Recording or importing audio will show the transcript here.",
+    resizeAria: "Resize transcript panel",
+    recording: {
+      loadingModel: "Loading local model…",
+      active: "Recording and transcribing locally…",
+      transcribing: "Finishing transcription…",
+      idle: "Ready",
+      cancel: "Cancel transcription",
+      stop: "Stop recording",
+      start: "Start recording",
+    },
+  },
+  stt: {
+    title: "Local speech transcription",
+    readyDetail: "Ready: {name}",
+    notReadyDetail:
+      "Download the local model to transcribe audio offline, no API key needed.",
+    downloadProgress: "Local speech model download progress",
+    cancelDownload: "Cancel download",
+    ready: "Local model is ready",
+    download: "Download local transcription model",
+    defaultModelName: "Local speech model",
+  },
+  modelConnections: {
+    keyHint:
+      "Keys are stored in a file under the local app data directory and cleared from the input right after submission.",
+    openingAuth: "Opening provider authorization…",
+    connecting: "Connecting…",
+    cancelAuth: "Cancel authorization",
+  },
+  settingsDialog: {
+    title: "Model & appearance",
+  },
+  theme: {
+    switch: "Switch theme",
+    system: "Follow system",
+    light: "Light",
+    dark: "Dark",
+  },
+  language: {
+    zh: "中文",
+    en: "English",
+    switch: "Switch language",
+  },
+  deleteDialog: {
+    title: "Confirm deletion",
+    body: 'Deleting "{name}" cannot be undone. Continue?',
+  },
+  notice: {
+    materialSaved: "Material saved locally.",
+    settingsSaved: "Settings saved locally.",
+  },
+  materialPicker: {
+    title: "Choose a learning material",
+    filterName: "Learning material",
+  },
+  audioPicker: {
+    title: "Choose an audio recording",
+    filterName: "Audio",
+  },
+  loading: "Loading local class data…",
+  appTitle: "Async",
+};
