@@ -50,6 +50,7 @@ pub struct Session {
     pub messages: Vec<Message>,
     pub transcription: Option<String>,
     pub summary: Option<String>,
+    pub summary_updated_at: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -166,11 +167,21 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     let db = Connection::open(path).map_err(|e| e.to_string())?;
     db.execute_batch("PRAGMA foreign_keys = ON;
       CREATE TABLE IF NOT EXISTS workspaces(id TEXT PRIMARY KEY, name TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE, title TEXT NOT NULL, transcription TEXT, summary TEXT);
+      CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE, title TEXT NOT NULL, transcription TEXT, summary TEXT, summary_updated_at TEXT);
       CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, role TEXT NOT NULL, content TEXT NOT NULL, position INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS materials(id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE, name TEXT NOT NULL, content TEXT NOT NULL, path TEXT);
       CREATE TABLE IF NOT EXISTS providers(id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, models_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS settings(singleton INTEGER PRIMARY KEY CHECK(singleton=1), json TEXT NOT NULL);") .map_err(|e| e.to_string())?;
+    // CREATE TABLE IF NOT EXISTS does not add columns to a table that already exists on disk.
+    let has_summary_updated_at: bool = db
+        .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name='summary_updated_at'")
+        .map_err(|e| e.to_string())?
+        .exists([])
+        .map_err(|e| e.to_string())?;
+    if !has_summary_updated_at {
+        db.execute("ALTER TABLE sessions ADD COLUMN summary_updated_at TEXT", [])
+            .map_err(|e| e.to_string())?;
+    }
     for (id, name, base) in [
         ("workbuddy", "WorkBuddy", "https://copilot.tencent.com/v2"),
         ("traecode", "TraeCode", "https://www.trae.ai"),
@@ -221,7 +232,7 @@ fn load_data(state: &AppState) -> Result<AppData, String> {
         .map_err(|e| e.to_string())?;
     let mut sessions = Vec::new();
     let mut statement = db
-        .prepare("SELECT id,workspace_id,title,transcription,summary FROM sessions ORDER BY rowid")
+        .prepare("SELECT id,workspace_id,title,transcription,summary,summary_updated_at FROM sessions ORDER BY rowid")
         .map_err(|e| e.to_string())?;
     let rows = statement
         .query_map([], |r| {
@@ -231,11 +242,13 @@ fn load_data(state: &AppState) -> Result<AppData, String> {
                 r.get::<_, String>(2)?,
                 r.get::<_, Option<String>>(3)?,
                 r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
             ))
         })
         .map_err(|e| e.to_string())?;
     for row in rows {
-        let (sid, workspace_id, title, transcription, summary) = row.map_err(|e| e.to_string())?;
+        let (sid, workspace_id, title, transcription, summary, summary_updated_at) =
+            row.map_err(|e| e.to_string())?;
         let messages = db
             .prepare("SELECT id,role,content FROM messages WHERE session_id=? ORDER BY position")
             .map_err(|e| e.to_string())?
@@ -256,6 +269,7 @@ fn load_data(state: &AppState) -> Result<AppData, String> {
             messages,
             transcription,
             summary,
+            summary_updated_at,
         });
     }
     let materials = db
@@ -331,6 +345,31 @@ fn create_workspace(name: String, state: tauri::State<'_, AppState>) -> Result<W
         .map_err(|e| e.to_string())?;
     Ok(item)
 }
+fn rename_workspace_impl(state: &AppState, id: &str, name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("名称不能为空。".into());
+    }
+    let updated = state
+        .db()?
+        .execute(
+            "UPDATE workspaces SET name=? WHERE id=?",
+            params![name, id],
+        )
+        .map_err(|e| e.to_string())?;
+    if updated == 0 {
+        return Err("找不到工作区。".into());
+    }
+    Ok(())
+}
+#[tauri::command]
+fn rename_workspace(
+    id: String,
+    name: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    rename_workspace_impl(&state, &id, &name)
+}
 #[tauri::command]
 fn delete_workspace(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     state
@@ -352,6 +391,7 @@ fn create_session(
         messages: vec![],
         transcription: None,
         summary: None,
+        summary_updated_at: None,
     };
     state
         .db()?
@@ -376,11 +416,12 @@ fn save_session(session: Session, state: tauri::State<'_, AppState>) -> Result<(
     let tx = db.transaction().map_err(|e| e.to_string())?;
     let updated = tx
         .execute(
-            "UPDATE sessions SET title=?,transcription=?,summary=? WHERE id=?",
+            "UPDATE sessions SET title=?,transcription=?,summary=?,summary_updated_at=? WHERE id=?",
             params![
                 session.title,
                 session.transcription,
                 session.summary,
+                session.summary_updated_at,
                 session.id
             ],
         )
@@ -681,11 +722,12 @@ async fn summarize(
         .map_err(|_| "生成状态不可用。")?
         .remove(&session_id);
     let summary = result?;
+    let updated_at = chrono::Utc::now().to_rfc3339();
     state
         .db()?
         .execute(
-            "UPDATE sessions SET summary=? WHERE id=?",
-            params![summary, session_id],
+            "UPDATE sessions SET summary=?,summary_updated_at=? WHERE id=?",
+            params![summary, updated_at, session_id],
         )
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -919,6 +961,7 @@ pub fn run() {
             auth_commands::cancel_model_auth,
             load_state,
             create_workspace,
+            rename_workspace,
             delete_workspace,
             create_session,
             delete_session,
