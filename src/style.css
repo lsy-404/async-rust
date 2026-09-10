@@ -56,8 +56,6 @@ textarea {
 .app-sidebar {
   width: 264px;
   flex: none;
-  min-width: 210px;
-  max-width: 340px;
   display: flex;
   flex-direction: column;
   border-right: 1px solid var(--fluent-border);
@@ -159,6 +157,16 @@ textarea {
 .tree-workspace {
   font-weight: 600;
 }
+.tree-expand {
+  flex: none;
+  width: 16px;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--fluent-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
 .tree-session {
   padding-left: 18px;
   font-size: 13px;
@@ -181,6 +189,24 @@ textarea {
 .material-editor {
   margin: 12px 4px;
 }
+.material-editor-panel {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 22px max(24px, 8%);
+}
+.material-editor-panel h2 {
+  margin: 0;
+  font-size: 16px;
+}
+.material-editor-panel .material-editor {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+}
 .sidebar-footer {
   flex: none;
   display: grid;
@@ -201,7 +227,7 @@ textarea {
   overflow: hidden;
 }
 .app-header {
-  grid-column: 1 / 4;
+  grid-column: 1 / -1;
   grid-row: 1;
   height: 60px;
   display: flex;
@@ -248,10 +274,20 @@ textarea {
   border-radius: 999px;
   padding: 4px 9px;
   font-size: 12px;
+}
+.status-ok {
   color: var(--fluent-success);
   background: color-mix(
     in srgb,
     var(--fluent-success) 14%,
+    var(--fluent-surface)
+  );
+}
+.status-warn {
+  color: var(--fluent-warning);
+  background: color-mix(
+    in srgb,
+    var(--fluent-warning) 14%,
     var(--fluent-surface)
   );
 }
@@ -562,6 +598,11 @@ textarea {
 }
 .settings h2 {
   margin: 0;
+}
+.dialog-description {
+  margin: 0 0 4px;
+  color: var(--fluent-muted);
+  font-size: 12px;
 }
 @media (max-width: 1050px) {
   .app-sidebar {
