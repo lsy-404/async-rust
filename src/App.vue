@@ -15,6 +15,7 @@ import katex from "katex";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import ModelConnections from "./components/ModelConnections.vue";
+import { i18n, setLocale } from "./locales";
 import {
   FluentButton,
   FluentDialog,
@@ -38,6 +39,7 @@ import type {
 } from "./types";
 import { cancelStream, streamCommand } from "./workbench-commands";
 
+const { t } = i18n.global;
 const md = new MarkdownIt({ html: false, linkify: true, breaks: true }).use(
   texmath,
   {
@@ -52,7 +54,7 @@ const defaultFenceRule =
   ((tokens, idx, options, _env, self) =>
     self.renderToken(tokens, idx, options));
 md.renderer.rules.fence = (tokens, idx, options, env, self) =>
-  `<div class="code-block"><button type="button" class="code-copy" aria-label="复制代码">复制</button>${defaultFenceRule(tokens, idx, options, env, self)}</div>`;
+  `<div class="code-block"><button type="button" class="code-copy" aria-label="${t("codeBlock.copyAria")}">${t("codeBlock.copy")}</button>${defaultFenceRule(tokens, idx, options, env, self)}</div>`;
 const blankSettings: Settings = {
   providerId: "openai",
   model: "",
@@ -79,7 +81,7 @@ const summaryStream = ref("");
 const transcriptionLoading = ref(false);
 const stt = ref<SttStatus>({
   ready: false,
-  modelName: "本地语音模型",
+  modelName: t("stt.defaultModelName"),
   modelPath: "",
   sizeBytes: 0,
 });
@@ -135,11 +137,11 @@ const renamingId = ref("");
 const renameKind = ref<"workspace" | "session" | "material">("workspace");
 const renameDraft = ref("");
 const sessionCreateWorkspaceId = ref("");
-const themeChoices: { value: Theme; label: string }[] = [
-  { value: "system", label: "系统" },
-  { value: "light", label: "浅色" },
-  { value: "dark", label: "深色" },
-];
+const themeChoices = computed<{ value: Theme; label: string }[]>(() => [
+  { value: "system", label: t("theme.system") },
+  { value: "light", label: t("theme.light") },
+  { value: "dark", label: t("theme.dark") },
+]);
 
 const workspaces = computed(() => data.value.workspaces);
 const sessions = computed(() =>
@@ -218,23 +220,28 @@ const summaryUpdatedLabel = computed(() => {
 });
 const deleteCopy = computed(() => {
   const target = deleteTarget.value;
-  if (!target) return { title: "确认删除", body: "", confirmLabel: "删除" };
+  if (!target)
+    return {
+      title: t("deleteDialog.title"),
+      body: "",
+      confirmLabel: t("common.delete"),
+    };
   if (target.kind === "workspace")
     return {
-      title: "删除工作区",
-      body: `删除工作区"${target.label}"会同时删除其中的全部会话与材料，且无法恢复。继续吗？`,
-      confirmLabel: "删除工作区",
+      title: t("deleteWorkspace.title"),
+      body: t("deleteWorkspace.body", { name: target.label }),
+      confirmLabel: t("deleteWorkspace.confirm"),
     };
   if (target.kind === "session")
     return {
-      title: "删除会话",
-      body: `删除会话"${target.label}"后，其中的对话与转写记录将无法恢复。继续吗？`,
-      confirmLabel: "删除会话",
+      title: t("deleteSession.title"),
+      body: t("deleteSession.body", { name: target.label }),
+      confirmLabel: t("deleteSession.confirm"),
     };
   return {
-    title: "删除学习资料",
-    body: `删除学习资料"${target.label}"后无法恢复。继续吗？`,
-    confirmLabel: "删除学习资料",
+    title: t("deleteMaterial.title"),
+    body: t("deleteMaterial.body", { name: target.label }),
+    confirmLabel: t("deleteMaterial.confirm"),
   };
 });
 
@@ -422,6 +429,15 @@ async function setTheme(theme: Theme) {
     report(cause);
   }
 }
+async function setLanguage(language: Settings["language"]) {
+  if (data.value.settings.language === language) return;
+  data.value.settings.language = language;
+  try {
+    await invoke("save_settings", { settings: data.value.settings });
+  } catch (cause) {
+    report(cause);
+  }
+}
 async function persistLayoutSettings() {
   data.value.settings.mainPanelRatio = mainPanelRatio.value;
   data.value.settings.sidebarOpen = sidebarOpen.value;
@@ -493,9 +509,9 @@ async function importMaterial() {
   try {
     const path = await open({
       multiple: false,
-      title: "Choose a learning material",
+      title: t("materialPicker.title"),
       filters: [
-        { name: "Learning material", extensions: ["txt", "md", "docx"] },
+        { name: t("materialPicker.filterName"), extensions: ["txt", "md", "docx"] },
       ],
     });
     if (typeof path === "string") {
@@ -516,7 +532,7 @@ async function saveMaterial() {
       await invoke("save_material", {
         material: { ...material.value, content: materialDraft.value },
       });
-      notice.value = "Material saved locally.";
+      notice.value = t("notice.materialSaved");
       await refresh();
     } catch (cause) {
       report(cause);
@@ -709,10 +725,10 @@ async function uploadAudio() {
   try {
     const path = await open({
       multiple: false,
-      title: "Choose an audio recording",
+      title: t("audioPicker.title"),
       filters: [
         {
-          name: "Audio",
+          name: t("audioPicker.filterName"),
           extensions: ["wav", "mp3", "flac", "ogg", "m4a", "aac"],
         },
       ],
@@ -812,7 +828,7 @@ async function saveSettings() {
   try {
     await invoke("save_settings", { settings: data.value.settings });
     settingsOpen.value = false;
-    notice.value = "Settings saved locally.";
+    notice.value = t("notice.settingsSaved");
     await refresh();
   } catch (cause) {
     report(cause);
@@ -877,6 +893,11 @@ watch(
   { immediate: true },
 );
 watch(
+  () => data.value.settings.language,
+  (language) => setLocale(language),
+  { immediate: true },
+);
+watch(
   () => data.value.workspaces.map((item) => item.id),
   (ids, previousIds) => {
     const seen = new Set(previousIds ?? []);
@@ -927,21 +948,21 @@ onUnmounted(() => {
   <FluentTheme :mode="data.settings.theme">
     <main class="app-shell">
       <FluentNotice v-if="error" tone="danger" class="notice"
-        >{{ error }} <button @click="error = ''">关闭</button></FluentNotice
+        >{{ error }} <button @click="error = ''">{{ t("common.close") }}</button></FluentNotice
       >
       <FluentNotice v-if="notice" tone="success" class="notice"
-        >{{ notice }} <button @click="notice = ''">关闭</button></FluentNotice
+        >{{ notice }} <button @click="notice = ''">{{ t("common.close") }}</button></FluentNotice
       >
       <div v-if="loading" class="loading">
-        <span class="spinner"></span> 正在加载本地课堂数据…
+        <span class="spinner"></span> {{ t("loading") }}
       </div>
       <div v-else class="desktop-shell">
         <aside v-if="sidebarOpen" class="app-sidebar">
           <div class="sidebar-search">
             <FluentField
               v-model="searchQuery"
-              label="搜索"
-              placeholder="搜索工作区、会话或知识库"
+              :label="t('sidebar.search')"
+              :placeholder="t('sidebar.searchPlaceholder')"
             />
           </div>
           <div class="sidebar-tabs">
@@ -949,20 +970,20 @@ onUnmounted(() => {
               :class="{ active: sidebarMode === 'session' }"
               tone="subtle"
               @click="sidebarMode = 'session'"
-              >会话</FluentButton
+              >{{ t("sidebar.tabs.sessions") }}</FluentButton
             ><FluentButton
               :class="{ active: sidebarMode === 'knowledge' }"
               tone="subtle"
               @click="sidebarMode = 'knowledge'"
-              >知识库</FluentButton
+              >{{ t("sidebar.tabs.knowledge") }}</FluentButton
             >
           </div>
           <div v-if="sidebarMode === 'session'" class="sidebar-tree">
             <p v-if="!filteredWorkspaces.length" class="empty">
               {{
                 normalizedSearch
-                  ? "未找到匹配的工作区或会话"
-                  : "创建一个工作区开始整理课堂。"
+                  ? t("sidebar.noSearchResults")
+                  : t("sidebar.emptyWorkspaces")
               }}
             </p>
             <section
@@ -985,7 +1006,7 @@ onUnmounted(() => {
                   type="button"
                   class="tree-expand"
                   :aria-expanded="expandedWorkspaces.has(workspace.id)"
-                  aria-label="展开或折叠工作区"
+                  :aria-label="t('sidebar.toggleWorkspaceAria')"
                   @click.stop="toggleWorkspaceExpand(workspace.id)"
                 >
                   {{ expandedWorkspaces.has(workspace.id) ? "▾" : "▸" }}
@@ -1017,9 +1038,9 @@ onUnmounted(() => {
                   class="tree-delete"
                   tone="subtle"
                   :disabled="operationBusy"
-                  :aria-label="`删除工作区 ${workspace.name}`"
+                  :aria-label="t('sidebar.deleteWorkspaceAria', { name: workspace.name })"
                   @click="askDelete('workspace', workspace.id, workspace.name)"
-                  >删除</FluentButton
+                  >{{ t("common.delete") }}</FluentButton
                 >
               </div>
               <template v-if="expandedWorkspaces.has(workspace.id)">
@@ -1069,9 +1090,9 @@ onUnmounted(() => {
                     class="tree-delete"
                     tone="subtle"
                     :disabled="operationBusy"
-                    :aria-label="`删除会话 ${item.title}`"
+                    :aria-label="t('sidebar.deleteSessionAria', { name: item.title })"
                     @click="askDelete('session', item.id, item.title)"
-                    >删除</FluentButton
+                    >{{ t("common.delete") }}</FluentButton
                   >
                 </div>
               </template>
@@ -1081,24 +1102,24 @@ onUnmounted(() => {
             <div class="knowledge-head">
               <FluentSelect
                 v-model="selectedWorkspaceId"
-                label="工作区"
+                :label="t('sidebar.knowledge.workspaceLabel')"
                 :options="workspaceOptions"
                 :disabled="operationBusy"
               />
-              <span>本地材料</span
+              <span>{{ t("sidebar.knowledge.localMaterials") }}</span
               ><FluentButton
                 tone="subtle"
                 :disabled="!selectedWorkspaceId"
                 @click="importMaterial"
-                >导入</FluentButton
+                >{{ t("sidebar.knowledge.import") }}</FluentButton
               >
             </div>
-            <p v-if="!selectedWorkspaceId" class="empty">先选择一个工作区。</p>
+            <p v-if="!selectedWorkspaceId" class="empty">{{ t("sidebar.knowledge.selectWorkspaceFirst") }}</p>
             <p v-else-if="!filteredMaterials.length" class="empty">
               {{
                 normalizedSearch
-                  ? "未找到匹配的材料"
-                  : "导入 TXT、Markdown 或 DOCX 材料。"
+                  ? t("sidebar.knowledge.noSearchResults")
+                  : t("sidebar.knowledge.emptyMaterials")
               }}
             </p>
             <div
@@ -1134,9 +1155,9 @@ onUnmounted(() => {
                 class="tree-delete"
                 tone="subtle"
                 :disabled="operationBusy"
-                :aria-label="`删除材料 ${item.name}`"
+                :aria-label="t('sidebar.deleteMaterialAria', { name: item.name })"
                 @click="askDelete('material', item.id, item.name)"
-                >删除</FluentButton
+                >{{ t("common.delete") }}</FluentButton
               >
             </div>
           </div>
@@ -1145,18 +1166,18 @@ onUnmounted(() => {
               tone="subtle"
               :disabled="!workspaces.length || operationBusy"
               @click="createQuickSession"
-              >新建会话</FluentButton
+              >{{ t("sidebar.createSession") }}</FluentButton
             >
             <form @submit.prevent="createWorkspace">
               <FluentField
                 v-model="workspaceName"
-                label="工作区"
-                placeholder="新工作区"
+                :label="t('sidebar.knowledge.workspaceLabel')"
+                :placeholder="t('sidebar.newWorkspacePlaceholder')"
               /><FluentButton
                 type="submit"
                 tone="subtle"
                 :disabled="operationBusy"
-                >新建工作区</FluentButton
+                >{{ t("sidebar.createWorkspace") }}</FluentButton
               >
             </form>
           </footer>
@@ -1168,7 +1189,7 @@ onUnmounted(() => {
               tone="subtle"
               :disabled="!selectedWorkspaceId"
               @click="importMaterial"
-              >导入材料</FluentButton
+              >{{ t("sidebar.knowledge.import") }}</FluentButton
             >
           </footer>
         </aside>
@@ -1187,7 +1208,7 @@ onUnmounted(() => {
             <FluentButton
               tone="subtle"
               :aria-expanded="sidebarOpen"
-              aria-label="切换侧栏"
+              :aria-label="t('header.toggleSidebar')"
               @click="toggleSidebar"
               ><svg
                 width="16"
@@ -1203,9 +1224,9 @@ onUnmounted(() => {
                   stroke-linecap="round"
                 /></svg
             ></FluentButton>
-            <h1>{{ session?.title || "Async" }}</h1>
+            <h1>{{ session?.title || t("appTitle") }}</h1>
             <div class="header-actions">
-              <div class="header-switches" role="group" aria-label="切换主题">
+              <div class="header-switches" role="group" :aria-label="t('theme.switch')">
                 <button
                   v-for="choice in themeChoices"
                   :key="choice.value"
@@ -1216,6 +1237,22 @@ onUnmounted(() => {
                   {{ choice.label }}
                 </button>
               </div>
+              <div class="header-switches" role="group" :aria-label="t('language.switch')">
+                <button
+                  type="button"
+                  :class="{ active: data.settings.language === 'zh' }"
+                  @click="setLanguage('zh')"
+                >
+                  {{ t("language.zh") }}
+                </button>
+                <button
+                  type="button"
+                  :class="{ active: data.settings.language === 'en' }"
+                  @click="setLanguage('en')"
+                >
+                  {{ t("language.en") }}
+                </button>
+              </div>
               <span
                 :class="[
                   'status',
@@ -1224,10 +1261,10 @@ onUnmounted(() => {
                 >{{
                   currentProvider?.hasKey
                     ? currentProvider.name
-                    : "需要连接模型"
+                    : t("header.needsConnection")
                 }}</span
               ><FluentButton tone="subtle" @click="settingsOpen = true"
-                >设置</FluentButton
+                >{{ t("common.settings") }}</FluentButton
               >
             </div>
           </header>
@@ -1238,12 +1275,12 @@ onUnmounted(() => {
                   :class="{ active: activeSessionTab === 'chat' }"
                   tone="subtle"
                   @click="activeSessionTab = 'chat'"
-                  >对话</FluentButton
+                  >{{ t("session.tabs.chat") }}</FluentButton
                 ><FluentButton
                   :class="{ active: activeSessionTab === 'summary' }"
                   tone="subtle"
                   @click="activeSessionTab = 'summary'"
-                  >摘要</FluentButton
+                  >{{ t("session.tabs.summary") }}</FluentButton
                 >
               </div>
               <template v-if="activeSessionTab === 'chat'"
@@ -1254,7 +1291,7 @@ onUnmounted(() => {
                     :class="['message', message.role]"
                   >
                     <label>{{
-                      message.role === "user" ? "你" : "课堂助手"
+                      message.role === "user" ? t("session.you") : t("session.assistant")
                     }}</label>
                     <div class="message-actions">
                       <button
@@ -1262,7 +1299,7 @@ onUnmounted(() => {
                         :disabled="operationBusy"
                         @click="copyMessage(message.content)"
                       >
-                        复制
+                        {{ t("session.actions.copy") }}
                       </button>
                       <button
                         v-if="message.role === 'user'"
@@ -1270,7 +1307,7 @@ onUnmounted(() => {
                         :disabled="operationBusy"
                         @click="startEditMessage(message.id, message.content)"
                       >
-                        编辑
+                        {{ t("session.actions.edit") }}
                       </button>
                       <button
                         v-if="message.role === 'assistant'"
@@ -1278,45 +1315,45 @@ onUnmounted(() => {
                         :disabled="operationBusy"
                         @click="regenerateMessage(message.id)"
                       >
-                        重新生成
+                        {{ t("session.actions.regenerate") }}
                       </button>
                       <button
                         type="button"
                         :disabled="operationBusy"
                         @click="deleteMessage(message.id)"
                       >
-                        删除
+                        {{ t("session.actions.delete") }}
                       </button>
                     </div>
                     <div
                       v-if="editingMessageId === message.id"
                       class="message-edit"
                     >
-                      <FluentTextArea v-model="editDraft" label="编辑消息" />
+                      <FluentTextArea v-model="editDraft" :label="t('session.editMessageLabel')" />
                       <div class="message-edit-actions">
                         <FluentButton tone="subtle" @click="cancelEditMessage"
-                          >取消</FluentButton
+                          >{{ t("common.cancel") }}</FluentButton
                         ><FluentButton tone="primary" @click="commitEditMessage"
-                          >保存</FluentButton
+                          >{{ t("common.save") }}</FluentButton
                         >
                       </div>
                     </div>
                     <div v-else class="message-body" v-html="message.html"></div>
                   </article>
                   <div v-if="!renderedMessages.length" class="empty center">
-                    向课堂助手提问，它会结合当前工作区的材料和转写内容。
+                    {{ t("session.emptyChat") }}
                   </div>
                 </div>
                 <form class="composer" @submit.prevent="send">
                   <FluentTextArea
                     v-model="draft"
-                    label="提问"
+                    :label="t('session.inputLabel')"
                     :disabled="operationBusy"
-                    placeholder="输入问题，Enter 发送，Shift+Enter 换行"
+                    :placeholder="t('session.inputPlaceholder')"
                     @keydown.enter.exact.prevent="handleComposerEnter"
                     @input="handleComposerInput"
                   /><FluentButton v-if="streaming" tone="danger" @click="cancel"
-                    >停止</FluentButton
+                    >{{ t("session.stop") }}</FluentButton
                   ><FluentButton
                     v-else
                     tone="primary"
@@ -1324,30 +1361,30 @@ onUnmounted(() => {
                     :disabled="
                       !draft.trim() || !currentProvider?.hasKey || operationBusy
                     "
-                    >发送</FluentButton
+                    >{{ t("session.send") }}</FluentButton
                   >
                 </form></template
               >
               <section v-else class="summary-page">
                 <header>
                   <div>
-                    <h2>课堂摘要</h2>
-                    <p>根据当前对话、材料与转写生成。</p>
+                    <h2>{{ t("summary.title") }}</h2>
+                    <p>{{ t("summary.description") }}</p>
                   </div>
                   <FluentButton
                     :tone="summaryLoading ? 'danger' : 'secondary'"
                     :disabled="operationBusy && !summaryLoading"
                     @click="summaryLoading ? cancel() : summarize()"
                     >{{
-                      summaryLoading ? "停止摘要" : "生成摘要"
+                      summaryLoading ? t("summary.stop") : t("summary.generate")
                     }}</FluentButton
                   >
                 </header>
                 <p v-if="summaryUpdatedLabel" class="summary-meta">
-                  最近更新：{{ summaryUpdatedLabel }}
+                  {{ t("summary.updatedAt", { time: summaryUpdatedLabel }) }}
                 </p>
                 <div v-if="summaryLoading && !summaryStream" class="empty">
-                  <span class="spinner"></span> 正在生成摘要…
+                  <span class="spinner"></span> {{ t("summary.generating") }}
                 </div>
                 <div
                   v-else-if="session.summary || summaryStream"
@@ -1356,7 +1393,7 @@ onUnmounted(() => {
                   @click="handleContentClick"
                 ></div>
                 <div v-else class="empty">
-                  还没有课堂摘要，点击上方按钮生成。
+                  {{ t("summary.empty") }}
                 </div>
               </section>
             </section>
@@ -1364,7 +1401,7 @@ onUnmounted(() => {
               class="resize-handle"
               role="separator"
               tabindex="0"
-              aria-label="调整转写面板宽度"
+              :aria-label="t('transcript.resizeAria')"
               aria-orientation="vertical"
               :aria-valuenow="Math.round(mainPanelRatio * 100)"
               @pointerdown="beginResize"
@@ -1373,10 +1410,10 @@ onUnmounted(() => {
             <aside class="transcript-panel">
               <header>
                 <div>
-                  <h2>课堂转写</h2>
+                  <h2>{{ t("transcript.title") }}</h2>
                   <p>
                     {{
-                      stt.ready ? "本地模型已就绪" : "下载本地模型后可离线转写"
+                      stt.ready ? t("transcript.readyHint") : t("transcript.notReadyHint")
                     }}
                   </p>
                 </div>
@@ -1385,7 +1422,7 @@ onUnmounted(() => {
                   :busy="transcriptionLoading"
                   :disabled="!session || operationBusy"
                   @click="uploadAudio"
-                  >导入音频</FluentButton
+                  >{{ t("transcript.import") }}</FluentButton
                 >
               </header>
               <div ref="transcriptScrollRef" class="transcript-content">
@@ -1409,24 +1446,24 @@ onUnmounted(() => {
                       stroke-linecap="round"
                     />
                   </svg>
-                  <p>录音或导入音频后，转写会持续显示在这里。</p>
+                  <p>{{ t("transcript.empty") }}</p>
                 </div>
               </div>
               <footer class="recording-bar">
                 <span class="recording-state">{{
                   recordingStarting
-                    ? "正在加载本地模型…"
+                    ? t("transcript.recording.loadingModel")
                     : recording
-                      ? "正在本地录音与转写…"
+                      ? t("transcript.recording.active")
                       : transcriptionLoading
-                        ? "正在完成转写…"
-                        : "准备就绪"
+                        ? t("transcript.recording.transcribing")
+                        : t("transcript.recording.idle")
                 }}</span
                 ><FluentButton
                   v-if="transcriptionLoading && !recordingSessionId"
                   tone="danger"
                   @click="cancel"
-                  >取消转写</FluentButton
+                  >{{ t("transcript.recording.cancel") }}</FluentButton
                 ><FluentButton
                   :tone="recording ? 'danger' : 'primary'"
                   :busy="recordingStarting"
@@ -1437,7 +1474,7 @@ onUnmounted(() => {
                     transcriptionLoading
                   "
                   @click="toggleRecording"
-                  >{{ recording ? "停止录音" : "开始录音" }}</FluentButton
+                  >{{ recording ? t("transcript.recording.stop") : t("transcript.recording.start") }}</FluentButton
                 >
               </footer>
             </aside>
@@ -1447,23 +1484,23 @@ onUnmounted(() => {
               <h2>{{ material.name }}</h2>
               <FluentTextArea
                 v-model="materialDraft"
-                label="材料内容"
+                :label="t('sidebar.knowledge.materialContent')"
                 class="material-editor"
               />
               <div class="material-actions">
                 <FluentButton tone="secondary" @click="saveMaterial"
-                  >保存</FluentButton
+                  >{{ t("common.save") }}</FluentButton
                 ><FluentButton
                   tone="danger"
                   @click="askDelete('material', material.id, material.name)"
-                  >删除</FluentButton
+                  >{{ t("common.delete") }}</FluentButton
                 >
               </div>
             </div>
             <div v-else class="workbench-empty">
-              <h2>选择或创建一个会话</h2>
+              <h2>{{ t("workbenchEmpty.title") }}</h2>
               <p>
-                选择或创建一个会话以开始课堂对话，或在知识库中选择一份材料进行编辑。
+                {{ t("workbenchEmpty.body") }}
               </p>
             </div>
           </section>
@@ -1481,33 +1518,33 @@ onUnmounted(() => {
           type="button"
           @click="contextMenuNewSession"
         >
-          新建会话
+          {{ t("sidebar.createSession") }}
         </button>
-        <button type="button" @click="contextMenuRename">重命名</button>
+        <button type="button" @click="contextMenuRename">{{ t("sidebar.menu.rename") }}</button>
         <button type="button" class="danger" @click="contextMenuDelete">
-          删除
+          {{ t("sidebar.menu.delete") }}
         </button>
       </div>
-      <FluentDialog v-model:open="sessionCreateOpen" label="新建会话">
-        <template #title><h2>新建会话</h2></template>
+      <FluentDialog v-model:open="sessionCreateOpen" :label="t('sessionCreate.title')">
+        <template #title><h2>{{ t("sessionCreate.title") }}</h2></template>
         <template #default>
           <p class="dialog-description">
-            将在下方选择的工作区中创建一个新的课堂会话。
+            {{ t("sessionCreate.description") }}
           </p>
           <FluentSelect
             v-model="sessionCreateWorkspaceId"
-            label="工作区"
+            :label="t('sidebar.knowledge.workspaceLabel')"
             :options="workspaceOptions"
           />
           <FluentField
             v-model="sessionTitle"
-            label="会话标题"
-            placeholder="例如：第 3 课讨论"
+            :label="t('sessionCreate.label')"
+            :placeholder="t('sessionCreate.placeholder')"
           />
         </template>
         <template #footer
           ><FluentButton tone="subtle" @click="sessionCreateOpen = false"
-            >取消</FluentButton
+            >{{ t("common.cancel") }}</FluentButton
           ><FluentButton
             tone="primary"
             :disabled="!sessionTitle.trim() || !sessionCreateWorkspaceId"
@@ -1515,12 +1552,12 @@ onUnmounted(() => {
               createSession();
               sessionCreateOpen = false;
             "
-            >新建</FluentButton
+            >{{ t("sessionCreate.submit") }}</FluentButton
           ></template
         >
       </FluentDialog>
-      <FluentDialog v-model:open="settingsOpen" label="设置"
-        ><template #title><h2>设置</h2></template>
+      <FluentDialog v-model:open="settingsOpen" :label="t('settingsDialog.title')"
+        ><template #title><h2>{{ t("settingsDialog.title") }}</h2></template>
         <template #default
           ><div class="settings">
             <ModelConnections
@@ -1528,17 +1565,17 @@ onUnmounted(() => {
               :refresh-workbench="refreshModelSettings"
             />
             <section class="stt-status">
-              <strong>本地语音转写</strong>
+              <strong>{{ t("stt.title") }}</strong>
               <p>
                 {{
                   stt.ready
-                    ? `已就绪：${stt.modelName}`
-                    : "下载本地模型后可离线转写音频，无需 API Key。"
+                    ? t("stt.readyDetail", { name: stt.modelName })
+                    : t("stt.notReadyDetail")
                 }}
               </p>
               <FluentProgressBar
                 v-if="sttDownloading"
-                label="本地语音模型下载进度"
+                :label="t('stt.downloadProgress')"
                 :indeterminate="!sttProgress.total"
                 :value="sttProgress.downloaded"
                 :max="sttProgress.total || 1"
@@ -1546,31 +1583,31 @@ onUnmounted(() => {
                 v-if="sttDownloading"
                 tone="danger"
                 @click="cancelStt"
-                >取消下载</FluentButton
+                >{{ t("stt.cancelDownload") }}</FluentButton
               ><FluentButton
                 v-else
                 tone="secondary"
                 :disabled="stt.ready"
                 @click="downloadStt"
                 >{{
-                  stt.ready ? "本地模型已就绪" : "下载本地转写模型"
+                  stt.ready ? t("stt.ready") : t("stt.download")
                 }}</FluentButton
               >
             </section>
             <FluentSelect
               v-model="data.settings.theme"
-              label="主题"
+              :label="t('theme.label')"
               :options="[
-                { value: 'system', label: '跟随系统' },
-                { value: 'light', label: '浅色' },
-                { value: 'dark', label: '深色' },
+                { value: 'system', label: t('theme.system') },
+                { value: 'light', label: t('theme.light') },
+                { value: 'dark', label: t('theme.dark') },
               ]"
             /></div></template
         ><template #footer
           ><FluentButton tone="subtle" @click="settingsOpen = false"
-            >关闭</FluentButton
+            >{{ t("common.close") }}</FluentButton
           ><FluentButton tone="primary" @click="saveSettings"
-            >保存设置</FluentButton
+            >{{ t("settingsDialog.save") }}</FluentButton
           ></template
         ></FluentDialog
       >
@@ -1590,7 +1627,7 @@ onUnmounted(() => {
         >
         <template #footer
           ><FluentButton tone="subtle" @click="deleteTarget = undefined"
-            >取消</FluentButton
+            >{{ t("common.cancel") }}</FluentButton
           ><FluentButton tone="danger" @click="confirmDelete">{{
             deleteCopy.confirmLabel
           }}</FluentButton></template

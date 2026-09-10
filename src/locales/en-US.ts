@@ -15,6 +15,8 @@ export default {
     search: "Search",
     searchPlaceholder: "Search workspaces, sessions, or knowledge",
     emptyWorkspaces: "Create a workspace to start organizing your class.",
+    noSearchResults: "No matching workspaces or sessions found",
+    toggleWorkspaceAria: "Expand or collapse workspace",
     menu: {
       rename: "Rename",
       delete: "Delete",
@@ -28,6 +30,7 @@ export default {
       import: "Import",
       selectWorkspaceFirst: "Select a workspace first.",
       emptyMaterials: "Import TXT, Markdown, or DOCX materials.",
+      noSearchResults: "No matching materials found",
       materialContent: "Material content",
     },
     newWorkspacePlaceholder: "New workspace",
@@ -40,6 +43,7 @@ export default {
   },
   sessionCreate: {
     title: "New session",
+    description: "Creates a new class session in the workspace selected below.",
     label: "Session title",
     placeholder: "e.g. Lesson 3 discussion",
     submit: "Create",
@@ -66,8 +70,10 @@ export default {
     stop: "Stop",
     send: "Send",
     empty: "Select or create a session to start a class conversation.",
+    editMessageLabel: "Edit message",
     actions: {
       copy: "Copy",
+      edit: "Edit",
       delete: "Delete",
       regenerate: "Regenerate",
     },
@@ -118,12 +124,37 @@ export default {
   },
   settingsDialog: {
     title: "Model & appearance",
+    save: "Save settings",
   },
   theme: {
     switch: "Switch theme",
+    label: "Theme",
     system: "Follow system",
     light: "Light",
     dark: "Dark",
+  },
+  workbenchEmpty: {
+    title: "Select or create a session",
+    body: "Select or create a session to start a class conversation, or choose a material in Knowledge to edit it.",
+  },
+  codeBlock: {
+    copy: "Copy",
+    copyAria: "Copy code",
+  },
+  deleteWorkspace: {
+    title: "Delete workspace",
+    body: 'Deleting workspace "{name}" also deletes all of its sessions and materials, and cannot be undone. Continue?',
+    confirm: "Delete workspace",
+  },
+  deleteSession: {
+    title: "Delete session",
+    body: 'Deleting session "{name}" will permanently remove its conversation and transcript. Continue?',
+    confirm: "Delete session",
+  },
+  deleteMaterial: {
+    title: "Delete material",
+    body: 'Deleting material "{name}" cannot be undone.',
+    confirm: "Delete material",
   },
   language: {
     zh: "中文",

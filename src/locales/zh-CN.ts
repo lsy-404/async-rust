@@ -15,6 +15,8 @@ export default {
     search: "搜索",
     searchPlaceholder: "搜索工作区、会话或知识库",
     emptyWorkspaces: "创建一个工作区开始整理课堂。",
+    noSearchResults: "未找到匹配的工作区或会话",
+    toggleWorkspaceAria: "展开或折叠工作区",
     menu: {
       rename: "重命名",
       delete: "删除",
@@ -28,6 +30,7 @@ export default {
       import: "导入",
       selectWorkspaceFirst: "先选择一个工作区。",
       emptyMaterials: "导入 TXT、Markdown 或 DOCX 材料。",
+      noSearchResults: "未找到匹配的材料",
       materialContent: "材料内容",
     },
     newWorkspacePlaceholder: "新工作区",
@@ -40,6 +43,7 @@ export default {
   },
   sessionCreate: {
     title: "新建会话",
+    description: "将在下方选择的工作区中创建一个新的课堂会话。",
     label: "会话标题",
     placeholder: "例如：第 3 课讨论",
     submit: "新建",
@@ -65,8 +69,10 @@ export default {
     stop: "停止",
     send: "发送",
     empty: "选择或创建一个会话以开始课堂对话。",
+    editMessageLabel: "编辑消息",
     actions: {
       copy: "复制",
+      edit: "编辑",
       delete: "删除",
       regenerate: "重新生成",
     },
@@ -115,12 +121,37 @@ export default {
   },
   settingsDialog: {
     title: "模型与外观",
+    save: "保存设置",
   },
   theme: {
     switch: "切换主题",
+    label: "主题",
     system: "跟随系统",
     light: "浅色",
     dark: "深色",
+  },
+  workbenchEmpty: {
+    title: "选择或创建一个会话",
+    body: "选择或创建一个会话以开始课堂对话，或在知识库中选择一份材料进行编辑。",
+  },
+  codeBlock: {
+    copy: "复制",
+    copyAria: "复制代码",
+  },
+  deleteWorkspace: {
+    title: "删除工作区",
+    body: '删除工作区"{name}"会同时删除其中的全部会话与材料，且无法恢复。继续吗？',
+    confirm: "删除工作区",
+  },
+  deleteSession: {
+    title: "删除会话",
+    body: '删除会话"{name}"后，其中的对话与转写记录将无法恢复。继续吗？',
+    confirm: "删除会话",
+  },
+  deleteMaterial: {
+    title: "删除学习资料",
+    body: '删除学习资料"{name}"后无法恢复。继续吗？',
+    confirm: "删除学习资料",
   },
   language: {
     zh: "中文",

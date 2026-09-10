@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { i18n } from "../locales";
 import {
   ModelAuthDialog,
   ModelConnectionPanel,
@@ -15,13 +16,14 @@ const props = defineProps<{
   theme: Theme;
   refreshWorkbench: () => Promise<void>;
 }>();
+const { t } = i18n.global;
 const initialConnection = ref<ModelConnectionTarget | null>(null);
 const oauthProgress = ref("");
 const oauthActive = ref(false);
 let cancelActive: (() => void) | undefined;
-const messages = {
-  keyHint: "密钥保存在本机应用数据目录的文件中，提交后立即清空输入。",
-};
+const messages = computed(() => ({
+  keyHint: t("modelConnections.keyHint"),
+}));
 const auth = useModelAuth({
   getState: () => invoke<ModelAuthState>("get_auth_state"),
   async execute(action, { signal }) {
@@ -36,7 +38,7 @@ const auth = useModelAuth({
     cancelActive = cancel;
     signal.addEventListener("abort", cancel, { once: true });
     oauthActive.value = action.type === "authorize-oauth";
-    oauthProgress.value = "正在打开供应商授权…";
+    oauthProgress.value = t("modelConnections.openingAuth");
     try {
       if (signal.aborted) return;
       await invoke("model_auth_action", { action, onEvent, operationId });
@@ -86,9 +88,9 @@ defineExpose({ refresh });
     v-on="auth.listeners"
   >
     <template v-if="oauthActive" #footer>
-      <div role="status">{{ oauthProgress || "正在连接…" }}</div>
+      <div role="status">{{ oauthProgress || t("modelConnections.connecting") }}</div>
       <FluentButton tone="danger" @click="auth.listeners.close">
-        取消授权
+        {{ t("modelConnections.cancelAuth") }}
       </FluentButton>
     </template>
   </ModelAuthDialog>
