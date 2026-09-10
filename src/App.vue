@@ -10,6 +10,8 @@ import {
   type ComponentPublicInstance,
 } from "vue";
 import MarkdownIt from "markdown-it";
+import texmath from "markdown-it-texmath";
+import katex from "katex";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import ModelConnections from "./components/ModelConnections.vue";
@@ -36,7 +38,21 @@ import type {
 } from "./types";
 import { cancelStream, streamCommand } from "./workbench-commands";
 
-const md = new MarkdownIt({ html: false, linkify: true, breaks: true });
+const md = new MarkdownIt({ html: false, linkify: true, breaks: true }).use(
+  texmath,
+  {
+    engine: katex,
+    delimiters: "dollars",
+    katexOptions: { throwOnError: false },
+  },
+);
+// Fenced code blocks get a copy affordance; clicks are handled by delegation since this is raw v-html.
+const defaultFenceRule =
+  md.renderer.rules.fence ??
+  ((tokens, idx, options, _env, self) =>
+    self.renderToken(tokens, idx, options));
+md.renderer.rules.fence = (tokens, idx, options, env, self) =>
+  `<div class="code-block"><button type="button" class="code-copy" aria-label="复制代码">复制</button>${defaultFenceRule(tokens, idx, options, env, self)}</div>`;
 const blankSettings: Settings = {
   providerId: "openai",
   model: "",
@@ -85,11 +101,23 @@ const recordingSessionId = ref("");
 let recordingGeneration = 0;
 const sidebarMode = ref<"session" | "knowledge">("session");
 const searchQuery = ref("");
-const activeSessionTab = ref<"chat" | "summary">("chat");
+const sessionTabsById = reactive<Record<string, "chat" | "summary">>({});
+const activeSessionTab = computed<"chat" | "summary">({
+  get: () =>
+    session.value ? (sessionTabsById[session.value.id] ?? "chat") : "chat",
+  set: (value) => {
+    if (session.value) sessionTabsById[session.value.id] = value;
+  },
+});
 const sidebarOpen = ref(true);
 const mainPanelRatio = ref(0.62);
+let layoutSettingsInitialized = false;
 const layoutRef = ref<HTMLElement>();
 const transcriptScrollRef = ref<HTMLElement>();
+const messagesRef = ref<HTMLElement>();
+const composerTextareaEl = ref<HTMLTextAreaElement>();
+const editingMessageId = ref("");
+const editDraft = ref("");
 const expandedWorkspaces = ref(new Set<string>());
 const contextMenu = ref<
   | {
@@ -177,6 +205,17 @@ const renderedMessages = computed(
       html: md.render(message.content),
     })) ?? [],
 );
+const summaryUpdatedLabel = computed(() => {
+  const iso = session.value?.summaryUpdatedAt;
+  if (!iso) return "";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const locale = data.value.settings.language === "en" ? "en-US" : "zh-CN";
+  return new Intl.DateTimeFormat(locale, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(date);
+});
 const deleteCopy = computed(() => {
   const target = deleteTarget.value;
   if (!target) return { title: "确认删除", body: "", confirmLabel: "删除" };
@@ -208,6 +247,11 @@ async function refresh() {
   try {
     data.value = await invoke<AppData>("load_state");
     stt.value = await invoke<SttStatus>("stt_status");
+    if (!layoutSettingsInitialized) {
+      layoutSettingsInitialized = true;
+      mainPanelRatio.value = data.value.settings.mainPanelRatio ?? 0.62;
+      sidebarOpen.value = data.value.settings.sidebarOpen ?? true;
+    }
     if (
       !selectedWorkspaceId.value ||
       !data.value.workspaces.some(
@@ -378,6 +422,19 @@ async function setTheme(theme: Theme) {
     report(cause);
   }
 }
+async function persistLayoutSettings() {
+  data.value.settings.mainPanelRatio = mainPanelRatio.value;
+  data.value.settings.sidebarOpen = sidebarOpen.value;
+  try {
+    await invoke("save_settings", { settings: data.value.settings });
+  } catch (cause) {
+    report(cause);
+  }
+}
+function toggleSidebar() {
+  sidebarOpen.value = !sidebarOpen.value;
+  void persistLayoutSettings();
+}
 function handleWindowClick() {
   if (contextMenu.value) closeContextMenu();
 }
@@ -387,7 +444,7 @@ function handleWindowScroll() {
 function handleWindowKeydown(event: KeyboardEvent) {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "b") {
     event.preventDefault();
-    sidebarOpen.value = !sidebarOpen.value;
+    toggleSidebar();
     return;
   }
   if (event.key === "Escape") {
@@ -478,6 +535,7 @@ async function send() {
   const sessionId = target.id;
   const content = draft.value.trim();
   draft.value = "";
+  if (composerTextareaEl.value) composerTextareaEl.value.style.height = "auto";
   streaming.value = true;
   error.value = "";
   const pending = reactive({
@@ -510,6 +568,108 @@ async function cancel() {
     } catch (cause) {
       report(cause);
     }
+}
+async function copyMessage(content: string) {
+  try {
+    await navigator.clipboard.writeText(content);
+  } catch (cause) {
+    report(cause);
+  }
+}
+async function deleteMessage(messageId: string) {
+  if (!session.value || operationBusy.value) return;
+  const target = session.value;
+  target.messages = target.messages.filter((item) => item.id !== messageId);
+  try {
+    await invoke("save_session", { session: target });
+  } catch (cause) {
+    report(cause);
+  }
+}
+function startEditMessage(id: string, content: string) {
+  if (operationBusy.value) return;
+  editingMessageId.value = id;
+  editDraft.value = content;
+}
+function cancelEditMessage() {
+  editingMessageId.value = "";
+}
+async function commitEditMessage() {
+  if (!session.value) return;
+  const id = editingMessageId.value;
+  const content = editDraft.value.trim();
+  editingMessageId.value = "";
+  if (!id || !content) return;
+  const target = session.value;
+  const message = target.messages.find((item) => item.id === id);
+  if (!message || message.content === content) return;
+  message.content = content;
+  try {
+    await invoke("save_session", { session: target });
+  } catch (cause) {
+    report(cause);
+  }
+}
+async function regenerateMessage(messageId: string) {
+  if (!session.value || operationBusy.value) return;
+  const target = session.value;
+  const index = target.messages.findIndex((item) => item.id === messageId);
+  if (index === -1 || target.messages[index]!.role !== "assistant") return;
+  let userIndex = -1;
+  for (let i = index - 1; i >= 0; i -= 1) {
+    if (target.messages[i]!.role === "user") {
+      userIndex = i;
+      break;
+    }
+  }
+  if (userIndex === -1) return;
+  const content = target.messages[userIndex]!.content;
+  const sessionId = target.id;
+  target.messages = target.messages.slice(0, userIndex);
+  try {
+    await invoke("save_session", { session: target });
+  } catch (cause) {
+    report(cause);
+    return;
+  }
+  streaming.value = true;
+  error.value = "";
+  const pending = reactive({
+    id: `streaming-${sessionId}`,
+    role: "assistant" as const,
+    content: "",
+  });
+  target.messages.push(
+    { id: crypto.randomUUID(), role: "user", content },
+    pending,
+  );
+  const channel = new Channel<StreamEvent>();
+  channel.onmessage = (event) => {
+    if (event.type === "delta") pending.content += event.text;
+  };
+  try {
+    await streamCommand(invoke, "chat", sessionId, channel, content);
+    await refresh();
+  } catch (cause) {
+    target.messages = target.messages.filter((item) => item.id !== pending.id);
+    report(cause);
+  } finally {
+    streaming.value = false;
+  }
+}
+function handleContentClick(event: MouseEvent) {
+  const button = (event.target as HTMLElement).closest<HTMLElement>(
+    ".code-copy",
+  );
+  if (!button) return;
+  const code = button.parentElement?.querySelector("pre")?.textContent ?? "";
+  void copyMessage(code);
+}
+function handleComposerInput(event: Event) {
+  const el = event.target as HTMLTextAreaElement;
+  composerTextareaEl.value = el;
+  el.style.height = "auto";
+  el.style.height = `${Math.min(el.scrollHeight, 180)}px`;
 }
 async function summarize() {
   if (
@@ -674,6 +834,7 @@ function beginResize(event: PointerEvent) {
   const onEnd = () => {
     window.removeEventListener("pointermove", onMove);
     window.removeEventListener("pointerup", onEnd);
+    void persistLayoutSettings();
   };
   window.addEventListener("pointermove", onMove);
   window.addEventListener("pointerup", onEnd, { once: true });
@@ -688,6 +849,7 @@ function resizeWithKeyboard(event: KeyboardEvent) {
     0.42,
     Math.min(0.7, (current + delta) / width),
   );
+  void persistLayoutSettings();
 }
 watch(selectedWorkspaceId, () => {
   if (
@@ -736,6 +898,15 @@ watch(
     panel.scrollTop = panel.scrollHeight;
   },
 );
+watch(renderedMessages, async () => {
+  const panel = messagesRef.value;
+  if (!panel) return;
+  const distanceFromBottom =
+    panel.scrollHeight - panel.scrollTop - panel.clientHeight;
+  if (distanceFromBottom > 36) return;
+  await nextTick();
+  panel.scrollTop = panel.scrollHeight;
+});
 onMounted(() => {
   void refresh();
   window.addEventListener("click", handleWindowClick);
@@ -761,7 +932,9 @@ onUnmounted(() => {
       <FluentNotice v-if="notice" tone="success" class="notice"
         >{{ notice }} <button @click="notice = ''">关闭</button></FluentNotice
       >
-      <div v-if="loading" class="loading">正在加载本地课堂数据…</div>
+      <div v-if="loading" class="loading">
+        <span class="spinner"></span> 正在加载本地课堂数据…
+      </div>
       <div v-else class="desktop-shell">
         <aside v-if="sidebarOpen" class="app-sidebar">
           <div class="sidebar-search">
@@ -1015,7 +1188,7 @@ onUnmounted(() => {
               tone="subtle"
               :aria-expanded="sidebarOpen"
               aria-label="切换侧栏"
-              @click="sidebarOpen = !sidebarOpen"
+              @click="toggleSidebar"
               ><svg
                 width="16"
                 height="16"
@@ -1074,7 +1247,7 @@ onUnmounted(() => {
                 >
               </div>
               <template v-if="activeSessionTab === 'chat'"
-                ><div class="messages">
+                ><div ref="messagesRef" class="messages" @click="handleContentClick">
                   <article
                     v-for="message in renderedMessages"
                     :key="message.id"
@@ -1083,7 +1256,52 @@ onUnmounted(() => {
                     <label>{{
                       message.role === "user" ? "你" : "课堂助手"
                     }}</label>
-                    <div class="message-body" v-html="message.html"></div>
+                    <div class="message-actions">
+                      <button
+                        type="button"
+                        :disabled="operationBusy"
+                        @click="copyMessage(message.content)"
+                      >
+                        复制
+                      </button>
+                      <button
+                        v-if="message.role === 'user'"
+                        type="button"
+                        :disabled="operationBusy"
+                        @click="startEditMessage(message.id, message.content)"
+                      >
+                        编辑
+                      </button>
+                      <button
+                        v-if="message.role === 'assistant'"
+                        type="button"
+                        :disabled="operationBusy"
+                        @click="regenerateMessage(message.id)"
+                      >
+                        重新生成
+                      </button>
+                      <button
+                        type="button"
+                        :disabled="operationBusy"
+                        @click="deleteMessage(message.id)"
+                      >
+                        删除
+                      </button>
+                    </div>
+                    <div
+                      v-if="editingMessageId === message.id"
+                      class="message-edit"
+                    >
+                      <FluentTextArea v-model="editDraft" label="编辑消息" />
+                      <div class="message-edit-actions">
+                        <FluentButton tone="subtle" @click="cancelEditMessage"
+                          >取消</FluentButton
+                        ><FluentButton tone="primary" @click="commitEditMessage"
+                          >保存</FluentButton
+                        >
+                      </div>
+                    </div>
+                    <div v-else class="message-body" v-html="message.html"></div>
                   </article>
                   <div v-if="!renderedMessages.length" class="empty center">
                     向课堂助手提问，它会结合当前工作区的材料和转写内容。
@@ -1096,6 +1314,7 @@ onUnmounted(() => {
                     :disabled="operationBusy"
                     placeholder="输入问题，Enter 发送，Shift+Enter 换行"
                     @keydown.enter.exact.prevent="handleComposerEnter"
+                    @input="handleComposerInput"
                   /><FluentButton v-if="streaming" tone="danger" @click="cancel"
                     >停止</FluentButton
                   ><FluentButton
@@ -1124,15 +1343,21 @@ onUnmounted(() => {
                     }}</FluentButton
                   >
                 </header>
+                <p v-if="summaryUpdatedLabel" class="summary-meta">
+                  最近更新：{{ summaryUpdatedLabel }}
+                </p>
                 <div v-if="summaryLoading && !summaryStream" class="empty">
-                  正在生成摘要…
+                  <span class="spinner"></span> 正在生成摘要…
                 </div>
                 <div
                   v-else-if="session.summary || summaryStream"
                   class="summary-content"
                   v-html="md.render(summaryStream || session.summary || '')"
+                  @click="handleContentClick"
                 ></div>
-                <div v-else class="empty">还没有课堂摘要。</div>
+                <div v-else class="empty">
+                  还没有课堂摘要，点击上方按钮生成。
+                </div>
               </section>
             </section>
             <div
@@ -1166,7 +1391,25 @@ onUnmounted(() => {
               <div ref="transcriptScrollRef" class="transcript-content">
                 <p v-if="session?.transcription">{{ session.transcription }}</p>
                 <div v-else class="empty transcript-empty">
-                  录音或导入音频后，转写会持续显示在这里。
+                  <svg
+                    width="32"
+                    height="32"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    aria-hidden="true"
+                  >
+                    <path
+                      d="M12 15a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Z"
+                      stroke="currentColor"
+                      stroke-width="1.4"
+                    /><path
+                      d="M5 11v1a7 7 0 0 0 14 0v-1M12 19v3"
+                      stroke="currentColor"
+                      stroke-width="1.4"
+                      stroke-linecap="round"
+                    />
+                  </svg>
+                  <p>录音或导入音频后，转写会持续显示在这里。</p>
                 </div>
               </div>
               <footer class="recording-bar">

@@ -22,6 +22,7 @@ export interface Session {
   messages: Message[];
   transcription?: string;
   summary?: string;
+  summaryUpdatedAt?: string | null;
 }
 export interface Provider {
   id: string;
@@ -36,6 +37,8 @@ export interface Settings {
   model: string;
   theme: Theme;
   language: "zh" | "en";
+  mainPanelRatio?: number;
+  sidebarOpen?: boolean;
 }
 export interface SttStatus {
   ready: boolean;

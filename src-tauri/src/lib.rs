@@ -68,6 +68,16 @@ pub struct Settings {
     pub model: String,
     pub theme: String,
     pub language: String,
+    #[serde(default = "default_main_panel_ratio")]
+    pub main_panel_ratio: f64,
+    #[serde(default = "default_sidebar_open")]
+    pub sidebar_open: bool,
+}
+fn default_main_panel_ratio() -> f64 {
+    0.62
+}
+fn default_sidebar_open() -> bool {
+    true
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -76,6 +86,8 @@ impl Default for Settings {
             model: String::new(),
             theme: "system".into(),
             language: "zh".into(),
+            main_panel_ratio: default_main_panel_ratio(),
+            sidebar_open: default_sidebar_open(),
         }
     }
 }
