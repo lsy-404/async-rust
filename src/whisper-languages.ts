@@ -106,5 +106,4 @@ export const WHISPER_LANGUAGES: WhisperLanguage[] = [
   { code: "ba", name: "Bashkir" },
   { code: "jw", name: "Javanese" },
   { code: "su", name: "Sundanese" },
-  { code: "yue", name: "Cantonese" },
 ];
