@@ -352,6 +352,93 @@ textarea {
   background: #111827;
   color: #eef2ff;
 }
+.tool-call-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.tool-call-card {
+  border: 1px solid var(--fluent-border);
+  border-radius: 6px;
+  background: var(--fluent-surface);
+  overflow: hidden;
+}
+.tool-call-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--fluent-text);
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+.tool-call-header:hover {
+  background: color-mix(in srgb, var(--fluent-muted) 10%, transparent);
+}
+.tool-call-spinner {
+  width: 12px;
+  height: 12px;
+  border-width: 2px;
+}
+.tool-call-status-icon {
+  display: inline-flex;
+  width: 12px;
+  justify-content: center;
+  color: var(--fluent-muted);
+}
+.tool-call-finished .tool-call-status-icon {
+  color: var(--fluent-success);
+}
+.tool-call-failed .tool-call-status-icon {
+  color: var(--fluent-danger);
+}
+.tool-call-name {
+  font-weight: 600;
+}
+.tool-call-status-label {
+  margin-left: auto;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--fluent-muted);
+  background: color-mix(in srgb, var(--fluent-muted) 12%, transparent);
+}
+.tool-call-finished .tool-call-status-label {
+  color: var(--fluent-success);
+  background: color-mix(in srgb, var(--fluent-success) 14%, transparent);
+}
+.tool-call-failed .tool-call-status-label {
+  color: var(--fluent-danger);
+  background: color-mix(in srgb, var(--fluent-danger) 14%, transparent);
+}
+.tool-call-chevron {
+  color: var(--fluent-muted);
+}
+.tool-call-body {
+  padding: 0 10px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.tool-call-section-label {
+  margin-bottom: 4px;
+  font-size: 11px;
+  color: var(--fluent-muted);
+}
+.tool-call-body pre {
+  overflow: auto;
+  margin: 0;
+  padding: 8px;
+  border-radius: 5px;
+  background: #111827;
+  color: #eef2ff;
+  font-size: 12px;
+}
 .message-actions {
   display: flex;
   align-items: center;

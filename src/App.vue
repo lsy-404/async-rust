@@ -40,6 +40,7 @@ import type {
   SystemAudioCapability,
   RecordingEvent,
   Theme,
+  ToolCall,
   Workspace,
 } from "./types";
 import { cancelStream, streamCommand } from "./workbench-commands";
@@ -573,6 +574,7 @@ async function streamAssistantReply(target: Session, content: string) {
     id: `streaming-${sessionId}`,
     role: "assistant" as const,
     content: "",
+    toolCalls: [] as ToolCall[],
   });
   target.messages.push(
     { id: crypto.randomUUID(), role: "user", content },
@@ -580,7 +582,29 @@ async function streamAssistantReply(target: Session, content: string) {
   );
   const channel = new Channel<StreamEvent>();
   channel.onmessage = (event) => {
-    if (event.type === "delta") pending.content += event.text;
+    if (event.type === "delta") {
+      pending.content += event.text;
+      return;
+    }
+    if (event.type === "tool" && event.toolCallId) {
+      const existing = pending.toolCalls.find(
+        (call) => call.id === event.toolCallId,
+      );
+      if (existing) {
+        existing.status = event.toolStatus ?? existing.status;
+        if (event.toolArguments !== undefined)
+          existing.arguments = event.toolArguments;
+        if (event.toolResult !== undefined) existing.result = event.toolResult;
+      } else {
+        pending.toolCalls.push({
+          id: event.toolCallId,
+          name: event.toolName ?? "",
+          status: event.toolStatus ?? "requested",
+          arguments: event.toolArguments,
+          result: event.toolResult,
+        });
+      }
+    }
   };
   try {
     await streamCommand(invoke, "chat", sessionId, channel, content);

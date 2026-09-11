@@ -4,14 +4,45 @@ use crate::{
 };
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 use tauri::{ipc::Channel, State};
 use tokio_util::sync::CancellationToken;
+
+// A tool round is one model turn that ends in tool_calls; this bounds how many
+// times a misbehaving model can keep calling tools before a turn must finish.
+// One further request is always made after the budget is spent, with the
+// tools array omitted, so the turn still ends in a normal answer.
+const MAX_TOOL_ROUNDS: usize = 3;
+const RETRIEVAL_TOOL_NAME: &str = "search_local_materials";
+const RETRIEVAL_RESULT_LIMIT: i64 = 5;
+
+#[derive(Clone, Debug, Default)]
+struct PendingToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+enum RoundOutcome {
+    Answer(String),
+    ToolCalls { text: String, calls: Vec<PendingToolCall> },
+}
+// Bundles the per-credential request context so the streaming helpers stay
+// under clippy's argument-count lint instead of growing a parameter each.
+struct ApiRequest<'a> {
+    p: &'a Provider,
+    key: &'a str,
+    model: &'a str,
+    cancel: CancellationToken,
+}
 
 #[derive(Clone, Serialize)]
 pub struct AuthEvent {
@@ -524,34 +555,53 @@ pub async fn stream(
     provider_id: &str,
     model: &str,
     messages: Vec<Value>,
+    tool_workspace_id: Option<&str>,
     cancel: CancellationToken,
     channel: Channel<StreamEvent>,
 ) -> Result<String, String> {
-    let answer = stream_with(state, provider_id, model, messages, cancel, |text| {
-        channel
-            .send(StreamEvent {
-                kind: "delta".into(),
-                text,
-            })
-            .map_err(|_| "聊天状态通道已关闭。".into())
-    })
+    let answer = stream_with(
+        state,
+        provider_id,
+        model,
+        messages,
+        StreamOptions {
+            tool_workspace_id,
+            cancel,
+        },
+        |text| {
+            channel
+                .send(StreamEvent::delta(text))
+                .map_err(|_| "聊天状态通道已关闭。".into())
+        },
+        |event| {
+            channel
+                .send(event)
+                .map_err(|_| "聊天状态通道已关闭。".into())
+        },
+    )
     .await?;
     channel
-        .send(StreamEvent {
-            kind: "done".into(),
-            text: String::new(),
-        })
+        .send(StreamEvent::done())
         .map_err(|_| "聊天状态通道已关闭。")?;
     Ok(answer)
+}
+struct StreamOptions<'a> {
+    tool_workspace_id: Option<&'a str>,
+    cancel: CancellationToken,
 }
 async fn stream_with(
     state: &AppState,
     provider_id: &str,
     model: &str,
     messages: Vec<Value>,
-    cancel: CancellationToken,
+    options: StreamOptions<'_>,
     on_delta: impl Fn(String) -> Result<(), String> + Send + Sync,
+    on_tool: impl Fn(StreamEvent) -> Result<(), String> + Send + Sync,
 ) -> Result<String, String> {
+    let StreamOptions {
+        tool_workspace_id,
+        cancel,
+    } = options;
     let p = provider(state, provider_id)?;
     let candidates = connections::candidates(state, provider_id, model)?;
     if candidates.is_empty() {
@@ -584,16 +634,13 @@ async fn stream_with(
                 )
                 .await
             } else {
-                api_stream(
-                    state,
-                    &p,
-                    saved["apiKey"].as_str().ok_or("本地 API Key 无效。")?,
+                let req = ApiRequest {
+                    p: &p,
+                    key: saved["apiKey"].as_str().ok_or("本地 API Key 无效。")?,
                     model,
-                    &messages,
-                    cancel.clone(),
-                    delta,
-                )
-                .await
+                    cancel: cancel.clone(),
+                };
+                api_stream(state, &req, tool_workspace_id, &messages, delta, &on_tool).await
             }
         }
         .await;
@@ -616,16 +663,230 @@ async fn stream_with(
     }
     Err(last_error)
 }
+/// Runs the tool-calling loop for one OpenAI-compatible credential: each pass
+/// through the loop is one HTTP request. The first `MAX_TOOL_ROUNDS` passes
+/// offer the retrieval tool; if the model keeps calling it, one further pass
+/// is made with the tools array omitted so the turn always ends in an answer.
 async fn api_stream(
     state: &AppState,
-    p: &Provider,
-    key: &str,
-    model: &str,
+    req: &ApiRequest<'_>,
+    tool_workspace_id: Option<&str>,
     messages: &[Value],
-    cancel: CancellationToken,
-    on_delta: impl Fn(String) -> Result<(), String> + Send,
+    on_delta: impl Fn(String) -> Result<(), String> + Send + Sync,
+    on_tool: impl Fn(StreamEvent) -> Result<(), String> + Send + Sync,
 ) -> Result<String, String> {
-    let response = tokio::select! {_ = cancel.cancelled()=>return Err("生成已取消。".into()),response=state.client.post(crate::endpoint(&p.base_url,"chat/completions")).bearer_auth(key).json(&json!({"model":model,"messages":messages,"stream":true})).send()=>response.map_err(|_|"无法连接模型供应商。")?};
+    let emitted = Arc::new(AtomicBool::new(false));
+    let sent = emitted.clone();
+    let track_delta = |text: String| {
+        if !text.is_empty() {
+            sent.store(true, Ordering::Relaxed);
+        }
+        on_delta(text)
+    };
+    let mut working = messages.to_vec();
+    let mut answer = String::new();
+    let mut attempt = 0usize;
+    loop {
+        let allow_tools = tool_workspace_id.is_some() && attempt < MAX_TOOL_ROUNDS;
+        let tools = allow_tools.then(retrieval_tool_schema);
+        let round = api_stream_round(state, req, &working, tools.as_ref(), &track_delta).await;
+        let outcome = match round {
+            Ok(outcome) => outcome,
+            // A provider that rejects the tools array fails the request outright
+            // rather than ignoring it; on the very first, still-empty attempt
+            // that almost certainly means it doesn't support tool calling, so
+            // degrade to a plain completion instead of failing the whole turn.
+            Err(error) if attempt == 0 && allow_tools && !emitted.load(Ordering::Relaxed) => {
+                api_stream_round(state, req, &working, None, &track_delta)
+                    .await
+                    .map_err(|_| error)?
+            }
+            Err(error) => return Err(error),
+        };
+        match outcome {
+            RoundOutcome::Answer(text) => {
+                answer.push_str(&text);
+                return Ok(answer);
+            }
+            RoundOutcome::ToolCalls { text, calls } => {
+                answer.push_str(&text);
+                if !allow_tools {
+                    // Tools weren't offered this round; nothing declared them, so
+                    // there is nothing to execute. Finish with whatever text came back.
+                    return Ok(answer);
+                }
+                let workspace_id = tool_workspace_id.expect("allow_tools implies Some");
+                working.push(json!({
+                    "role": "assistant",
+                    "content": if text.is_empty() { Value::Null } else { json!(text) },
+                    "tool_calls": calls.iter().map(|call| json!({
+                        "id": call.id,
+                        "type": "function",
+                        "function": {"name": call.name, "arguments": call.arguments},
+                    })).collect::<Vec<_>>(),
+                }));
+                for call in &calls {
+                    on_tool(tool_event(call, "requested", None))?;
+                    on_tool(tool_event(call, "running", None))?;
+                    match run_tool(state, workspace_id, call) {
+                        Ok(result) => {
+                            on_tool(tool_event(call, "finished", Some(&result)))?;
+                            working.push(json!({
+                                "role": "tool",
+                                "tool_call_id": call.id,
+                                "content": result,
+                            }));
+                        }
+                        Err(error) => {
+                            on_tool(tool_event(call, "failed", Some(&error)))?;
+                            working.push(json!({
+                                "role": "tool",
+                                "tool_call_id": call.id,
+                                "content": format!("Error: {error}"),
+                            }));
+                        }
+                    }
+                }
+                attempt += 1;
+            }
+        }
+    }
+}
+fn tool_event(call: &PendingToolCall, status: &str, result: Option<&str>) -> StreamEvent {
+    StreamEvent {
+        kind: "tool".into(),
+        tool_call_id: Some(call.id.clone()),
+        tool_name: Some(call.name.clone()),
+        tool_status: Some(status.into()),
+        tool_arguments: Some(call.arguments.clone()),
+        tool_result: result.map(str::to_owned),
+        ..StreamEvent::default()
+    }
+}
+fn retrieval_tool_schema() -> Value {
+    json!([{
+        "type": "function",
+        "function": {
+            "name": RETRIEVAL_TOOL_NAME,
+            "description": "Search the user's own local course materials and session transcripts stored on this device for text matching a query. Use it to find facts, definitions or context before answering when the conversation alone doesn't already cover it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keywords or a short phrase to search for.",
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false,
+            },
+        },
+    }])
+}
+fn run_tool(state: &AppState, workspace_id: &str, call: &PendingToolCall) -> Result<String, String> {
+    if call.name != RETRIEVAL_TOOL_NAME {
+        return Err(format!("未知工具：{}。", call.name));
+    }
+    let arguments: Value =
+        serde_json::from_str(&call.arguments).map_err(|_| "工具参数不是有效 JSON。".to_owned())?;
+    let query = arguments
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if query.is_empty() {
+        return Err("查询内容不能为空。".into());
+    }
+    search_local(state, workspace_id, query)
+}
+fn escape_like(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+fn excerpt(content: &str, query: &str) -> String {
+    const RADIUS: usize = 200;
+    let at = content
+        .to_lowercase()
+        .find(&query.to_lowercase())
+        .unwrap_or(0);
+    let from = (0..=at.saturating_sub(RADIUS))
+        .rev()
+        .find(|i| content.is_char_boundary(*i))
+        .unwrap_or(0);
+    let to = ((at + query.len() + RADIUS).min(content.len())..=content.len())
+        .find(|i| content.is_char_boundary(*i))
+        .unwrap_or(content.len());
+    let mut piece = content[from..to].trim().to_string();
+    if from > 0 {
+        piece.insert(0, '…');
+    }
+    if to < content.len() {
+        piece.push('…');
+    }
+    piece
+}
+fn search_local(state: &AppState, workspace_id: &str, query: &str) -> Result<String, String> {
+    let db = state.db()?;
+    let pattern = format!("%{}%", escape_like(query));
+    let mut results = Vec::new();
+    let mut materials_stmt = db
+        .prepare("SELECT name,content FROM materials WHERE workspace_id=?1 AND (name LIKE ?2 ESCAPE '\\' OR content LIKE ?2 ESCAPE '\\') ORDER BY rowid LIMIT ?3")
+        .map_err(|e| e.to_string())?;
+    let materials = materials_stmt
+        .query_map(params![workspace_id, pattern, RETRIEVAL_RESULT_LIMIT], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    for (name, content) in materials {
+        results.push(format!("[Material] {name}: {}", excerpt(&content, query)));
+    }
+    let mut sessions_stmt = db
+        .prepare("SELECT title,transcription FROM sessions WHERE workspace_id=?1 AND transcription LIKE ?2 ESCAPE '\\' ORDER BY rowid LIMIT ?3")
+        .map_err(|e| e.to_string())?;
+    let sessions = sessions_stmt
+        .query_map(params![workspace_id, pattern, RETRIEVAL_RESULT_LIMIT], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    for (title, transcript) in sessions {
+        results.push(format!(
+            "[Session transcript] {title}: {}",
+            excerpt(&transcript, query)
+        ));
+    }
+    if results.is_empty() {
+        return Ok(format!("No local materials or session transcripts matched \"{query}\"."));
+    }
+    Ok(results.join("\n\n"))
+}
+/// One HTTP request/response cycle against an OpenAI-compatible endpoint.
+/// Tool-call deltas arrive as fragments addressed by `index` across chunks
+/// (id and name usually once, arguments incrementally) and must be
+/// accumulated rather than treated as whole objects.
+async fn api_stream_round(
+    state: &AppState,
+    req: &ApiRequest<'_>,
+    messages: &[Value],
+    tools: Option<&Value>,
+    on_delta: &(impl Fn(String) -> Result<(), String> + Send + Sync),
+) -> Result<RoundOutcome, String> {
+    let ApiRequest {
+        p,
+        key,
+        model,
+        cancel,
+    } = req;
+    let mut body = json!({"model":model,"messages":messages,"stream":true});
+    if let Some(tools) = tools {
+        body["tools"] = tools.clone();
+    }
+    let response = tokio::select! {_ = cancel.cancelled()=>return Err("生成已取消。".into()),response=state.client.post(crate::endpoint(&p.base_url,"chat/completions")).bearer_auth(*key).json(&body).send()=>response.map_err(|_|"无法连接模型供应商。")?};
     if !response.status().is_success() {
         return Err(format!(
             "模型供应商拒绝请求（HTTP {}）。",
@@ -653,6 +914,7 @@ async fn api_stream(
         })
         .eventsource();
     let mut answer = String::new();
+    let mut tool_calls: BTreeMap<i64, PendingToolCall> = BTreeMap::new();
     loop {
         let next = tokio::select! {_ = cancel.cancelled()=>return Err("生成已取消。".into()),next=stream.next()=>next};
         let Some(next) = next else {
@@ -660,7 +922,13 @@ async fn api_stream(
         };
         let event = next.map_err(|_| "模型响应格式无效。")?;
         if event.data == "[DONE]" {
-            return Ok(answer);
+            if tool_calls.is_empty() {
+                return Ok(RoundOutcome::Answer(answer));
+            }
+            return Ok(RoundOutcome::ToolCalls {
+                text: answer,
+                calls: tool_calls.into_values().collect(),
+            });
         }
         let value: Value =
             serde_json::from_str(&event.data).map_err(|_| "模型响应包含无效 JSON。")?;
@@ -674,12 +942,31 @@ async fn api_stream(
             if choice["index"].as_u64().unwrap_or(0) != 0 {
                 continue;
             }
-            if choice["delta"].get("tool_calls").is_some()
-                || choice["delta"].get("function_call").is_some()
-            {
-                return Err("当前对话不支持工具调用响应。".into());
+            let delta = &choice["delta"];
+            if let Some(deltas) = delta.get("tool_calls").and_then(Value::as_array) {
+                for item in deltas {
+                    let index = item.get("index").and_then(Value::as_i64).unwrap_or(0);
+                    let entry = tool_calls.entry(index).or_default();
+                    if let Some(id) = item.get("id").and_then(Value::as_str) {
+                        if !id.is_empty() {
+                            entry.id = id.to_owned();
+                        }
+                    }
+                    if let Some(function) = item.get("function") {
+                        if let Some(name) = function.get("name").and_then(Value::as_str) {
+                            entry.name.push_str(name);
+                        }
+                        if let Some(arguments) = function.get("arguments").and_then(Value::as_str)
+                        {
+                            entry.arguments.push_str(arguments);
+                        }
+                    }
+                    if entry.id.is_empty() {
+                        entry.id = format!("call_{index}");
+                    }
+                }
             }
-            if let Some(value) = choice["delta"].get("content").filter(|v| !v.is_null()) {
+            if let Some(value) = delta.get("content").filter(|v| !v.is_null()) {
                 let text = value.as_str().ok_or("模型响应文本无效。")?;
                 answer.push_str(text);
                 on_delta(text.into())?;

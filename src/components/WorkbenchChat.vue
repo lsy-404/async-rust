@@ -2,6 +2,7 @@
 import { ref } from "vue";
 import { i18n } from "../locales";
 import { FluentButton, FluentTextArea } from "@platform-kit/fluent/vue";
+import WorkbenchToolCallCard from "./WorkbenchToolCallCard.vue";
 import type { Message } from "../types";
 
 const { t, locale } = i18n.global;
@@ -203,7 +204,16 @@ function handleUncertainAsk() {
               >
             </div>
           </div>
-          <div v-else class="message-body" v-html="message.html"></div>
+          <template v-else>
+            <div v-if="message.toolCalls?.length" class="tool-call-list">
+              <WorkbenchToolCallCard
+                v-for="call in message.toolCalls"
+                :key="call.id"
+                :tool-call="call"
+              />
+            </div>
+            <div class="message-body" v-html="message.html"></div>
+          </template>
         </article>
         <div v-if="!renderedMessages.length" class="empty center">
           {{ t("session.emptyChat") }}

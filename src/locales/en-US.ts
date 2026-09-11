@@ -47,6 +47,17 @@ export default {
     toggleSidebar: "Toggle sidebar",
     needsConnection: "Model connection required",
   },
+  toolCall: {
+    title: "Tool call: {name}",
+    arguments: "Arguments",
+    result: "Result",
+    status: {
+      requested: "Requested",
+      running: "Running",
+      finished: "Finished",
+      failed: "Failed",
+    },
+  },
   session: {
     tabs: {
       chat: "Chat",

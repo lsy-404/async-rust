@@ -117,11 +117,37 @@ pub struct AppData {
     pub settings: Settings,
     pub providers: Vec<Provider>,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StreamEvent {
     #[serde(rename = "type")]
     pub kind: String,
     pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_arguments: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result: Option<String>,
+}
+impl StreamEvent {
+    pub fn delta(text: String) -> Self {
+        Self {
+            kind: "delta".into(),
+            text,
+            ..Self::default()
+        }
+    }
+    pub fn done() -> Self {
+        Self {
+            kind: "done".into(),
+            ..Self::default()
+        }
+    }
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -707,6 +733,7 @@ async fn streamed_completion(
     state: &AppState,
     session_id: &str,
     messages: Vec<Value>,
+    tool_workspace_id: Option<&str>,
     channel: Channel<StreamEvent>,
     cancellation: CancellationToken,
 ) -> Result<String, String> {
@@ -716,6 +743,7 @@ async fn streamed_completion(
         &settings.provider_id,
         &settings.model,
         messages,
+        tool_workspace_id,
         cancellation,
         channel,
     )
@@ -728,6 +756,7 @@ async fn chat_impl(
     on_event: Channel<StreamEvent>,
 ) -> Result<(), String> {
     let (session, materials, _) = session_context(state, session_id)?;
+    let workspace_id = session.workspace_id.clone();
     // Reserve the generation slot before persisting anything, so a rejected
     // concurrent call never leaves a reply-less user message behind.
     let token = generation_token(state, session_id)?;
@@ -761,7 +790,15 @@ async fn chat_impl(
     );
     messages.push(json!({"role":"user","content":content}));
     persist_message(state, session_id, "user", content)?;
-    let result = streamed_completion(state, session_id, messages, on_event, token).await;
+    let result = streamed_completion(
+        state,
+        session_id,
+        messages,
+        Some(&workspace_id),
+        on_event,
+        token,
+    )
+    .await;
     state
         .cancellations
         .lock()
@@ -822,7 +859,7 @@ async fn summarize(
         json!({"role":"user","content":limit(source)}),
     ];
     let token = generation_token(&state, &session_id)?;
-    let result = streamed_completion(&state, &session_id, messages, on_event, token).await;
+    let result = streamed_completion(&state, &session_id, messages, None, on_event, token).await;
     state
         .cancellations
         .lock()

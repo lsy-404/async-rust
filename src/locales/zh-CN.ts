@@ -47,6 +47,17 @@ export default {
     toggleSidebar: "切换侧栏",
     needsConnection: "需要连接模型",
   },
+  toolCall: {
+    title: "工具调用：{name}",
+    arguments: "参数",
+    result: "结果",
+    status: {
+      requested: "已请求",
+      running: "运行中",
+      finished: "已完成",
+      failed: "失败",
+    },
+  },
   session: {
     tabs: {
       chat: "对话",

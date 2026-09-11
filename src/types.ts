@@ -7,6 +7,16 @@ export interface SystemAudioCapability {
   available: boolean;
   reason: string | null;
 }
+export type ToolCallStatus = "requested" | "running" | "finished" | "failed";
+// One local tool invocation attached to the assistant turn that triggered it.
+// Not persisted by the backend today: it only lives for the current stream.
+export interface ToolCall {
+  id: string;
+  name: string;
+  status: ToolCallStatus;
+  arguments?: string;
+  result?: string;
+}
 export interface Message {
   id: string;
   role: "user" | "assistant" | "system";
@@ -14,6 +24,7 @@ export interface Message {
   // Absent for an optimistic local message not yet round-tripped through the
   // backend; empty string for one persisted before this field existed.
   createdAt?: string;
+  toolCalls?: ToolCall[];
 }
 export interface Word {
   word: string;
@@ -73,8 +84,13 @@ export interface AppData {
   providers: Provider[];
 }
 export interface StreamEvent {
-  type: "delta" | "done";
+  type: "delta" | "done" | "tool";
   text: string;
+  toolCallId?: string;
+  toolName?: string;
+  toolStatus?: ToolCallStatus;
+  toolArguments?: string;
+  toolResult?: string;
 }
 
 // The wire shape per variant is exactly:
