@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { nextTick } from "vue";
 import App from "../src/App.vue";
 import type { AppData } from "../src/types";
+import { open } from "@tauri-apps/plugin-dialog";
+import { splitTranscriptSentences } from "../src/transcript-sentences";
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({
@@ -12,6 +14,15 @@ vi.mock("@tauri-apps/api/core", () => ({
   },
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
+
+// jsdom has no Blob URL implementation; the playback feature only needs a
+// stable string handle back, not real object-URL semantics.
+if (typeof URL.createObjectURL !== "function") {
+  URL.createObjectURL = () => "blob:mock-audio";
+}
+if (typeof URL.revokeObjectURL !== "function") {
+  URL.revokeObjectURL = () => undefined;
+}
 
 const stubs = {
   FluentTheme: { template: "<div><slot /></div>" },
@@ -39,7 +50,13 @@ const stubs = {
     props: ["modelValue", "label", "options"],
     emits: ["update:modelValue"],
     template:
-      "<label>{{ label }}<select :aria-label='label' :value='modelValue' @change='$emit(\"update:modelValue\", $event.target.value)'><option v-for='option in options' :value='option.value'>{{ option.label }}</option></select></label>",
+      "<label>{{ label }}<select :aria-label='label' :value='modelValue' @change='$emit(\"update:modelValue\", $event.target.value)'><option v-for='option in options' :value='option.value' :disabled='option.disabled'>{{ option.label }}</option></select></label>",
+  },
+  FluentSlider: {
+    props: ["modelValue", "min", "max", "step", "label"],
+    emits: ["update:modelValue"],
+    template:
+      "<input type='range' :min='min' :max='max' :step='step' :value='modelValue' @input='$emit(\"update:modelValue\", Number($event.target.value))' />",
   },
   ModelConnections: { template: "<div data-test='model-connections' />" },
 };
@@ -1016,5 +1033,178 @@ describe("chat gap fixes: edit, inline error, uncertainty markup, IME safety", (
     expect(
       invoke.mock.calls.some(([command]) => command === "chat"),
     ).toBe(false);
+  });
+});
+
+describe("transcript sentence segmentation (pure function)", () => {
+  it("splits on Chinese and English sentence punctuation", () => {
+    expect(splitTranscriptSentences("第一句。第二句！第三句？")).toEqual([
+      "第一句。",
+      "第二句！",
+      "第三句？",
+    ]);
+    expect(
+      splitTranscriptSentences("First sentence. Second sentence! Really?"),
+    ).toEqual(["First sentence.", "Second sentence!", "Really?"]);
+  });
+
+  it("keeps a trailing fragment with no terminal punctuation as its own sentence", () => {
+    expect(splitTranscriptSentences("完整的句子。还在说的半句")).toEqual([
+      "完整的句子。",
+      "还在说的半句",
+    ]);
+  });
+
+  it("returns an empty list for blank input", () => {
+    expect(splitTranscriptSentences("")).toEqual([]);
+    expect(splitTranscriptSentences("   \n  ")).toEqual([]);
+  });
+});
+
+describe("transcript gap fixes: capture mode, language, level meter, playback", () => {
+  let data: AppData;
+  beforeEach(() => {
+    data = baseState();
+    invoke.mockReset();
+    mockInvoke(data);
+    vi.mocked(open).mockReset();
+  });
+
+  it("renders the transcript as separate sentence items instead of one block", async () => {
+    data.sessions[0]!.transcription = "第一句。第二句！Third sentence.";
+    const wrapper = mountApp();
+    await flushPromises();
+    const sentences = wrapper.findAll(".transcript-sentence");
+    expect(sentences.map((item) => item.text())).toEqual([
+      "第一句。",
+      "第二句！",
+      "Third sentence.",
+    ]);
+  });
+
+  it("unifies capture behind one mode selector and one action button", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    expect(buttonWithText(wrapper, "开始录音").exists()).toBe(true);
+    expect(wrapper.findAll("button").some((b) => b.text() === "导入音频")).toBe(
+      false,
+    );
+
+    const modeSelect = wrapper.get('[aria-label="输入方式"]');
+    await modeSelect.setValue("upload");
+    await nextTick();
+    expect(buttonWithText(wrapper, "导入音频").exists()).toBe(true);
+    expect(
+      wrapper.findAll("button").some((b) => b.text() === "开始录音"),
+    ).toBe(false);
+
+    vi.mocked(open).mockResolvedValue("/tmp/lecture.wav");
+    await buttonWithText(wrapper, "导入音频").trigger("click");
+    await flushPromises();
+    expect(open).toHaveBeenCalled();
+    expect(invoke).toHaveBeenCalledWith(
+      "transcribe_audio",
+      expect.objectContaining({ sessionId: "s1", path: "/tmp/lecture.wav" }),
+    );
+  });
+
+  it("renders the system-audio option disabled with a short explanation instead of omitting or faking it", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    const modeSelect = wrapper.get('[aria-label="输入方式"]');
+    const systemOption = modeSelect
+      .findAll("option")
+      .find((option) => option.element.value === "system")!;
+    expect(systemOption.attributes("disabled")).toBeDefined();
+    expect(systemOption.text()).toContain("暂不可用");
+  });
+
+  it("passes the picked transcription language into transcribe_audio", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await wrapper.get('[aria-label="转写语言"]').setValue("ja");
+    await wrapper.get('[aria-label="输入方式"]').setValue("upload");
+    vi.mocked(open).mockResolvedValue("/tmp/lecture.wav");
+    await buttonWithText(wrapper, "导入音频").trigger("click");
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("transcribe_audio", {
+      sessionId: "s1",
+      path: "/tmp/lecture.wav",
+      language: "ja",
+    });
+  });
+
+  it("passes the picked transcription language into start_recording, and null when left on auto-detect", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await wrapper.get('[aria-label="转写语言"]').setValue("fr");
+    await buttonWithText(wrapper, "开始录音").trigger("click");
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith(
+      "start_recording",
+      expect.objectContaining({ sessionId: "s1", language: "fr" }),
+    );
+  });
+
+  it("renders a live level meter while recording and resets it once recording stops", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await buttonWithText(wrapper, "开始录音").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".level-meter").exists()).toBe(true);
+    const start = invoke.mock.calls.find(
+      ([command]) => command === "start_recording",
+    )!;
+    const channel = start[1].onEvent;
+    channel.onmessage({ type: "level", sessionId: "s1", level: 0.8 });
+    await nextTick();
+    const bars = wrapper.findAll(".level-meter span");
+    expect(bars[bars.length - 1]!.attributes("style")).toContain("16.8px");
+
+    await buttonWithText(wrapper, "停止录音").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".level-meter").exists()).toBe(false);
+
+    await buttonWithText(wrapper, "开始录音").trigger("click");
+    await flushPromises();
+    const restartedBars = wrapper.findAll(".level-meter span");
+    expect(restartedBars[restartedBars.length - 1]!.attributes("style")).toContain(
+      "4px",
+    );
+  });
+
+  it("offers play/pause and a seek slider for an imported file, and revokes the blob URL on session switch", async () => {
+    vi.mocked(open).mockResolvedValue("/tmp/lecture.wav");
+    const revokeSpy = vi.spyOn(URL, "revokeObjectURL");
+    const wrapper = mountApp();
+    await flushPromises();
+    expect(wrapper.find(".playback-bar").exists()).toBe(false);
+
+    await wrapper.get('[aria-label="输入方式"]').setValue("upload");
+    await buttonWithText(wrapper, "导入音频").trigger("click");
+    await flushPromises();
+
+    const playbackBar = wrapper.get(".playback-bar");
+    const playButton = buttonWithText(wrapper, "播放");
+    const audio = playbackBar.get("audio").element as HTMLAudioElement;
+    await playButton.trigger("click");
+    await audio.dispatchEvent(new Event("play"));
+    await nextTick();
+    expect(buttonWithText(wrapper, "暂停").exists()).toBe(true);
+
+    // jsdom never fires real media events; give the slider a real range to
+    // seek within by reporting duration the same way a browser would.
+    Object.defineProperty(audio, "duration", { value: 30, configurable: true });
+    await audio.dispatchEvent(new Event("loadedmetadata"));
+    await nextTick();
+    const slider = playbackBar.get("input[type=range]");
+    await slider.setValue(12);
+    await nextTick();
+    expect(audio.currentTime).toBe(12);
+
+    await wrapper.findAll(".tree-session")[1]!.trigger("click");
+    await flushPromises();
+    expect(revokeSpy).toHaveBeenCalled();
+    expect(wrapper.find(".playback-bar").exists()).toBe(false);
   });
 });

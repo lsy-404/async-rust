@@ -30,6 +30,7 @@ import {
 } from "@platform-kit/fluent/vue";
 import type {
   AppData,
+  CaptureMode,
   Material,
   Session,
   Settings,
@@ -113,6 +114,10 @@ const deleteTarget = ref<{
 const recordingStarting = ref(false);
 const recordingSessionId = ref("");
 let recordingGeneration = 0;
+const recordingLevel = ref(0);
+const captureMode = ref<CaptureMode>("realtime");
+const transcriptionLanguage = ref("");
+const importedAudioUrl = ref<string>();
 const sidebarMode = ref<"session" | "knowledge">("session");
 const searchQuery = ref("");
 const sessionTabsById = reactive<Record<string, "chat" | "summary">>({});
@@ -721,6 +726,33 @@ async function summarize() {
     summaryStream.value = "";
   }
 }
+function guessAudioMime(path: string): string {
+  const extension = path.split(".").pop()?.toLowerCase() ?? "";
+  const byExtension: Record<string, string> = {
+    wav: "audio/wav",
+    mp3: "audio/mpeg",
+    flac: "audio/flac",
+    ogg: "audio/ogg",
+    m4a: "audio/mp4",
+    aac: "audio/aac",
+  };
+  return byExtension[extension] ?? "audio/mpeg";
+}
+function revokeImportedAudio() {
+  if (importedAudioUrl.value) URL.revokeObjectURL(importedAudioUrl.value);
+  importedAudioUrl.value = undefined;
+}
+async function loadImportedAudio(path: string) {
+  revokeImportedAudio();
+  try {
+    const bytes = await invoke<ArrayBuffer>("read_audio_file", { path });
+    importedAudioUrl.value = URL.createObjectURL(
+      new Blob([bytes], { type: guessAudioMime(path) }),
+    );
+  } catch (cause) {
+    report(cause);
+  }
+}
 async function uploadAudio() {
   if (
     !session.value ||
@@ -743,7 +775,12 @@ async function uploadAudio() {
       ],
     });
     if (typeof path === "string") {
-      await invoke("transcribe_audio", { sessionId, path });
+      await loadImportedAudio(path);
+      await invoke("transcribe_audio", {
+        sessionId,
+        path,
+        language: transcriptionLanguage.value || null,
+      });
       await refresh();
     }
   } catch (cause) {
@@ -798,11 +835,14 @@ async function toggleRecording() {
       transcriptionLoading.value = false;
       recordingSessionId.value = "";
       recordingGeneration += 1;
+      recordingLevel.value = 0;
     }
     return;
   }
+  revokeImportedAudio();
   const sessionId = session.value.id;
   recordingStarting.value = true;
+  recordingLevel.value = 0;
   error.value = "";
   const generation = ++recordingGeneration;
   const onEvent = new Channel<RecordingEvent>();
@@ -815,14 +855,23 @@ async function toggleRecording() {
       recording.value = false;
       recordingSessionId.value = "";
       recordingGeneration += 1;
+      recordingLevel.value = 0;
       void invoke("cancel_recording").catch(report);
+      return;
+    }
+    if (event.type === "level") {
+      recordingLevel.value = event.level ?? 0;
       return;
     }
     const target = data.value.sessions.find((item) => item.id === sessionId);
     if (target) target.transcription = event.text;
   };
   try {
-    await invoke("start_recording", { sessionId, onEvent });
+    await invoke("start_recording", {
+      sessionId,
+      onEvent,
+      language: transcriptionLanguage.value || null,
+    });
     if (generation !== recordingGeneration) return;
     recording.value = true;
   } catch (cause) {
@@ -929,6 +978,9 @@ watch(
     panel.scrollTop = panel.scrollHeight;
   },
 );
+watch(selectedSessionId, () => {
+  revokeImportedAudio();
+});
 watch(operationBusy, (busy) => {
   if (!busy) return;
   closeContextMenu();
@@ -957,6 +1009,7 @@ onUnmounted(() => {
   recordingGeneration += 1;
   if (recording.value || recordingStarting.value)
     void invoke("cancel_recording").catch(() => undefined);
+  revokeImportedAudio();
 });
 </script>
 
@@ -1139,9 +1192,15 @@ onUnmounted(() => {
               :recording-session-id="recordingSessionId"
               :streaming="streaming"
               :summary-loading="summaryLoading"
+              :capture-mode="captureMode"
+              :language="transcriptionLanguage"
+              :recording-level="recordingLevel"
+              :audio-url="importedAudioUrl"
               @upload-audio="uploadAudio"
               @cancel="cancel"
               @toggle-recording="toggleRecording"
+              @update:capture-mode="captureMode = $event"
+              @update:language="transcriptionLanguage = $event"
             />
           </template>
           <section v-else class="main-workspace">

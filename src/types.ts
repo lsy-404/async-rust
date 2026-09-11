@@ -1,4 +1,5 @@
 export type Theme = "system" | "light" | "dark";
+export type CaptureMode = "realtime" | "upload" | "system";
 export interface Message {
   id: string;
   role: "user" | "assistant" | "system";

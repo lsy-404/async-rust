@@ -99,6 +99,21 @@ export default {
       stop: "停止录音",
       start: "开始录音",
     },
+    mode: {
+      label: "输入方式",
+      realtime: "麦克风",
+      upload: "上传文件",
+      system: "系统音频",
+      systemUnavailable: "暂不可用",
+    },
+    language: {
+      label: "转写语言",
+      auto: "自动检测",
+    },
+    playback: {
+      play: "播放",
+      pause: "暂停",
+    },
   },
   stt: {
     title: "本地语音转写",

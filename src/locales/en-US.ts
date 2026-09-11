@@ -101,6 +101,21 @@ export default {
       stop: "Stop recording",
       start: "Start recording",
     },
+    mode: {
+      label: "Capture mode",
+      realtime: "Microphone",
+      upload: "Upload file",
+      system: "System audio",
+      systemUnavailable: "not available yet",
+    },
+    language: {
+      label: "Transcription language",
+      auto: "Auto-detect",
+    },
+    playback: {
+      play: "Play",
+      pause: "Pause",
+    },
   },
   stt: {
     title: "Local speech transcription",
