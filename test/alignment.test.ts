@@ -629,3 +629,240 @@ describe("settings persistence", () => {
     expect((call[1] as any).settings.sidebarOpen).toBe(false);
   });
 });
+
+// A stale context menu, rename box or message-edit box committed while a
+// recording or chat stream is live would clobber data the backend is still writing.
+describe("operationBusy guards on the new sidebar and message affordances", () => {
+  let data: AppData;
+  beforeEach(() => {
+    data = baseState();
+    invoke.mockReset();
+  });
+
+  function mockInvokeWithPendingChat() {
+    invoke.mockImplementation((command: string, args?: Record<string, any>) => {
+      if (command === "load_state") return Promise.resolve(structuredClone(data));
+      if (command === "stt_status")
+        return Promise.resolve({
+          ready: true,
+          modelName: "fixture",
+          modelPath: "/tmp",
+          sizeBytes: 1,
+        });
+      if (command === "save_settings")
+        data.settings = args?.settings as AppData["settings"];
+      if (command === "rename_workspace") {
+        const workspace = data.workspaces.find((w) => w.id === args?.id);
+        if (workspace) workspace.name = args?.name as string;
+      }
+      if (command === "rename_session") {
+        const session = data.sessions.find((s) => s.id === args?.id);
+        if (session) session.title = args?.title as string;
+      }
+      if (command === "chat") return new Promise(() => undefined); // never resolves: stream stays in flight
+      return Promise.resolve();
+    });
+  }
+
+  async function startStreaming(wrapper: VueWrapper) {
+    await wrapper.get("form.composer textarea").setValue("Another question");
+    await wrapper.get("form.composer").trigger("submit");
+    await flushPromises();
+  }
+
+  it("refuses to open the context menu while a chat stream is in flight, and closes one already open", async () => {
+    mockInvokeWithPendingChat();
+    const wrapper = mountApp();
+    await flushPromises();
+    const row = wrapper.find(".workspace-node .tree-row");
+    await row.trigger("contextmenu");
+    expect(wrapper.find(".context-menu").exists()).toBe(true);
+
+    await startStreaming(wrapper);
+    // The stream now holds the generation slot; a menu left open over it must
+    // not stay open for the user to act on with a now-busy session.
+    expect(wrapper.find(".context-menu").exists()).toBe(false);
+    await row.trigger("contextmenu");
+    expect(wrapper.find(".context-menu").exists()).toBe(false);
+  });
+
+  it("closes an open session rename box and never commits it once a chat stream starts", async () => {
+    mockInvokeWithPendingChat();
+    const wrapper = mountApp();
+    await flushPromises();
+    await wrapper.get(".tree-session").trigger("dblclick");
+    expect(wrapper.find(".rename-input").exists()).toBe(true);
+
+    await startStreaming(wrapper);
+    expect(wrapper.find(".rename-input").exists()).toBe(false);
+    expect(
+      invoke.mock.calls.some(([command]) => command === "rename_session"),
+    ).toBe(false);
+    expect(
+      invoke.mock.calls.some(([command]) => command === "save_session"),
+    ).toBe(false);
+    // The session title in the tree must still read the un-renamed value.
+    expect(wrapper.get(".tree-session").text()).toContain("Lesson one");
+  });
+
+  it("closes an open message-edit box and never saves it once a chat stream starts", async () => {
+    mockInvokeWithPendingChat();
+    const wrapper = mountApp();
+    await flushPromises();
+    await wrapper
+      .findAll(".message-actions")[0]!
+      .findAll("button")
+      .find((item) => item.text() === "编辑")!
+      .trigger("click");
+    expect(wrapper.find(".message-edit").exists()).toBe(true);
+    await wrapper.get(".message-edit textarea").setValue("Edited content");
+
+    await startStreaming(wrapper);
+    expect(wrapper.find(".message-edit").exists()).toBe(false);
+    expect(
+      invoke.mock.calls.some(([command]) => command === "save_session"),
+    ).toBe(false);
+    expect(wrapper.text()).not.toContain("Edited content");
+  });
+
+  it("disables the delete-confirmation button once an operation starts, without closing the dialog under it", async () => {
+    mockInvokeWithPendingChat();
+    const wrapper = mountApp();
+    await flushPromises();
+    await wrapper.get(".tree-delete").trigger("click");
+    expect(wrapper.find(".dialog-stub").exists()).toBe(true);
+    expect(
+      buttonWithText(wrapper, "删除工作区").attributes("disabled"),
+    ).toBeUndefined();
+
+    await startStreaming(wrapper);
+    // Unlike the context menu and edit box, the delete dialog itself stays
+    // open -- only the destructive action inside it is locked out.
+    expect(wrapper.find(".dialog-stub").exists()).toBe(true);
+    expect(
+      buttonWithText(wrapper, "删除工作区").attributes("disabled"),
+    ).toBeDefined();
+  });
+
+  it("marks the session busy before the regenerate save awaits, so a second send is refused in the gap", async () => {
+    let releaseSave: () => void = () => undefined;
+    invoke.mockImplementation((command: string, args?: Record<string, any>) => {
+      if (command === "load_state") return Promise.resolve(structuredClone(data));
+      if (command === "stt_status")
+        return Promise.resolve({
+          ready: true,
+          modelName: "fixture",
+          modelPath: "/tmp",
+          sizeBytes: 1,
+        });
+      if (command === "save_session")
+        return new Promise<void>((resolve) => {
+          releaseSave = resolve;
+        });
+      return Promise.resolve();
+    });
+    const wrapper = mountApp();
+    await flushPromises();
+    await wrapper
+      .findAll(".message-actions")[1]!
+      .findAll("button")
+      .find((item) => item.text() === "重新生成")!
+      .trigger("click");
+    await nextTick();
+    // regenerateMessage is now paused awaiting save_session; streaming must
+    // already be true so a second send cannot start a concurrent generation.
+    await wrapper.get("form.composer textarea").setValue("Another question");
+    await wrapper.get("form.composer").trigger("submit");
+    await flushPromises();
+    expect(
+      invoke.mock.calls.some(([command]) => command === "chat"),
+    ).toBe(false);
+    releaseSave();
+    await flushPromises();
+  });
+});
+
+describe("material editor draft", () => {
+  let data: AppData;
+  beforeEach(() => {
+    data = baseState();
+    data.sessions = [];
+    data.materials = [
+      {
+        id: "mat1",
+        workspaceId: "w1",
+        name: "Notes.md",
+        content: "original content",
+        path: "/tmp/notes.md",
+      },
+      {
+        id: "mat2",
+        workspaceId: "w1",
+        name: "Other.md",
+        content: "other content",
+        path: "/tmp/other.md",
+      },
+    ];
+    invoke.mockReset();
+    mockInvoke(data);
+  });
+
+  it("keeps an unsaved draft across an unrelated refresh, but swaps it when a different material is selected", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    expect(
+      (wrapper.get(".material-editor textarea").element as HTMLTextAreaElement)
+        .value,
+    ).toBe("original content");
+    await wrapper.get(".material-editor textarea").setValue("unsaved edits");
+
+    // Rename the workspace: an action wholly unrelated to the open material,
+    // but one that still triggers a refresh() and a fresh load_state payload.
+    await wrapper.get(".tree-workspace").trigger("dblclick");
+    const input = wrapper.get(".rename-input");
+    await input.setValue("Renamed class");
+    await input.trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(
+      invoke.mock.calls.some(([command]) => command === "rename_workspace"),
+    ).toBe(true);
+    expect(
+      (wrapper.get(".material-editor textarea").element as HTMLTextAreaElement)
+        .value,
+    ).toBe("unsaved edits");
+
+    // Selecting a different material still swaps the draft as expected.
+    await buttonWithText(wrapper, "知识库").trigger("click");
+    const materialRows = wrapper.findAll(".tree-session");
+    await materialRows[1]!.trigger("click");
+    await nextTick();
+    expect(
+      (wrapper.get(".material-editor textarea").element as HTMLTextAreaElement)
+        .value,
+    ).toBe("other content");
+  });
+});
+
+describe("settings dialog theme control", () => {
+  let data: AppData;
+  beforeEach(() => {
+    data = baseState();
+    invoke.mockReset();
+    mockInvoke(data);
+  });
+
+  it("has no theme control of its own in the Settings dialog; the header switcher is the sole, immediate theme control", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await buttonWithText(wrapper, "设置").trigger("click");
+    const dialog = wrapper.get(".dialog-stub");
+    expect(dialog.findAll("select").length).toBe(0);
+    expect(dialog.text()).not.toContain("主题");
+    await buttonWithText(wrapper, "关闭").trigger("click");
+
+    await buttonWithText(wrapper, "深色").trigger("click");
+    await flushPromises();
+    expect(document.documentElement.dataset.fluentTheme).toBe("dark");
+    expect(data.settings.theme).toBe("dark");
+  });
+});
