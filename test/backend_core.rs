@@ -203,6 +203,7 @@ fn created_at_round_trips_through_save_session_edits() {
             role: "user".into(),
             content: "hello".into(),
             created_at: String::new(),
+            tool_calls: None,
         }],
         transcription: None,
         summary: None,
@@ -224,6 +225,7 @@ fn created_at_round_trips_through_save_session_edits() {
         role: "assistant".into(),
         content: "hi".into(),
         created_at: String::new(),
+        tool_calls: None,
     });
     save_session_with(edited, &state).unwrap();
     let reloaded = load_data(&state).unwrap();
@@ -234,6 +236,53 @@ fn created_at_round_trips_through_save_session_edits() {
         session.messages[0].created_at,
         session.messages[1].created_at.clone()
     );
+}
+
+#[test]
+fn tool_calls_persist_and_survive_a_reload() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
+    let db = state.db().unwrap();
+    db.execute("INSERT INTO workspaces VALUES('w','Class')", [])
+        .unwrap();
+    db.execute(
+        "INSERT INTO sessions(id,workspace_id,title) VALUES('s','w','Lesson')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+
+    let calls = vec![ToolCall {
+        id: "call_1".into(),
+        name: "search_local_materials".into(),
+        status: "finished".into(),
+        arguments: Some("{\"query\":\"algebra\"}".into()),
+        result: Some("Algebra is fun.".into()),
+    }];
+    persist_message(&state, "s", "assistant", "Here is what I found.", Some(&calls)).unwrap();
+
+    // The card must still be there after the same reload the frontend does
+    // right after a turn finishes (load_state), not just in the live stream.
+    let loaded = load_data(&state).unwrap();
+    let session = loaded.sessions.iter().find(|s| s.id == "s").unwrap();
+    let tool_calls = session.messages[0]
+        .tool_calls
+        .as_ref()
+        .expect("tool calls must survive a reload");
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(tool_calls[0].id, "call_1");
+    assert_eq!(tool_calls[0].result.as_deref(), Some("Algebra is fun."));
+
+    // save_session's delete-and-reinsert (an edit/regenerate) must carry
+    // tool_calls through untouched, the same way created_at already does.
+    save_session_with(session.clone(), &state).unwrap();
+    let reloaded = load_data(&state).unwrap();
+    let session = reloaded.sessions.iter().find(|s| s.id == "s").unwrap();
+    let tool_calls = session.messages[0]
+        .tool_calls
+        .as_ref()
+        .expect("tool calls must survive save_session's reinsert");
+    assert_eq!(tool_calls[0].id, "call_1");
 }
 
 #[test]

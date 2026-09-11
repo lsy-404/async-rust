@@ -35,6 +35,17 @@ pub struct Workspace {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Message {
     pub id: String,
     pub role: String,
@@ -42,6 +53,9 @@ pub struct Message {
     // Empty for messages persisted before this field existed; never rewritten afterward.
     #[serde(default)]
     pub created_at: String,
+    // Only present on an assistant turn that ran at least one local tool.
+    #[serde(default)]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -222,6 +236,7 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     ensure_column(&db, "sessions", "summary_updated_at", "TEXT")?;
     ensure_column(&db, "sessions", "transcription_words", "TEXT")?;
     ensure_column(&db, "messages", "created_at", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(&db, "messages", "tool_calls", "TEXT")?;
     for (id, name, base) in [
         ("workbuddy", "WorkBuddy", "https://copilot.tencent.com/v2"),
         ("traecode", "TraeCode", "https://www.trae.ai"),
@@ -327,20 +342,35 @@ fn load_data(state: &AppState) -> Result<AppData, String> {
             .transpose()?;
         let messages = db
             .prepare(
-                "SELECT id,role,content,created_at FROM messages WHERE session_id=? ORDER BY position",
+                "SELECT id,role,content,created_at,tool_calls FROM messages WHERE session_id=? ORDER BY position",
             )
             .map_err(|e| e.to_string())?
             .query_map([&sid], |r| {
-                Ok(Message {
-                    id: r.get(0)?,
-                    role: r.get(1)?,
-                    content: r.get(2)?,
-                    created_at: r.get(3)?,
-                })
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
             })
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|(id, role, content, created_at, tool_calls)| {
+                let tool_calls = tool_calls
+                    .map(|raw| serde_json::from_str(&raw).map_err(|e| e.to_string()))
+                    .transpose()?;
+                Ok(Message {
+                    id,
+                    role,
+                    content,
+                    created_at,
+                    tool_calls,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         sessions.push(Session {
             id: sid,
             workspace_id,
@@ -546,9 +576,15 @@ fn save_session_with(session: Session, state: &AppState) -> Result<(), String> {
         } else {
             m.created_at.clone()
         };
+        let tool_calls = m
+            .tool_calls
+            .as_ref()
+            .filter(|calls| !calls.is_empty())
+            .map(|calls| serde_json::to_string(calls).map_err(|e| e.to_string()))
+            .transpose()?;
         tx.execute(
-            "INSERT INTO messages(id,session_id,role,content,position,created_at) VALUES(?,?,?,?,?,?)",
-            params![m.id, session.id, m.role, m.content, position, created_at],
+            "INSERT INTO messages(id,session_id,role,content,position,created_at,tool_calls) VALUES(?,?,?,?,?,?,?)",
+            params![m.id, session.id, m.role, m.content, position, created_at, tool_calls],
         )
         .map_err(|e| e.to_string())?;
     }
@@ -696,7 +732,12 @@ fn persist_message(
     session_id: &str,
     role: &str,
     content: &str,
+    tool_calls: Option<&[ToolCall]>,
 ) -> Result<(), String> {
+    let tool_calls_json = tool_calls
+        .filter(|calls| !calls.is_empty())
+        .map(|calls| serde_json::to_string(calls).map_err(|e| e.to_string()))
+        .transpose()?;
     let mut db = state.db()?;
     let tx = db.transaction().map_err(|e| e.to_string())?;
     let position: i64 = tx
@@ -707,14 +748,15 @@ fn persist_message(
         )
         .map_err(|e| e.to_string())?;
     tx.execute(
-        "INSERT INTO messages(id,session_id,role,content,position,created_at) VALUES(?,?,?,?,?,?)",
+        "INSERT INTO messages(id,session_id,role,content,position,created_at,tool_calls) VALUES(?,?,?,?,?,?,?)",
         params![
             id(),
             session_id,
             role,
             content,
             position,
-            chrono::Utc::now().to_rfc3339()
+            chrono::Utc::now().to_rfc3339(),
+            tool_calls_json
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -736,7 +778,7 @@ async fn streamed_completion(
     tool_workspace_id: Option<&str>,
     channel: Channel<StreamEvent>,
     cancellation: CancellationToken,
-) -> Result<String, String> {
+) -> Result<(String, Vec<ToolCall>), String> {
     let (_, _, settings) = session_context(state, session_id)?;
     auth_commands::stream(
         state,
@@ -789,7 +831,7 @@ async fn chat_impl(
             .map(|m| json!({"role":m.role,"content":m.content})),
     );
     messages.push(json!({"role":"user","content":content}));
-    persist_message(state, session_id, "user", content)?;
+    persist_message(state, session_id, "user", content, None)?;
     let result = streamed_completion(
         state,
         session_id,
@@ -804,9 +846,9 @@ async fn chat_impl(
         .lock()
         .map_err(|_| "生成状态不可用。")?
         .remove(session_id);
-    let answer = result?;
-    if !answer.is_empty() {
-        persist_message(state, session_id, "assistant", &answer)?;
+    let (answer, tool_calls) = result?;
+    if !answer.is_empty() || !tool_calls.is_empty() {
+        persist_message(state, session_id, "assistant", &answer, Some(&tool_calls))?;
     }
     Ok(())
 }
@@ -865,7 +907,7 @@ async fn summarize(
         .lock()
         .map_err(|_| "生成状态不可用。")?
         .remove(&session_id);
-    let summary = result?;
+    let (summary, _) = result?;
     let updated_at = chrono::Utc::now().to_rfc3339();
     state
         .db()?
