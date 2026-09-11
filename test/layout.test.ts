@@ -164,4 +164,38 @@ describe("original workbench layout", () => {
     await flushPromises();
     expect(wrapper.find(".tree-session").attributes("disabled")).toBeDefined();
   });
+
+  it("closes an open context menu when recording starts and refuses to reopen it while busy", async () => {
+    const data = state();
+    invoke.mockImplementation((command: string) => {
+      if (command === "load_state")
+        return Promise.resolve(structuredClone(data));
+      if (command === "stt_status")
+        return Promise.resolve({
+          ready: true,
+          modelName: "local",
+          modelPath: "",
+          sizeBytes: 0,
+        });
+      if (command === "start_recording") return Promise.resolve();
+      return Promise.resolve();
+    });
+    const wrapper = mount(App, { global: { stubs } });
+    await flushPromises();
+    const row = wrapper.find(".workspace-node .tree-row");
+    await row.trigger("contextmenu");
+    expect(wrapper.find(".context-menu").exists()).toBe(true);
+    await wrapper
+      .findAll("button")
+      .find((item) => item.text() === "开始录音")!
+      .trigger("click");
+    await flushPromises();
+    // A recording session is now writing the transcript; any menu left open
+    // over it must be closed rather than acting on a now-stale session.
+    expect(wrapper.find(".context-menu").exists()).toBe(false);
+    // A native contextmenu event bypasses a plain :disabled attribute, so the
+    // guard has to live in the handler itself.
+    await row.trigger("contextmenu");
+    expect(wrapper.find(".context-menu").exists()).toBe(false);
+  });
 });

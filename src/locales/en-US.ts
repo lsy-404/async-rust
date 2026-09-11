@@ -1,6 +1,5 @@
 export default {
   common: {
-    confirm: "Confirm",
     cancel: "Cancel",
     save: "Save",
     delete: "Delete",
@@ -37,20 +36,12 @@ export default {
     createWorkspace: "New workspace",
     createSession: "New session",
   },
-  workspacePicker: {
-    title: "Choose a workspace",
-    description: "Select a workspace to create the session in.",
-  },
   sessionCreate: {
     title: "New session",
     description: "Creates a new class session in the workspace selected below.",
     label: "Session title",
     placeholder: "e.g. Lesson 3 discussion",
     submit: "Create",
-  },
-  rename: {
-    title: "Rename",
-    label: "Name",
   },
   header: {
     toggleSidebar: "Toggle sidebar",
@@ -69,7 +60,6 @@ export default {
     inputPlaceholder: "Type a question. Enter to send, Shift+Enter for a new line",
     stop: "Stop",
     send: "Send",
-    empty: "Select or create a session to start a class conversation.",
     editMessageLabel: "Edit message",
     actions: {
       copy: "Copy",
@@ -128,7 +118,6 @@ export default {
   },
   theme: {
     switch: "Switch theme",
-    label: "Theme",
     system: "Follow system",
     light: "Light",
     dark: "Dark",
@@ -163,7 +152,6 @@ export default {
   },
   deleteDialog: {
     title: "Confirm deletion",
-    body: 'Deleting "{name}" cannot be undone. Continue?',
   },
   notice: {
     materialSaved: "Material saved locally.",

@@ -414,6 +414,28 @@ fn create_session(
         .map_err(|e| e.to_string())?;
     Ok(item)
 }
+fn rename_session_impl(state: &AppState, id: &str, title: &str) -> Result<(), String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("名称不能为空。".into());
+    }
+    let updated = state
+        .db()?
+        .execute("UPDATE sessions SET title=? WHERE id=?", params![title, id])
+        .map_err(|e| e.to_string())?;
+    if updated == 0 {
+        return Err("找不到会话。".into());
+    }
+    Ok(())
+}
+#[tauri::command]
+fn rename_session(
+    id: String,
+    title: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    rename_session_impl(&state, &id, &title)
+}
 #[tauri::command]
 fn delete_session(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     state
@@ -638,15 +660,16 @@ async fn streamed_completion(
     )
     .await
 }
-#[tauri::command]
-async fn chat(
-    session_id: String,
-    content: String,
+async fn chat_impl(
+    state: &AppState,
+    session_id: &str,
+    content: &str,
     on_event: Channel<StreamEvent>,
-    state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let (session, materials, _) = session_context(&state, &session_id)?;
-    persist_message(&state, &session_id, "user", &content)?;
+    let (session, materials, _) = session_context(state, session_id)?;
+    // Reserve the generation slot before persisting anything, so a rejected
+    // concurrent call never leaves a reply-less user message behind.
+    let token = generation_token(state, session_id)?;
     let mut context = String::new();
     if let Some(text) = session.transcription {
         context.push_str("Transcript:\n");
@@ -674,18 +697,27 @@ async fn chat(
             .map(|m| json!({"role":m.role,"content":m.content})),
     );
     messages.push(json!({"role":"user","content":content}));
-    let token = generation_token(&state, &session_id)?;
-    let result = streamed_completion(&state, &session_id, messages, on_event, token).await;
+    persist_message(state, session_id, "user", content)?;
+    let result = streamed_completion(state, session_id, messages, on_event, token).await;
     state
         .cancellations
         .lock()
         .map_err(|_| "生成状态不可用。")?
-        .remove(&session_id);
+        .remove(session_id);
     let answer = result?;
     if !answer.is_empty() {
-        persist_message(&state, &session_id, "assistant", &answer)?;
+        persist_message(state, session_id, "assistant", &answer)?;
     }
     Ok(())
+}
+#[tauri::command]
+async fn chat(
+    session_id: String,
+    content: String,
+    on_event: Channel<StreamEvent>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    chat_impl(&state, &session_id, &content, on_event).await
 }
 #[tauri::command]
 fn cancel_generation(session_id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
@@ -976,6 +1008,7 @@ pub fn run() {
             rename_workspace,
             delete_workspace,
             create_session,
+            rename_session,
             delete_session,
             save_session,
             import_material,

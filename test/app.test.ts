@@ -96,7 +96,7 @@ describe("desktop workbench interactions", () => {
             sizeBytes: 1,
           };
         if (command === "save_settings")
-          data.settings = args?.settings as AppData["settings"];
+          data.settings = { ...(args?.settings as AppData["settings"]) };
         return undefined;
       },
     );
@@ -137,10 +137,11 @@ describe("desktop workbench interactions", () => {
     expect(data.settings.providerId).toBe("workbuddy");
   });
 
-  it("refreshes the active model after native auth without dropping an unsaved theme", async () => {
+  it("refreshes the active model after native auth without dropping the header theme choice", async () => {
     const wrapper = mountApp();
     await flushPromises();
-    await wrapper.get('select[aria-label="主题"]').setValue("dark");
+    await buttonWithText(wrapper, "深色").trigger("click");
+    await flushPromises();
     data.settings.model = "native-model";
     data.providers[0]!.name = "Native connection";
     const connections = wrapper.getComponent(ModelConnections);

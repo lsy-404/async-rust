@@ -88,6 +88,76 @@ fn summary_timestamp_survives_reload() {
 }
 
 #[test]
+fn rename_session_updates_title_and_rejects_blank() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
+    state
+        .db()
+        .unwrap()
+        .execute("INSERT INTO workspaces VALUES('w','Class')", [])
+        .unwrap();
+    state
+        .db()
+        .unwrap()
+        .execute(
+            "INSERT INTO sessions(id,workspace_id,title) VALUES('s','w','Lesson')",
+            [],
+        )
+        .unwrap();
+
+    rename_session_impl(&state, "s", "Renamed").unwrap();
+    let title: String = state
+        .db()
+        .unwrap()
+        .query_row("SELECT title FROM sessions WHERE id='s'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(title, "Renamed");
+
+    let err = rename_session_impl(&state, "s", "   ").unwrap_err();
+    assert_eq!(err, "名称不能为空。");
+
+    let err = rename_session_impl(&state, "missing", "x").unwrap_err();
+    assert_eq!(err, "找不到会话。");
+}
+
+#[tokio::test]
+async fn chat_rejects_concurrent_generation_without_persisting_user_message() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
+    state
+        .db()
+        .unwrap()
+        .execute("INSERT INTO workspaces VALUES('w','Class')", [])
+        .unwrap();
+    state
+        .db()
+        .unwrap()
+        .execute(
+            "INSERT INTO sessions(id,workspace_id,title) VALUES('s','w','Lesson')",
+            [],
+        )
+        .unwrap();
+
+    // Simulate a generation already in flight for this session.
+    let _held_token = generation_token(&state, "s").unwrap();
+
+    let channel = Channel::<StreamEvent>::new(|_| Ok(()));
+    let result = chat_impl(&state, "s", "hello", channel).await;
+
+    assert_eq!(result.unwrap_err(), "该会话已有生成任务。");
+    let message_count: i64 = state
+        .db()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id='s'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(message_count, 0);
+}
+
+#[test]
 fn preexisting_database_without_summary_column_does_not_crash() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("state.sqlite3");

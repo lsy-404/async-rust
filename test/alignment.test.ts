@@ -107,6 +107,10 @@ function mockInvoke(data: AppData) {
         const workspace = data.workspaces.find((w) => w.id === args?.id);
         if (workspace) workspace.name = args?.name as string;
       }
+      if (command === "rename_session") {
+        const session = data.sessions.find((s) => s.id === args?.id);
+        if (session) session.title = args?.title as string;
+      }
       if (command === "save_session") {
         const index = data.sessions.findIndex(
           (s) => s.id === (args?.session as { id: string }).id,
@@ -156,7 +160,7 @@ describe("sidebar tree behaviour", () => {
     expect(wrapper.find(".context-menu").exists()).toBe(false);
   });
 
-  it("commits an inline session rename on Enter and calls save_session", async () => {
+  it("commits an inline session rename on Enter via rename_session, not save_session", async () => {
     const wrapper = mountApp();
     await flushPromises();
     await wrapper.get(".tree-session").trigger("dblclick");
@@ -164,12 +168,13 @@ describe("sidebar tree behaviour", () => {
     await input.setValue("Renamed lesson");
     await input.trigger("keydown", { key: "Enter" });
     await flushPromises();
-    const call = invoke.mock.calls.find(([command]) => command === "save_session");
-    expect(call).toBeTruthy();
-    expect((call![1] as any).session).toMatchObject({
+    expect(invoke).toHaveBeenCalledWith("rename_session", {
       id: "s1",
       title: "Renamed lesson",
     });
+    expect(
+      invoke.mock.calls.some(([command]) => command === "save_session"),
+    ).toBe(false);
   });
 
   it("commits an inline workspace rename with the trimmed name via rename_workspace", async () => {

@@ -310,7 +310,7 @@ function askDelete(
 }
 async function confirmDelete() {
   const target = deleteTarget.value;
-  if (!target) return;
+  if (!target || operationBusy.value) return;
   try {
     if (target.kind === "workspace")
       await invoke("delete_workspace", { id: target.id });
@@ -335,6 +335,7 @@ function openContextMenu(
   label: string,
   workspaceId?: string,
 ) {
+  if (operationBusy.value) return;
   contextMenu.value = {
     x: event.clientX,
     y: event.clientY,
@@ -367,13 +368,13 @@ function contextMenuNewSession() {
 }
 function contextMenuRename() {
   const menu = contextMenu.value;
-  if (!menu) return;
+  if (!menu || operationBusy.value) return;
   startRename(menu.kind, menu.id, menu.label);
   closeContextMenu();
 }
 function contextMenuDelete() {
   const menu = contextMenu.value;
-  if (!menu) return;
+  if (!menu || operationBusy.value) return;
   askDelete(menu.kind, menu.id, menu.label);
   closeContextMenu();
 }
@@ -400,7 +401,7 @@ async function commitRename() {
   const kind = renameKind.value;
   const name = renameDraft.value.trim();
   renamingId.value = "";
-  if (!id || !name) return;
+  if (!id || !name || operationBusy.value) return;
   try {
     if (kind === "workspace") {
       const current = data.value.workspaces.find((item) => item.id === id);
@@ -409,7 +410,7 @@ async function commitRename() {
     } else if (kind === "session") {
       const current = data.value.sessions.find((item) => item.id === id);
       if (!current || current.title === name) return;
-      await invoke("save_session", { session: { ...current, title: name } });
+      await invoke("rename_session", { id, title: name });
     } else {
       const current = data.value.materials.find((item) => item.id === id);
       if (!current || current.name === name) return;
@@ -611,7 +612,7 @@ function cancelEditMessage() {
   editingMessageId.value = "";
 }
 async function commitEditMessage() {
-  if (!session.value) return;
+  if (!session.value || operationBusy.value) return;
   const id = editingMessageId.value;
   const content = editDraft.value.trim();
   editingMessageId.value = "";
@@ -642,14 +643,15 @@ async function regenerateMessage(messageId: string) {
   const content = target.messages[userIndex]!.content;
   const sessionId = target.id;
   target.messages = target.messages.slice(0, userIndex);
+  streaming.value = true;
+  error.value = "";
   try {
     await invoke("save_session", { session: target });
   } catch (cause) {
+    streaming.value = false;
     report(cause);
     return;
   }
-  streaming.value = true;
-  error.value = "";
   const pending = reactive({
     id: `streaming-${sessionId}`,
     role: "assistant" as const,
@@ -879,9 +881,9 @@ watch(selectedWorkspaceId, () => {
   }
 });
 watch(
-  material,
-  (value) => {
-    materialDraft.value = value?.content ?? "";
+  () => material.value?.id,
+  () => {
+    materialDraft.value = material.value?.content ?? "";
   },
   { immediate: true },
 );
@@ -919,6 +921,12 @@ watch(
     panel.scrollTop = panel.scrollHeight;
   },
 );
+watch(operationBusy, (busy) => {
+  if (!busy) return;
+  closeContextMenu();
+  cancelEditMessage();
+  if (renamingId.value) cancelRename();
+});
 watch(renderedMessages, async () => {
   const panel = messagesRef.value;
   if (!panel) return;
@@ -1331,9 +1339,15 @@ onUnmounted(() => {
                     >
                       <FluentTextArea v-model="editDraft" :label="t('session.editMessageLabel')" />
                       <div class="message-edit-actions">
-                        <FluentButton tone="subtle" @click="cancelEditMessage"
+                        <FluentButton
+                          tone="subtle"
+                          :disabled="operationBusy"
+                          @click="cancelEditMessage"
                           >{{ t("common.cancel") }}</FluentButton
-                        ><FluentButton tone="primary" @click="commitEditMessage"
+                        ><FluentButton
+                          tone="primary"
+                          :disabled="operationBusy"
+                          @click="commitEditMessage"
                           >{{ t("common.save") }}</FluentButton
                         >
                       </div>
@@ -1593,16 +1607,7 @@ onUnmounted(() => {
                   stt.ready ? t("stt.ready") : t("stt.download")
                 }}</FluentButton
               >
-            </section>
-            <FluentSelect
-              v-model="data.settings.theme"
-              :label="t('theme.label')"
-              :options="[
-                { value: 'system', label: t('theme.system') },
-                { value: 'light', label: t('theme.light') },
-                { value: 'dark', label: t('theme.dark') },
-              ]"
-            /></div></template
+            </section></div></template
         ><template #footer
           ><FluentButton tone="subtle" @click="settingsOpen = false"
             >{{ t("common.close") }}</FluentButton
@@ -1628,9 +1633,12 @@ onUnmounted(() => {
         <template #footer
           ><FluentButton tone="subtle" @click="deleteTarget = undefined"
             >{{ t("common.cancel") }}</FluentButton
-          ><FluentButton tone="danger" @click="confirmDelete">{{
-            deleteCopy.confirmLabel
-          }}</FluentButton></template
+          ><FluentButton
+            tone="danger"
+            :disabled="operationBusy"
+            @click="confirmDelete"
+            >{{ deleteCopy.confirmLabel }}</FluentButton
+          ></template
         ></FluentDialog
       >
     </main>

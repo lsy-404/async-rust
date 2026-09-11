@@ -1,6 +1,5 @@
 export default {
   common: {
-    confirm: "确认",
     cancel: "取消",
     save: "保存",
     delete: "删除",
@@ -37,20 +36,12 @@ export default {
     createWorkspace: "新建工作区",
     createSession: "新建会话",
   },
-  workspacePicker: {
-    title: "选择工作区",
-    description: "请选择一个工作区以创建会话。",
-  },
   sessionCreate: {
     title: "新建会话",
     description: "将在下方选择的工作区中创建一个新的课堂会话。",
     label: "会话标题",
     placeholder: "例如：第 3 课讨论",
     submit: "新建",
-  },
-  rename: {
-    title: "重命名",
-    label: "名称",
   },
   header: {
     toggleSidebar: "切换侧栏",
@@ -68,7 +59,6 @@ export default {
     inputPlaceholder: "输入问题，Enter 发送，Shift+Enter 换行",
     stop: "停止",
     send: "发送",
-    empty: "选择或创建一个会话以开始课堂对话。",
     editMessageLabel: "编辑消息",
     actions: {
       copy: "复制",
@@ -125,7 +115,6 @@ export default {
   },
   theme: {
     switch: "切换主题",
-    label: "主题",
     system: "跟随系统",
     light: "浅色",
     dark: "深色",
@@ -160,7 +149,6 @@ export default {
   },
   deleteDialog: {
     title: "确认删除",
-    body: '删除“{name}”后无法恢复。继续吗？',
   },
   notice: {
     materialSaved: "材料已在本地保存。",
