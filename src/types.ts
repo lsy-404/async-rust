@@ -1,5 +1,12 @@
 export type Theme = "system" | "light" | "dark";
 export type CaptureMode = "realtime" | "upload" | "system";
+export type RecordingSource = "microphone" | "systemAudio";
+// `reason` is a stable machine code the caller maps through i18n, e.g.
+// "unsupported-os" | "unsupported-platform"; absent when available.
+export interface SystemAudioCapability {
+  available: boolean;
+  reason: string | null;
+}
 export interface Message {
   id: string;
   role: "user" | "assistant" | "system";

@@ -105,6 +105,8 @@ export default {
       upload: "上传文件",
       system: "系统音频",
       systemUnavailable: "暂不可用",
+      systemUnavailableOs: "需要 macOS 14.6 或更高版本",
+      systemUnavailablePlatform: "当前平台暂不支持",
     },
     language: {
       label: "转写语言",

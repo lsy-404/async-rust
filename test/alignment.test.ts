@@ -1119,6 +1119,41 @@ describe("transcript gap fixes: capture mode, language, level meter, playback", 
     expect(systemOption.text()).toContain("暂不可用");
   });
 
+  it("enables the system-audio option once the backend reports it is available, and records with that source", async () => {
+    invoke.mockImplementation(
+      async (command: string, args?: Record<string, any>) => {
+        if (command === "get_system_audio_capability")
+          return { available: true, reason: null };
+        if (command === "load_state") return structuredClone(data);
+        if (command === "stt_status")
+          return {
+            ready: true,
+            modelName: "fixture",
+            modelPath: "/tmp/model",
+            sizeBytes: 1,
+          };
+        return undefined;
+      },
+    );
+    const wrapper = mountApp();
+    await flushPromises();
+    const modeSelect = wrapper.get('[aria-label="输入方式"]');
+    const systemOption = modeSelect
+      .findAll("option")
+      .find((option) => option.element.value === "system")!;
+    expect(systemOption.attributes("disabled")).toBeUndefined();
+    expect(systemOption.text()).not.toContain("暂不可用");
+
+    await modeSelect.setValue("system");
+    await nextTick();
+    await buttonWithText(wrapper, "开始录音").trigger("click");
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith(
+      "start_recording",
+      expect.objectContaining({ sessionId: "s1", source: "systemAudio" }),
+    );
+  });
+
   it("passes the picked transcription language into transcribe_audio", async () => {
     const wrapper = mountApp();
     await flushPromises();

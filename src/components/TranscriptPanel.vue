@@ -3,7 +3,7 @@ import { computed, ref, watch } from "vue";
 import { i18n } from "../locales";
 import { FluentButton, FluentSelect, FluentSlider } from "@platform-kit/fluent/vue";
 import type { FluentSelectOption } from "@platform-kit/fluent/vue";
-import type { CaptureMode } from "../types";
+import type { CaptureMode, SystemAudioCapability } from "../types";
 import { WHISPER_LANGUAGES } from "../whisper-languages";
 import { splitTranscriptSentences } from "../transcript-sentences";
 
@@ -21,6 +21,7 @@ const props = defineProps<{
   streaming: boolean;
   summaryLoading: boolean;
   captureMode: CaptureMode;
+  systemAudioCapability: SystemAudioCapability;
   language: string;
   recordingLevel: number;
   audioUrl: string | undefined;
@@ -45,14 +46,26 @@ const languageOptions = computed<FluentSelectOption[]>(() => [
   ...WHISPER_LANGUAGES.map((entry) => ({ value: entry.code, label: entry.name })),
 ]);
 
+const systemUnavailableLabel = computed(() => {
+  switch (props.systemAudioCapability.reason) {
+    case "unsupported-os":
+      return t("transcript.mode.systemUnavailableOs");
+    case "unsupported-platform":
+      return t("transcript.mode.systemUnavailablePlatform");
+    default:
+      return t("transcript.mode.systemUnavailable");
+  }
+});
 const modeOptions = computed<FluentSelectOption[]>(() => [
   { value: "realtime", label: t("transcript.mode.realtime") },
   { value: "upload", label: t("transcript.mode.upload") },
-  {
-    value: "system",
-    label: `${t("transcript.mode.system")} — ${t("transcript.mode.systemUnavailable")}`,
-    disabled: true,
-  },
+  props.systemAudioCapability.available
+    ? { value: "system", label: t("transcript.mode.system") }
+    : {
+        value: "system",
+        label: `${t("transcript.mode.system")} — ${systemUnavailableLabel.value}`,
+        disabled: true,
+      },
 ]);
 
 const primaryLabel = computed(() =>

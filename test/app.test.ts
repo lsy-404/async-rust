@@ -236,6 +236,7 @@ describe("desktop workbench interactions", () => {
     expect(invoke).toHaveBeenCalledWith("start_recording", {
       sessionId: "s1",
       onEvent: expect.objectContaining({ onmessage: expect.any(Function) }),
+      source: "microphone",
       language: null,
     });
     expect(

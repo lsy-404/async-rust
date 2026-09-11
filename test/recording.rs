@@ -133,6 +133,7 @@ async fn lifecycle_pins_session_and_cancel_or_drop_joins_worker() {
             "new",
             Path::new("unused"),
             &SttManager::new(PathBuf::from("unused")),
+            RecordingSource::Microphone,
             None,
             Arc::new(|_| Ok(())),
             Arc::new(|_| {}),
@@ -196,4 +197,106 @@ fn abandoned_stop_result_removes_unclaimed_recording() {
     fs::write(&path, b"audio").unwrap();
     assert_eq!(CompletedCapture(Some(path.clone())).claim().unwrap(), path);
     assert!(path.exists());
+}
+
+#[test]
+fn recording_source_serializes_as_camel_case_to_match_the_frontend_capture_mode() {
+    assert_eq!(
+        serde_json::to_value(RecordingSource::Microphone).unwrap(),
+        serde_json::json!("microphone")
+    );
+    assert_eq!(
+        serde_json::to_value(RecordingSource::SystemAudio).unwrap(),
+        serde_json::json!("systemAudio")
+    );
+    assert_eq!(
+        serde_json::from_value::<RecordingSource>(serde_json::json!("microphone")).unwrap(),
+        RecordingSource::Microphone
+    );
+    assert_eq!(
+        serde_json::from_value::<RecordingSource>(serde_json::json!("systemAudio")).unwrap(),
+        RecordingSource::SystemAudio
+    );
+}
+
+#[test]
+fn macos_version_parsing_handles_two_and_three_component_strings_and_garbage() {
+    assert_eq!(parse_macos_version("14.6.1"), Some((14, 6)));
+    assert_eq!(parse_macos_version("14.6"), Some((14, 6)));
+    assert_eq!(parse_macos_version("15"), Some((15, 0)));
+    assert_eq!(parse_macos_version("  13.2  \n"), Some((13, 2)));
+    assert_eq!(parse_macos_version(""), None);
+    assert_eq!(parse_macos_version("not-a-version"), None);
+}
+
+#[test]
+fn macos_system_audio_gate_requires_at_least_the_min_supported_release() {
+    assert!(!macos_supports_system_audio(None));
+    assert!(!macos_supports_system_audio(Some((14, 5))));
+    assert!(!macos_supports_system_audio(Some((13, 9))));
+    assert!(macos_supports_system_audio(Some((14, 6))));
+    assert!(macos_supports_system_audio(Some((14, 7))));
+    assert!(macos_supports_system_audio(Some((15, 0))));
+}
+
+#[test]
+fn gate_for_passes_available_capabilities_and_explains_unavailable_ones() {
+    gate_for(&SystemAudioCapability {
+        available: true,
+        reason: None,
+    })
+    .unwrap();
+    let os_error = gate_for(&SystemAudioCapability {
+        available: false,
+        reason: Some("unsupported-os".into()),
+    })
+    .unwrap_err();
+    assert!(os_error.contains("14.6"));
+    let platform_error = gate_for(&SystemAudioCapability {
+        available: false,
+        reason: Some("unsupported-platform".into()),
+    })
+    .unwrap_err();
+    assert!(platform_error.contains("平台"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn system_audio_capability_reason_is_present_exactly_when_unavailable() {
+    let capability = system_audio_capability();
+    assert_eq!(capability.available, capability.reason.is_none());
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn system_audio_capability_is_always_available_on_windows() {
+    let capability = system_audio_capability();
+    assert!(capability.available);
+    assert!(capability.reason.is_none());
+}
+
+// Building a real loopback stream needs an actual output device and, on
+// macOS, an interactively-granted System Audio Recording permission; neither
+// is available in CI. Mirrors the ASYNC_STT_* convention in test/native_stt.rs.
+#[tokio::test]
+#[ignore = "Set ASYNC_RECORDING_SYSTEM_AUDIO=1 on a machine with a real output device (and, on macOS 14.6+, granted System Audio Recording permission) to run"]
+async fn system_audio_capture_starts_and_stops_against_real_hardware() {
+    std::env::var("ASYNC_RECORDING_SYSTEM_AUDIO").unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let manager = RecordingManager::new();
+    manager
+        .start(
+            "hardware-check",
+            temp.path(),
+            &SttManager::new(temp.path().join("stt")),
+            RecordingSource::SystemAudio,
+            None,
+            Arc::new(|_| Ok(())),
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    manager.stop("hardware-check").await.unwrap();
 }

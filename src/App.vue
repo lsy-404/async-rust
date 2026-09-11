@@ -32,10 +32,12 @@ import type {
   AppData,
   CaptureMode,
   Material,
+  RecordingSource,
   Session,
   Settings,
   StreamEvent,
   SttStatus,
+  SystemAudioCapability,
   RecordingEvent,
   Theme,
   Workspace,
@@ -116,6 +118,10 @@ const recordingSessionId = ref("");
 let recordingGeneration = 0;
 const recordingLevel = ref(0);
 const captureMode = ref<CaptureMode>("realtime");
+const systemAudioCapability = ref<SystemAudioCapability>({
+  available: false,
+  reason: null,
+});
 const transcriptionLanguage = ref("");
 const importedAudioUrl = ref<string>();
 const sidebarMode = ref<"session" | "knowledge">("session");
@@ -866,10 +872,13 @@ async function toggleRecording() {
     const target = data.value.sessions.find((item) => item.id === sessionId);
     if (target) target.transcription = event.text;
   };
+  const source: RecordingSource =
+    captureMode.value === "system" ? "systemAudio" : "microphone";
   try {
     await invoke("start_recording", {
       sessionId,
       onEvent,
+      source,
       language: transcriptionLanguage.value || null,
     });
     if (generation !== recordingGeneration) return;
@@ -998,6 +1007,13 @@ watch(renderedMessages, async () => {
 });
 onMounted(() => {
   void refresh();
+  // Capture hardware/OS support doesn't change while the app runs, so this is
+  // fetched once rather than on every refresh().
+  void invoke<SystemAudioCapability>("get_system_audio_capability")
+    .then((capability) => {
+      if (capability) systemAudioCapability.value = capability;
+    })
+    .catch(() => {});
   window.addEventListener("click", handleWindowClick);
   window.addEventListener("keydown", handleWindowKeydown);
   window.addEventListener("scroll", handleWindowScroll, true);
@@ -1193,6 +1209,7 @@ onUnmounted(() => {
               :streaming="streaming"
               :summary-loading="summaryLoading"
               :capture-mode="captureMode"
+              :system-audio-capability="systemAudioCapability"
               :language="transcriptionLanguage"
               :recording-level="recordingLevel"
               :audio-url="importedAudioUrl"

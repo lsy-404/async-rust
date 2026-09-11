@@ -107,6 +107,8 @@ export default {
       upload: "Upload file",
       system: "System audio",
       systemUnavailable: "not available yet",
+      systemUnavailableOs: "requires macOS 14.6 or later",
+      systemUnavailablePlatform: "not supported on this platform",
     },
     language: {
       label: "Transcription language",

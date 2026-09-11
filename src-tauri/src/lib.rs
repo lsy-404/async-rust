@@ -1010,6 +1010,7 @@ async fn read_audio_file(path: String) -> Result<tauri::ipc::Response, String> {
 async fn start_recording(
     session_id: String,
     on_event: Channel<RecordingEvent>,
+    source: recording::RecordingSource,
     language: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
@@ -1058,6 +1059,7 @@ async fn start_recording(
             &session_id,
             state.db_path.parent().ok_or("本地数据路径无效。")?,
             &state.stt,
+            source,
             language,
             on_transcript,
             on_error,
@@ -1096,6 +1098,10 @@ async fn stop_recording(
 #[tauri::command]
 async fn cancel_recording(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.recording.cancel().await
+}
+#[tauri::command]
+fn get_system_audio_capability() -> recording::SystemAudioCapability {
+    recording::system_audio_capability()
 }
 
 pub fn run() {
@@ -1137,6 +1143,7 @@ pub fn run() {
             start_recording,
             stop_recording,
             cancel_recording,
+            get_system_audio_capability,
             stt_status,
             download_stt_model,
             cancel_stt_download

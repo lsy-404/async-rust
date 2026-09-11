@@ -15,6 +15,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     FromSample, Sample, SampleFormat, SizedSample,
 };
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -26,6 +27,99 @@ const MAX_WAV_BYTES: u64 = 512 * 1024 * 1024;
 const FAILURE_OVERFLOW: u8 = 1;
 const FAILURE_DEVICE: u8 = 2;
 const FAILURE_SAMPLES: u8 = 3;
+
+/// Which physical path feeds the shared capture pipeline (queue, VAD, live
+/// transcription). Wire format matches the frontend's `CaptureMode`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RecordingSource {
+    Microphone,
+    SystemAudio,
+}
+
+// Lowest macOS version cpal's Core Audio Process Tap loopback path supports (per its README).
+const MIN_MACOS_MAJOR: u32 = 14;
+const MIN_MACOS_MINOR: u32 = 6;
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemAudioCapability {
+    pub available: bool,
+    // Stable machine code for the frontend to map through i18n; never shown raw.
+    pub reason: Option<String>,
+}
+
+fn parse_macos_version(text: &str) -> Option<(u32, u32)> {
+    let mut parts = text.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor))
+}
+
+fn macos_supports_system_audio(version: Option<(u32, u32)>) -> bool {
+    matches!(version, Some(found) if found >= (MIN_MACOS_MAJOR, MIN_MACOS_MINOR))
+}
+
+#[cfg(target_os = "macos")]
+fn detected_macos_version() -> Option<(u32, u32)> {
+    let output = std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_macos_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(target_os = "macos")]
+pub fn system_audio_capability() -> SystemAudioCapability {
+    if macos_supports_system_audio(detected_macos_version()) {
+        SystemAudioCapability {
+            available: true,
+            reason: None,
+        }
+    } else {
+        SystemAudioCapability {
+            available: false,
+            reason: Some("unsupported-os".into()),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn system_audio_capability() -> SystemAudioCapability {
+    // WASAPI loopback works on any output device cpal can already open; no
+    // version gate needed on Windows.
+    SystemAudioCapability {
+        available: true,
+        reason: None,
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn system_audio_capability() -> SystemAudioCapability {
+    SystemAudioCapability {
+        available: false,
+        reason: Some("unsupported-platform".into()),
+    }
+}
+
+fn gate_for(capability: &SystemAudioCapability) -> Result<(), String> {
+    if capability.available {
+        return Ok(());
+    }
+    Err(match capability.reason.as_deref() {
+        Some("unsupported-os") => format!(
+            "系统音频录制需要 macOS {MIN_MACOS_MAJOR}.{MIN_MACOS_MINOR} 或更高版本，请更新系统后重试。"
+        ),
+        _ => "当前平台不支持系统音频录制。".into(),
+    })
+}
+
+fn system_audio_gate() -> Result<(), String> {
+    gate_for(&system_audio_capability())
+}
 
 enum Control {
     Stop,
@@ -107,6 +201,7 @@ impl RecordingManager {
         session_id: &str,
         data_root: &Path,
         stt: &SttManager,
+        source: RecordingSource,
         language: Option<String>,
         on_transcript: TranscriptCallback,
         on_error: ErrorCallback,
@@ -131,14 +226,19 @@ impl RecordingManager {
         let stt_root = stt.clone_root();
         let worker_canceled = canceled.clone();
         let worker_error = on_error.clone();
+        let thread_name = match source {
+            RecordingSource::Microphone => "microphone-writer",
+            RecordingSource::SystemAudio => "system-audio-writer",
+        };
         let worker = thread::Builder::new()
-            .name("microphone-writer".into())
+            .name(thread_name.into())
             .spawn(move || {
                 let result = recording_worker(
                     path,
                     commands,
                     ready,
                     stt_root,
+                    source,
                     language,
                     guarded_transcript,
                     worker_canceled,
@@ -362,6 +462,26 @@ fn enqueue<T: SizedSample>(
         }
     }
 }
+fn build_capture_stream<T: SizedSample>(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    sender: SyncSender<Vec<i16>>,
+    failure: Arc<AtomicU8>,
+) -> Result<cpal::Stream, cpal::Error>
+where
+    f32: FromSample<T>,
+{
+    let channels = usize::from(config.channels);
+    let device_failure = failure.clone();
+    device.build_input_stream(
+        config,
+        move |input: &[T], _| enqueue(input, channels, &sender, &failure),
+        move |_| {
+            device_failure.store(FAILURE_DEVICE, Ordering::Release);
+        },
+        Some(Duration::from_secs(10)),
+    )
+}
 fn stream_for<T: SizedSample>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
@@ -371,18 +491,28 @@ fn stream_for<T: SizedSample>(
 where
     f32: FromSample<T>,
 {
-    let channels = usize::from(config.channels);
-    let device_failure = failure.clone();
-    device
-        .build_input_stream(
-            config,
-            move |input: &[T], _| enqueue(input, channels, &sender, &failure),
-            move |_| {
-                device_failure.store(FAILURE_DEVICE, Ordering::Release);
-            },
-            Some(Duration::from_secs(10)),
-        )
+    build_capture_stream::<T>(device, config, sender, failure)
         .map_err(|e| format!("无法开启麦克风，请检查权限和设备：{e}"))
+}
+// Same capture path as `stream_for`, but on the loopback (output) device cpal
+// transparently builds when the requested device doesn't support input; the
+// permission-denied case gets a distinct, actionable message.
+fn system_stream_for<T: SizedSample>(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    sender: SyncSender<Vec<i16>>,
+    failure: Arc<AtomicU8>,
+) -> Result<cpal::Stream, String>
+where
+    f32: FromSample<T>,
+{
+    build_capture_stream::<T>(device, config, sender, failure).map_err(|e| {
+        if e.kind() == cpal::ErrorKind::PermissionDenied {
+            "系统音频权限被拒绝。请在系统设置的隐私与安全性中允许 Async 录制系统音频，然后重试。".into()
+        } else {
+            format!("无法开启系统音频采集，请检查权限和设备：{e}")
+        }
+    })
 }
 
 fn forward_transcript_audio(
@@ -413,6 +543,7 @@ fn recording_worker(
     commands: Receiver<Control>,
     ready: SyncSender<Result<(), String>>,
     stt_root: PathBuf,
+    source: RecordingSource,
     language: Option<String>,
     on_transcript: TranscriptCallback,
     canceled: Arc<std::sync::atomic::AtomicBool>,
@@ -420,27 +551,64 @@ fn recording_worker(
 ) -> WorkerResult {
     let initialize = || {
         let host = cpal::default_host();
-        let device = host.default_input_device().ok_or("没有可用的麦克风。")?;
-        let supported = device
-            .default_input_config()
-            .map_err(|e| format!("无法读取麦克风配置：{e}"))?;
+        // System audio rides the same output device cpal already exposes: asking it
+        // for an *input* stream (it has none) makes cpal transparently create the
+        // loopback path (Core Audio Process Tap on macOS, WASAPI loopback on Windows).
+        let (device, supported) = match source {
+            RecordingSource::Microphone => {
+                let device = host.default_input_device().ok_or("没有可用的麦克风。")?;
+                let supported = device
+                    .default_input_config()
+                    .map_err(|e| format!("无法读取麦克风配置：{e}"))?;
+                (device, supported)
+            }
+            RecordingSource::SystemAudio => {
+                system_audio_gate()?;
+                let device = host
+                    .default_output_device()
+                    .ok_or("没有可用的系统输出设备。")?;
+                let supported = device
+                    .default_output_config()
+                    .map_err(|e| format!("无法读取系统音频配置：{e}"))?;
+                (device, supported)
+            }
+        };
         let config = supported.config();
         if !(8_000..=192_000).contains(&config.sample_rate)
             || config.channels == 0
             || config.channels > 32
         {
-            return Err("麦克风采样率或声道数不受支持。".into());
+            return Err(match source {
+                RecordingSource::Microphone => "麦克风采样率或声道数不受支持。".to_string(),
+                RecordingSource::SystemAudio => "系统音频采样率或声道数不受支持。".to_string(),
+            });
         }
         let writer = WavCapture::create(path, config.sample_rate)?;
         let (sender, audio) = mpsc::sync_channel(QUEUE_CHUNKS);
         let failure = Arc::new(AtomicU8::new(0));
-        let stream = match supported.sample_format() {
-            SampleFormat::F32 => stream_for::<f32>(&device, config, sender, failure.clone()),
-            SampleFormat::I16 => stream_for::<i16>(&device, config, sender, failure.clone()),
-            SampleFormat::U16 => stream_for::<u16>(&device, config, sender, failure.clone()),
-            format => Err(format!(
-                "麦克风格式 {format:?} 不受支持，请选择 PCM16 或 Float32 输入。"
-            )),
+        let stream = match source {
+            RecordingSource::Microphone => match supported.sample_format() {
+                SampleFormat::F32 => stream_for::<f32>(&device, config, sender, failure.clone()),
+                SampleFormat::I16 => stream_for::<i16>(&device, config, sender, failure.clone()),
+                SampleFormat::U16 => stream_for::<u16>(&device, config, sender, failure.clone()),
+                format => Err(format!(
+                    "麦克风格式 {format:?} 不受支持，请选择 PCM16 或 Float32 输入。"
+                )),
+            },
+            RecordingSource::SystemAudio => match supported.sample_format() {
+                SampleFormat::F32 => {
+                    system_stream_for::<f32>(&device, config, sender, failure.clone())
+                }
+                SampleFormat::I16 => {
+                    system_stream_for::<i16>(&device, config, sender, failure.clone())
+                }
+                SampleFormat::U16 => {
+                    system_stream_for::<u16>(&device, config, sender, failure.clone())
+                }
+                format => Err(format!(
+                    "系统音频格式 {format:?} 不受支持，请选择 PCM16 或 Float32 输出。"
+                )),
+            },
         }?;
         let mut live =
             SttManager::from_root(stt_root).live_transcriber(config.sample_rate, language)?;

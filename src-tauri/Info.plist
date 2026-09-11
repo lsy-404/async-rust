@@ -3,4 +3,6 @@
 <plist version="1.0"><dict>
   <key>NSMicrophoneUsageDescription</key>
   <string>Async uses the microphone to transcribe classroom audio locally on this device.</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>Async captures system audio output to transcribe classroom audio locally on this device.</string>
 </dict></plist>
