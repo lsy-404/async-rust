@@ -1,6 +1,6 @@
 use crate::{
     connections::{self, Credential, Failure},
-    generation_token, load_data, oauth, provider, AppState, Provider, StreamEvent,
+    generation_token, load_data, oauth, provider, AppState, Provider, StreamEvent, ToolCall,
 };
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -11,11 +11,12 @@ use std::{
     collections::BTreeMap,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 use tauri::{ipc::Channel, State};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 // A tool round is one model turn that ends in tool_calls; this bounds how many
 // times a misbehaving model can keep calling tools before a turn must finish.
@@ -550,6 +551,36 @@ pub async fn models(state: &AppState, provider_id: &str) -> Result<Vec<String>, 
     Ok(models)
 }
 
+// Mirrors the frontend's own reducer over the same tool events, so the
+// persisted history matches what the user watched render during the turn.
+fn record_tool_call(calls: &Mutex<Vec<ToolCall>>, event: &StreamEvent) {
+    let Some(id) = event.tool_call_id.clone() else {
+        return;
+    };
+    let mut calls = calls.lock().unwrap();
+    if let Some(existing) = calls.iter_mut().find(|c| c.id == id) {
+        if let Some(status) = &event.tool_status {
+            existing.status = status.clone();
+        }
+        if let Some(arguments) = &event.tool_arguments {
+            existing.arguments = Some(arguments.clone());
+        }
+        if let Some(result) = &event.tool_result {
+            existing.result = Some(result.clone());
+        }
+    } else {
+        calls.push(ToolCall {
+            id,
+            name: event.tool_name.clone().unwrap_or_default(),
+            status: event
+                .tool_status
+                .clone()
+                .unwrap_or_else(|| "requested".into()),
+            arguments: event.tool_arguments.clone(),
+            result: event.tool_result.clone(),
+        });
+    }
+}
 pub async fn stream(
     state: &AppState,
     provider_id: &str,
@@ -558,7 +589,8 @@ pub async fn stream(
     tool_workspace_id: Option<&str>,
     cancel: CancellationToken,
     channel: Channel<StreamEvent>,
-) -> Result<String, String> {
+) -> Result<(String, Vec<ToolCall>), String> {
+    let tool_calls: Mutex<Vec<ToolCall>> = Mutex::new(Vec::new());
     let answer = stream_with(
         state,
         provider_id,
@@ -574,6 +606,7 @@ pub async fn stream(
                 .map_err(|_| "聊天状态通道已关闭。".into())
         },
         |event| {
+            record_tool_call(&tool_calls, &event);
             channel
                 .send(event)
                 .map_err(|_| "聊天状态通道已关闭。".into())
@@ -583,7 +616,7 @@ pub async fn stream(
     channel
         .send(StreamEvent::done())
         .map_err(|_| "聊天状态通道已关闭。")?;
-    Ok(answer)
+    Ok((answer, tool_calls.into_inner().unwrap()))
 }
 struct StreamOptions<'a> {
     tool_workspace_id: Option<&'a str>,
@@ -620,6 +653,13 @@ async fn stream_with(
             }
             on_delta(text)
         };
+        // A tool call the user has already seen is just as much visible
+        // progress as text output: it must block silent failover the same way.
+        let sent_tool = emitted.clone();
+        let tool_guard = |event: StreamEvent| {
+            sent_tool.store(true, Ordering::Relaxed);
+            on_tool(event)
+        };
         let result = async {
             let saved =
                 credential_for_request(state, provider_id, &item.id, cancel.clone()).await?;
@@ -640,7 +680,7 @@ async fn stream_with(
                     model,
                     cancel: cancel.clone(),
                 };
-                api_stream(state, &req, tool_workspace_id, &messages, delta, &on_tool).await
+                api_stream(state, &req, tool_workspace_id, &messages, delta, &tool_guard).await
             }
         }
         .await;
@@ -686,10 +726,16 @@ async fn api_stream(
     let mut working = messages.to_vec();
     let mut answer = String::new();
     let mut attempt = 0usize;
+    // Unique per credential attempt so a synthesized id from a round that gets
+    // discarded on failover can never collide with a retried attempt's ids.
+    let attempt_token = Uuid::new_v4().simple().to_string();
     loop {
         let allow_tools = tool_workspace_id.is_some() && attempt < MAX_TOOL_ROUNDS;
         let tools = allow_tools.then(retrieval_tool_schema);
-        let round = api_stream_round(state, req, &working, tools.as_ref(), &track_delta).await;
+        let round_id = format!("{attempt_token}_{attempt}");
+        let mut round_sent_tools = tools.is_some();
+        let round = api_stream_round(state, req, &working, tools.as_ref(), &track_delta, &round_id)
+            .await;
         let outcome = match round {
             Ok(outcome) => outcome,
             // A provider that rejects the tools array fails the request outright
@@ -697,7 +743,8 @@ async fn api_stream(
             // that almost certainly means it doesn't support tool calling, so
             // degrade to a plain completion instead of failing the whole turn.
             Err(error) if attempt == 0 && allow_tools && !emitted.load(Ordering::Relaxed) => {
-                api_stream_round(state, req, &working, None, &track_delta)
+                round_sent_tools = false;
+                api_stream_round(state, req, &working, None, &track_delta, &round_id)
                     .await
                     .map_err(|_| error)?
             }
@@ -710,9 +757,8 @@ async fn api_stream(
             }
             RoundOutcome::ToolCalls { text, calls } => {
                 answer.push_str(&text);
-                if !allow_tools {
-                    // Tools weren't offered this round; nothing declared them, so
-                    // there is nothing to execute. Finish with whatever text came back.
+                if !round_sent_tools {
+                    // The request that produced this outcome carried no tools array, so there is nothing to execute.
                     return Ok(answer);
                 }
                 let workspace_id = tool_workspace_id.expect("allow_tools implies Some");
@@ -875,6 +921,7 @@ async fn api_stream_round(
     messages: &[Value],
     tools: Option<&Value>,
     on_delta: &(impl Fn(String) -> Result<(), String> + Send + Sync),
+    round_id: &str,
 ) -> Result<RoundOutcome, String> {
     let ApiRequest {
         p,
@@ -962,7 +1009,7 @@ async fn api_stream_round(
                         }
                     }
                     if entry.id.is_empty() {
-                        entry.id = format!("call_{index}");
+                        entry.id = format!("call_{round_id}_{index}");
                     }
                 }
             }

@@ -454,6 +454,136 @@ async fn tool_loop_stops_after_max_rounds_and_finishes_without_tools() {
         "the final pass must omit the tools array so the turn can end: {seen:?}"
     );
 }
+#[tokio::test]
+async fn failover_never_runs_a_second_credential_once_a_tool_has_already_executed() {
+    // The first credential runs a tool successfully (visible to the user via
+    // on_tool events) but then the very next round on that same credential
+    // fails outright. A credential that already produced visible tool
+    // activity must not be silently abandoned for the next one - the whole
+    // turn should fail instead of quietly discarding that tool history.
+    let server = MockServer::start().await;
+    let (_dir, state) = setup(&server.uri());
+    seed_workspace(&state, "ws-guard");
+    let a = Credential::new("custom", "api-key", "First".into(), vec!["model".into()]);
+    let b = Credential::new("custom", "api-key", "Second".into(), vec!["model".into()]);
+    connections::save(&state, &a, "first").unwrap();
+    connections::save(&state, &b, "second").unwrap();
+    connections::set_strategy(&state, "custom", "failover").unwrap();
+    let round = Arc::new(AtomicUsize::new(0));
+    let counter = round.clone();
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer first"))
+        .respond_with(move |_req: &Request| {
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200).set_body_raw(
+                    sse_body(&[tool_call_chunk(
+                        0,
+                        Some("call_x"),
+                        Some("search_local_materials"),
+                        "{\"query\":\"algebra\"}",
+                    )]),
+                    "text/event-stream",
+                )
+            } else {
+                ResponseTemplate::new(500)
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer second"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            sse_body(&[content_chunk("must never be reached")]),
+            "text/event-stream",
+        ))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = events.clone();
+    let error = stream_with(
+        &state,
+        "custom",
+        "model",
+        vec![json!({"role":"user","content":"question"})],
+        StreamOptions {
+            tool_workspace_id: Some("ws-guard"),
+            cancel: CancellationToken::new(),
+        },
+        |_| Ok(()),
+        move |event: StreamEvent| {
+            sink.lock().unwrap().push(event);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("500"), "unexpected error: {error}");
+    assert!(events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e.tool_status.as_deref() == Some("finished")));
+}
+#[tokio::test]
+async fn a_tools_less_fallback_round_that_echoes_tool_calls_is_not_executed() {
+    // A non-conformant provider can echo a tool_calls delta even on the
+    // fallback request that carried no tools array. That round must be
+    // treated as a plain (if odd) answer, not routed through tool execution.
+    let server = MockServer::start().await;
+    let (_dir, state) = setup(&server.uri());
+    seed_workspace(&state, "ws-nonconformant");
+    let cred = Credential::new("custom", "api-key", "Key".into(), vec!["model".into()]);
+    connections::save(&state, &cred, "key").unwrap();
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(|req: &Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            if body.get("tools").is_some() {
+                ResponseTemplate::new(400)
+            } else {
+                ResponseTemplate::new(200).set_body_raw(
+                    sse_body(&[tool_call_chunk(
+                        0,
+                        Some("call_ghost"),
+                        Some("search_local_materials"),
+                        "{\"query\":\"x\"}",
+                    )]),
+                    "text/event-stream",
+                )
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = events.clone();
+    let answer = stream_with(
+        &state,
+        "custom",
+        "model",
+        vec![json!({"role":"user","content":"question"})],
+        StreamOptions {
+            tool_workspace_id: Some("ws-nonconformant"),
+            cancel: CancellationToken::new(),
+        },
+        |_| Ok(()),
+        move |event: StreamEvent| {
+            sink.lock().unwrap().push(event);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(answer, "");
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "a tools-less fallback round must not run tool machinery"
+    );
+}
 #[test]
 fn search_local_finds_real_rows_from_materials_and_session_transcripts() {
     let (_dir, state) = setup("http://localhost");
