@@ -4,7 +4,7 @@ import { i18n } from "../locales";
 import { FluentButton, FluentTextArea } from "@platform-kit/fluent/vue";
 import type { Message } from "../types";
 
-const { t } = i18n.global;
+const { t, locale } = i18n.global;
 
 defineProps<{
   activeTab: "chat" | "summary";
@@ -34,13 +34,80 @@ const emit = defineEmits<{
   "delete-message": [id: string];
   "submit-message": [];
   cancel: [];
-  "composer-enter": [event: KeyboardEvent];
+  "composer-enter": [];
   "composer-input": [event: Event];
+  "ask-uncertain": [text: string];
   summarize: [];
 }>();
 
 const messagesRef = ref<HTMLElement>();
 defineExpose({ messagesRef });
+
+// Some IME/browser combinations only signal composition via keyCode 229, not
+// event.isComposing, so composition state is tracked explicitly as well.
+const composing = ref(false);
+function handleComposerKeydown(event: KeyboardEvent) {
+  const keyCode = (event as KeyboardEvent & { keyCode?: number }).keyCode;
+  if (composing.value || event.isComposing || keyCode === 229) return;
+  event.preventDefault();
+  emit("composer-enter");
+}
+
+const copiedMessageId = ref("");
+let copiedResetTimer: ReturnType<typeof setTimeout> | undefined;
+function handleCopy(message: Message) {
+  emit("copy-message", message.content);
+  copiedMessageId.value = message.id;
+  clearTimeout(copiedResetTimer);
+  copiedResetTimer = setTimeout(() => {
+    copiedMessageId.value = "";
+  }, 1200);
+}
+
+function formatMessageTime(iso?: string) {
+  if (!iso) return "";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  return new Intl.DateTimeFormat(locale.value, { timeStyle: "short" }).format(
+    date,
+  );
+}
+
+const uncertainTooltip = ref<{
+  visible: boolean;
+  top: number;
+  left: number;
+  text: string;
+}>({ visible: false, top: 0, left: 0, text: "" });
+let uncertainHideTimer: ReturnType<typeof setTimeout> | undefined;
+function handleMessagesMouseMove(event: MouseEvent) {
+  const target = (event.target as HTMLElement | null)?.closest?.(
+    ".uncertain-span",
+  );
+  if (!target) return;
+  clearTimeout(uncertainHideTimer);
+  const rect = target.getBoundingClientRect();
+  uncertainTooltip.value = {
+    visible: true,
+    top: rect.top - 8,
+    left: rect.left,
+    text: target.textContent ?? "",
+  };
+}
+function scheduleHideUncertainTooltip() {
+  uncertainHideTimer = setTimeout(() => {
+    uncertainTooltip.value.visible = false;
+  }, 150);
+}
+function cancelHideUncertainTooltip() {
+  clearTimeout(uncertainHideTimer);
+}
+function handleUncertainAsk() {
+  const text = uncertainTooltip.value.text.trim();
+  if (!text) return;
+  uncertainTooltip.value.visible = false;
+  emit("ask-uncertain", text);
+}
 </script>
 
 <template>
@@ -63,6 +130,8 @@ defineExpose({ messagesRef });
         ref="messagesRef"
         class="messages"
         @click="emit('content-click', $event)"
+        @mousemove="handleMessagesMouseMove"
+        @mouseleave="scheduleHideUncertainTooltip"
       >
         <article
           v-for="message in renderedMessages"
@@ -76,9 +145,13 @@ defineExpose({ messagesRef });
             <button
               type="button"
               :disabled="operationBusy"
-              @click="emit('copy-message', message.content)"
+              @click="handleCopy(message)"
             >
-              {{ t("session.actions.copy") }}
+              {{
+                copiedMessageId === message.id
+                  ? t("session.actions.copied")
+                  : t("session.actions.copy")
+              }}
             </button>
             <button
               v-if="message.role === 'user'"
@@ -103,6 +176,9 @@ defineExpose({ messagesRef });
             >
               {{ t("session.actions.delete") }}
             </button>
+            <span v-if="formatMessageTime(message.createdAt)" class="message-time">{{
+              formatMessageTime(message.createdAt)
+            }}</span>
           </div>
           <div
             v-if="editingMessageId === message.id"
@@ -132,6 +208,18 @@ defineExpose({ messagesRef });
         <div v-if="!renderedMessages.length" class="empty center">
           {{ t("session.emptyChat") }}
         </div>
+        <div
+          v-if="uncertainTooltip.visible"
+          class="uncertain-tooltip"
+          :style="{ top: uncertainTooltip.top + 'px', left: uncertainTooltip.left + 'px' }"
+          @mouseenter="cancelHideUncertainTooltip"
+          @mouseleave="scheduleHideUncertainTooltip"
+        >
+          <span>{{ t("session.uncertain.label") }}</span>
+          <button type="button" @click="handleUncertainAsk">
+            {{ t("session.uncertain.ask") }}
+          </button>
+        </div>
       </div>
       <form class="composer" @submit.prevent="emit('submit-message')">
         <FluentTextArea
@@ -140,7 +228,9 @@ defineExpose({ messagesRef });
           :disabled="operationBusy"
           :placeholder="t('session.inputPlaceholder')"
           @update:model-value="emit('update:draft', $event)"
-          @keydown.enter.exact.prevent="emit('composer-enter', $event)"
+          @compositionstart="composing = true"
+          @compositionend="composing = false"
+          @keydown.enter.exact="handleComposerKeydown"
           @input="emit('composer-input', $event)"
         /><FluentButton v-if="streaming" tone="danger" @click="emit('cancel')"
           >{{ t("session.stop") }}</FluentButton

@@ -866,3 +866,155 @@ describe("settings dialog theme control", () => {
     expect(data.settings.theme).toBe("dark");
   });
 });
+
+describe("chat gap fixes: edit, inline error, uncertainty markup, IME safety", () => {
+  let data: AppData;
+  beforeEach(() => {
+    data = baseState();
+    invoke.mockReset();
+    mockInvoke(data);
+  });
+
+  it("truncates from the edited turn and re-runs chat instead of leaving the stale reply below it", async () => {
+    const savedSessionSnapshots: unknown[] = [];
+    invoke.mockImplementation((command: string, args?: Record<string, any>) => {
+      if (command === "load_state") return Promise.resolve(structuredClone(data));
+      if (command === "stt_status")
+        return Promise.resolve({
+          ready: true,
+          modelName: "fixture",
+          modelPath: "/tmp",
+          sizeBytes: 1,
+        });
+      if (command === "save_session") {
+        savedSessionSnapshots.push(JSON.parse(JSON.stringify(args?.session)));
+        const index = data.sessions.findIndex(
+          (item) => item.id === args?.session.id,
+        );
+        if (index !== -1) data.sessions[index] = args?.session;
+        return Promise.resolve();
+      }
+      if (command === "chat") {
+        args?.onEvent.onmessage({ type: "delta", text: "revised reply" });
+        const target = data.sessions.find((item) => item.id === args?.sessionId)!;
+        target.messages = [
+          ...target.messages,
+          { id: "edit-user", role: "user", content: args?.content },
+          { id: "edit-assistant", role: "assistant", content: "revised reply" },
+        ];
+        return Promise.resolve();
+      }
+      return Promise.resolve();
+    });
+    const wrapper = mountApp();
+    await flushPromises();
+    await wrapper
+      .findAll(".message-actions")[0]!
+      .findAll("button")
+      .find((item) => item.text() === "编辑")!
+      .trigger("click");
+    await wrapper.get(".message-edit textarea").setValue("Revised question");
+    await wrapper
+      .get(".message-edit")
+      .findAll("button")
+      .find((item) => item.text() === "保存")!
+      .trigger("click");
+    await flushPromises();
+    expect(savedSessionSnapshots).toHaveLength(1);
+    expect((savedSessionSnapshots[0] as any).messages).toHaveLength(0);
+    const chatCall = invoke.mock.calls.find(([command]) => command === "chat");
+    expect(chatCall![1]).toMatchObject({
+      sessionId: "s1",
+      content: "Revised question",
+    });
+    // The stale assistant reply to the original question must be gone.
+    expect(wrapper.text()).not.toContain("Hi there");
+    expect(wrapper.text()).toContain("revised reply");
+  });
+
+  it("renders a failed generation inline on the assistant turn instead of dropping it", async () => {
+    let rejectChat: (cause: Error) => void = () => undefined;
+    invoke.mockImplementation((command: string) => {
+      if (command === "load_state") return Promise.resolve(structuredClone(data));
+      if (command === "stt_status")
+        return Promise.resolve({
+          ready: true,
+          modelName: "fixture",
+          modelPath: "/tmp",
+          sizeBytes: 1,
+        });
+      if (command === "chat")
+        return new Promise((_, reject) => {
+          rejectChat = reject;
+        });
+      return Promise.resolve();
+    });
+    const wrapper = mountApp();
+    await flushPromises();
+    await wrapper.get("form.composer textarea").setValue("Will this fail?");
+    await wrapper.get("form.composer").trigger("submit");
+    await nextTick();
+    rejectChat(new Error("network unavailable"));
+    await flushPromises();
+    const messages = wrapper.findAll(".message");
+    const lastMessage = messages[messages.length - 1]!;
+    expect(lastMessage.classes()).toContain("assistant");
+    expect(lastMessage.text()).toContain("network unavailable");
+  });
+
+  it("highlights an uncertain <maybe> span and its follow-up action resends the exact claim to verify", async () => {
+    data.sessions[0]!.messages.push({
+      id: "m3",
+      role: "assistant",
+      content: "The lecture is <maybe>scheduled for 3pm</maybe> tomorrow.",
+    });
+    const wrapper = mountApp();
+    await flushPromises();
+    const span = wrapper.get(".uncertain-span");
+    expect(span.text()).toBe("scheduled for 3pm");
+
+    await span.trigger("mousemove");
+    await nextTick();
+    const tooltip = wrapper.get(".uncertain-tooltip");
+    await tooltip
+      .findAll("button")
+      .find((item) => item.text() === "追问核实")!
+      .trigger("click");
+    await flushPromises();
+    const chatCall = invoke.mock.calls.find(([command]) => command === "chat");
+    expect(chatCall).toBeTruthy();
+    expect(chatCall![1].content).toContain("scheduled for 3pm");
+  });
+
+  it("ignores Enter during IME composition even without isComposing on the event, and sends once composition ends", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    const textarea = wrapper.get("form.composer textarea");
+    await textarea.setValue("こんにちは");
+    await textarea.trigger("compositionstart");
+    await textarea.trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(
+      invoke.mock.calls.some(([command]) => command === "chat"),
+    ).toBe(false);
+
+    await textarea.trigger("compositionend");
+    await textarea.trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(
+      invoke.mock.calls.some(([command]) => command === "chat"),
+    ).toBe(true);
+  });
+
+  it("also treats keyCode 229 alone as composition, for browsers that never set isComposing", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    const textarea = wrapper.get("form.composer textarea");
+    await textarea.setValue("中文输入法");
+    await textarea.trigger("keydown", { key: "Enter", keyCode: 229 });
+    await flushPromises();
+    expect(
+      invoke.mock.calls.some(([command]) => command === "chat"),
+    ).toBe(false);
+  });
+});

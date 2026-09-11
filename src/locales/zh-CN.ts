@@ -60,11 +60,18 @@ export default {
     stop: "停止",
     send: "发送",
     editMessageLabel: "编辑消息",
+    errorPrefix: "生成失败：",
     actions: {
       copy: "复制",
+      copied: "已复制",
       edit: "编辑",
       delete: "删除",
       regenerate: "重新生成",
+    },
+    uncertain: {
+      label: "AI 对此表示不确定",
+      ask: "追问核实",
+      prompt: "请仔细核实以下说法的准确性，必要时获取更多信息核对。\n\n> {text}",
     },
   },
   summary: {

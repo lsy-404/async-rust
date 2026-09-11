@@ -57,6 +57,16 @@ const defaultFenceRule =
     self.renderToken(tokens, idx, options));
 md.renderer.rules.fence = (tokens, idx, options, env, self) =>
   `<div class="code-block"><button type="button" class="code-copy" aria-label="${t("codeBlock.copyAria")}">${t("codeBlock.copy")}</button>${defaultFenceRule(tokens, idx, options, env, self)}</div>`;
+// markdown-it runs with html:false, so a literal <maybe> the model emits arrives
+// HTML-escaped; an unpaired tag (mid-stream) is stripped rather than shown raw.
+function highlightUncertain(html: string): string {
+  const span = '<span class="uncertain-span">$1</span>';
+  return html
+    .replace(/&lt;maybe&gt;([\s\S]*?)&lt;\/maybe&gt;/g, span)
+    .replace(/<maybe>([\s\S]*?)<\/maybe>/g, span)
+    .replace(/&lt;\/?maybe&gt;/g, "")
+    .replace(/<\/?maybe>/g, "");
+}
 const blankSettings: Settings = {
   providerId: "openai",
   model: "",
@@ -206,7 +216,7 @@ const renderedMessages = computed(
   () =>
     session.value?.messages.map((message) => ({
       ...message,
-      html: md.render(message.content),
+      html: highlightUncertain(md.render(message.content)),
     })) ?? [],
 );
 const summaryHtml = computed(() =>
@@ -541,20 +551,11 @@ async function saveMaterial() {
       report(cause);
     }
 }
-async function send() {
-  if (
-    !session.value ||
-    !draft.value.trim() ||
-    streaming.value ||
-    summaryLoading.value ||
-    transcriptionLoading.value
-  )
-    return;
-  const target = session.value;
+// Shared by send/regenerate/edit: appends the user turn and a streaming
+// placeholder, then runs chat. A generation failure renders inline on that
+// turn (matching the reference) instead of dropping it behind a global notice.
+async function streamAssistantReply(target: Session, content: string) {
   const sessionId = target.id;
-  const content = draft.value.trim();
-  draft.value = "";
-  if (composerTextareaEl.value) composerTextareaEl.value.style.height = "auto";
   streaming.value = true;
   error.value = "";
   const pending = reactive({
@@ -574,11 +575,30 @@ async function send() {
     await streamCommand(invoke, "chat", sessionId, channel, content);
     await refresh();
   } catch (cause) {
-    target.messages = target.messages.filter((item) => item.id !== pending.id);
-    report(cause);
+    pending.content = `${t("session.errorPrefix")} ${String(cause)}`;
   } finally {
     streaming.value = false;
   }
+}
+async function send() {
+  if (
+    !session.value ||
+    !draft.value.trim() ||
+    streaming.value ||
+    summaryLoading.value ||
+    transcriptionLoading.value
+  )
+    return;
+  const target = session.value;
+  const content = draft.value.trim();
+  draft.value = "";
+  if (composerTextareaEl.value) composerTextareaEl.value.style.height = "auto";
+  await streamAssistantReply(target, content);
+}
+function askUncertain(text: string) {
+  if (!session.value || !text.trim() || operationBusy.value) return;
+  draft.value = t("session.uncertain.prompt", { text: text.trim() });
+  void send();
 }
 async function cancel() {
   if (session.value)
@@ -620,14 +640,21 @@ async function commitEditMessage() {
   editingMessageId.value = "";
   if (!id || !content) return;
   const target = session.value;
-  const message = target.messages.find((item) => item.id === id);
-  if (!message || message.content === content) return;
-  message.content = content;
+  const index = target.messages.findIndex((item) => item.id === id);
+  if (index === -1 || target.messages[index]!.content === content) return;
+  // Truncate from the edited turn on, same as regenerate, so the reply below
+  // it can never end up answering a question that no longer exists.
+  target.messages = target.messages.slice(0, index);
+  streaming.value = true;
+  error.value = "";
   try {
     await invoke("save_session", { session: target });
   } catch (cause) {
+    streaming.value = false;
     report(cause);
+    return;
   }
+  await streamAssistantReply(target, content);
 }
 async function regenerateMessage(messageId: string) {
   if (!session.value || operationBusy.value) return;
@@ -643,7 +670,6 @@ async function regenerateMessage(messageId: string) {
   }
   if (userIndex === -1) return;
   const content = target.messages[userIndex]!.content;
-  const sessionId = target.id;
   target.messages = target.messages.slice(0, userIndex);
   streaming.value = true;
   error.value = "";
@@ -654,28 +680,7 @@ async function regenerateMessage(messageId: string) {
     report(cause);
     return;
   }
-  const pending = reactive({
-    id: `streaming-${sessionId}`,
-    role: "assistant" as const,
-    content: "",
-  });
-  target.messages.push(
-    { id: crypto.randomUUID(), role: "user", content },
-    pending,
-  );
-  const channel = new Channel<StreamEvent>();
-  channel.onmessage = (event) => {
-    if (event.type === "delta") pending.content += event.text;
-  };
-  try {
-    await streamCommand(invoke, "chat", sessionId, channel, content);
-    await refresh();
-  } catch (cause) {
-    target.messages = target.messages.filter((item) => item.id !== pending.id);
-    report(cause);
-  } finally {
-    streaming.value = false;
-  }
+  await streamAssistantReply(target, content);
 }
 function handleContentClick(event: MouseEvent) {
   const button = (event.target as HTMLElement).closest<HTMLElement>(
@@ -838,8 +843,9 @@ async function saveSettings() {
     report(cause);
   }
 }
-function handleComposerEnter(event: KeyboardEvent) {
-  if (!event.isComposing) void send();
+function handleComposerEnter() {
+  // IME composition safety already gated in WorkbenchChat before this fires.
+  void send();
 }
 function beginResize(event: PointerEvent) {
   const layout = layoutRef.value;
@@ -1108,6 +1114,7 @@ onUnmounted(() => {
               @cancel="cancel"
               @composer-enter="handleComposerEnter"
               @composer-input="handleComposerInput"
+              @ask-uncertain="askUncertain"
               @summarize="summarize"
             />
             <div

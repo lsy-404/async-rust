@@ -389,6 +389,43 @@ textarea {
   opacity: 0.5;
   cursor: not-allowed;
 }
+.message-time {
+  padding: 0 4px;
+  color: var(--fluent-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.uncertain-span {
+  border-radius: 3px;
+  padding: 0 2px;
+  background: color-mix(in srgb, var(--fluent-warning) 16%, transparent);
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--fluent-warning) 28%, transparent);
+  cursor: help;
+}
+.uncertain-tooltip {
+  position: fixed;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transform: translateY(-100%);
+  padding: 6px 10px;
+  border: 1px solid var(--fluent-border);
+  border-radius: 6px;
+  background: var(--fluent-surface);
+  box-shadow: var(--fluent-shadow);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.uncertain-tooltip button {
+  border: 0;
+  border-radius: 4px;
+  padding: 3px 6px;
+  background: color-mix(in srgb, var(--fluent-accent) 14%, transparent);
+  color: var(--fluent-accent);
+  cursor: pointer;
+}
 .message-edit {
   display: grid;
   gap: 8px;

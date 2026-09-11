@@ -61,11 +61,19 @@ export default {
     stop: "Stop",
     send: "Send",
     editMessageLabel: "Edit message",
+    errorPrefix: "Generation failed:",
     actions: {
       copy: "Copy",
+      copied: "Copied",
       edit: "Edit",
       delete: "Delete",
       regenerate: "Regenerate",
+    },
+    uncertain: {
+      label: "AI is uncertain about this",
+      ask: "Verify this claim",
+      prompt:
+        "Please carefully verify the accuracy of the following statement, seeking more information if needed.\n\n> {text}",
     },
   },
   summary: {

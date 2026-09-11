@@ -748,6 +748,8 @@ async fn chat_impl(
         }
     }
     let mut messages = Vec::new();
+    // Lets the frontend highlight uncertain spans and offer a verify-this-claim follow-up.
+    messages.push(json!({"role":"system","content":"When a factual statement is uncertain, unverified, estimated, or likely stale, wrap only that span with <maybe> and </maybe>. Do not wrap entire answers unless everything is uncertain, and do not explain this rule unless asked."}));
     if !context.is_empty() {
         messages.push(json!({"role":"system","content":limit(context)}));
     }
