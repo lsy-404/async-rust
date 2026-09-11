@@ -116,6 +116,9 @@ const duration = ref(0);
 watch(
   () => props.audioUrl,
   () => {
+    // Removing the element from the DOM doesn't reliably stop playback, so
+    // pause it explicitly before the source changes out from under it.
+    audioEl.value?.pause();
     isPlaying.value = false;
     currentTime.value = 0;
     duration.value = 0;

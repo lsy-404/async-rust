@@ -1237,8 +1237,13 @@ describe("transcript gap fixes: capture mode, language, level meter, playback", 
     await nextTick();
     expect(audio.currentTime).toBe(12);
 
+    // Removing the <audio> element from the DOM does not reliably stop
+    // playback, so the source change must pause it explicitly first -
+    // otherwise leftover playback can bleed into a fresh recording capture.
+    const pauseSpy = vi.spyOn(audio, "pause");
     await wrapper.findAll(".tree-session")[1]!.trigger("click");
     await flushPromises();
+    expect(pauseSpy).toHaveBeenCalled();
     expect(revokeSpy).toHaveBeenCalled();
     expect(wrapper.find(".playback-bar").exists()).toBe(false);
   });
