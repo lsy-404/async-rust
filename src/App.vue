@@ -7,7 +7,6 @@ import {
   reactive,
   ref,
   watch,
-  type ComponentPublicInstance,
 } from "vue";
 import MarkdownIt from "markdown-it";
 import texmath from "markdown-it-texmath";
@@ -15,6 +14,9 @@ import katex from "katex";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import ModelConnections from "./components/ModelConnections.vue";
+import AppSidebar from "./components/AppSidebar.vue";
+import WorkbenchChat from "./components/WorkbenchChat.vue";
+import TranscriptPanel from "./components/TranscriptPanel.vue";
 import { i18n, setLocale } from "./locales";
 import {
   FluentButton,
@@ -115,8 +117,8 @@ const sidebarOpen = ref(true);
 const mainPanelRatio = ref(0.62);
 let layoutSettingsInitialized = false;
 const layoutRef = ref<HTMLElement>();
-const transcriptScrollRef = ref<HTMLElement>();
-const messagesRef = ref<HTMLElement>();
+const workbenchChatRef = ref<InstanceType<typeof WorkbenchChat>>();
+const transcriptPanelRef = ref<InstanceType<typeof TranscriptPanel>>();
 const composerTextareaEl = ref<HTMLTextAreaElement>();
 const editingMessageId = ref("");
 const editDraft = ref("");
@@ -206,6 +208,9 @@ const renderedMessages = computed(
       ...message,
       html: md.render(message.content),
     })) ?? [],
+);
+const summaryHtml = computed(() =>
+  md.render(summaryStream.value || session.value?.summary || ""),
 );
 const summaryUpdatedLabel = computed(() => {
   const iso = session.value?.summaryUpdatedAt;
@@ -390,12 +395,6 @@ function startRename(
 function cancelRename() {
   renamingId.value = "";
 }
-function updateRenameDraft(event: Event) {
-  renameDraft.value = (event.target as HTMLInputElement).value;
-}
-function focusElement(el: Element | ComponentPublicInstance | null) {
-  if (el instanceof HTMLInputElement) el.focus();
-}
 async function commitRename() {
   const id = renamingId.value;
   const kind = renameKind.value;
@@ -504,6 +503,9 @@ function selectSession(workspaceId: string, sessionId: string) {
   if (operationBusy.value) return;
   selectedWorkspaceId.value = workspaceId;
   selectedSessionId.value = sessionId;
+}
+function selectMaterial(id: string) {
+  selectedMaterialId.value = id;
 }
 async function importMaterial() {
   if (!selectedWorkspaceId.value) return;
@@ -912,7 +914,7 @@ watch(
 watch(
   () => session.value?.transcription,
   async () => {
-    const panel = transcriptScrollRef.value;
+    const panel = transcriptPanelRef.value?.transcriptScrollRef;
     if (!panel) return;
     const distanceFromBottom =
       panel.scrollHeight - panel.scrollTop - panel.clientHeight;
@@ -928,7 +930,7 @@ watch(operationBusy, (busy) => {
   if (renamingId.value) cancelRename();
 });
 watch(renderedMessages, async () => {
-  const panel = messagesRef.value;
+  const panel = workbenchChatRef.value?.messagesRef;
   if (!panel) return;
   const distanceFromBottom =
     panel.scrollHeight - panel.scrollTop - panel.clientHeight;
@@ -965,242 +967,45 @@ onUnmounted(() => {
         <span class="spinner"></span> {{ t("loading") }}
       </div>
       <div v-else class="desktop-shell">
-        <aside v-if="sidebarOpen" class="app-sidebar">
-          <div class="sidebar-search">
-            <FluentField
-              v-model="searchQuery"
-              :label="t('sidebar.search')"
-              :placeholder="t('sidebar.searchPlaceholder')"
-            />
-          </div>
-          <div class="sidebar-tabs">
-            <FluentButton
-              :class="{ active: sidebarMode === 'session' }"
-              tone="subtle"
-              @click="sidebarMode = 'session'"
-              >{{ t("sidebar.tabs.sessions") }}</FluentButton
-            ><FluentButton
-              :class="{ active: sidebarMode === 'knowledge' }"
-              tone="subtle"
-              @click="sidebarMode = 'knowledge'"
-              >{{ t("sidebar.tabs.knowledge") }}</FluentButton
-            >
-          </div>
-          <div v-if="sidebarMode === 'session'" class="sidebar-tree">
-            <p v-if="!filteredWorkspaces.length" class="empty">
-              {{
-                normalizedSearch
-                  ? t("sidebar.noSearchResults")
-                  : t("sidebar.emptyWorkspaces")
-              }}
-            </p>
-            <section
-              v-for="workspace in filteredWorkspaces"
-              :key="workspace.id"
-              class="workspace-node"
-            >
-              <div
-                class="tree-row"
-                @contextmenu.prevent="
-                  openContextMenu(
-                    $event,
-                    'workspace',
-                    workspace.id,
-                    workspace.name,
-                  )
-                "
-              >
-                <button
-                  type="button"
-                  class="tree-expand"
-                  :aria-expanded="expandedWorkspaces.has(workspace.id)"
-                  :aria-label="t('sidebar.toggleWorkspaceAria')"
-                  @click.stop="toggleWorkspaceExpand(workspace.id)"
-                >
-                  {{ expandedWorkspaces.has(workspace.id) ? "▾" : "▸" }}
-                </button>
-                <input
-                  v-if="renamingId === workspace.id"
-                  class="rename-input"
-                  :value="renameDraft"
-                  :ref="focusElement"
-                  @input="updateRenameDraft"
-                  @keydown.enter.prevent="commitRename"
-                  @keydown.escape.prevent="cancelRename"
-                  @blur="commitRename"
-                  @click.stop
-                />
-                <button
-                  v-else
-                  class="tree-workspace"
-                  :class="{ active: workspace.id === selectedWorkspaceId }"
-                  :disabled="operationBusy"
-                  @click="selectWorkspace(workspace.id)"
-                  @dblclick="
-                    startRename('workspace', workspace.id, workspace.name)
-                  "
-                >
-                  {{ workspace.name }}
-                </button>
-                <FluentButton
-                  class="tree-delete"
-                  tone="subtle"
-                  :disabled="operationBusy"
-                  :aria-label="t('sidebar.deleteWorkspaceAria', { name: workspace.name })"
-                  @click="askDelete('workspace', workspace.id, workspace.name)"
-                  >{{ t("common.delete") }}</FluentButton
-                >
-              </div>
-              <template v-if="expandedWorkspaces.has(workspace.id)">
-                <div
-                  v-for="item in data.sessions.filter(
-                    (candidate) =>
-                      candidate.workspaceId === workspace.id &&
-                      (!normalizedSearch ||
-                        candidate.title
-                          .toLowerCase()
-                          .includes(normalizedSearch)),
-                  )"
-                  :key="item.id"
-                  class="tree-row"
-                  @contextmenu.prevent="
-                    openContextMenu(
-                      $event,
-                      'session',
-                      item.id,
-                      item.title,
-                      workspace.id,
-                    )
-                  "
-                >
-                  <input
-                    v-if="renamingId === item.id"
-                    class="rename-input"
-                    :value="renameDraft"
-                    :ref="focusElement"
-                    @input="updateRenameDraft"
-                    @keydown.enter.prevent="commitRename"
-                    @keydown.escape.prevent="cancelRename"
-                    @blur="commitRename"
-                    @click.stop
-                  />
-                  <button
-                    v-else
-                    class="tree-session"
-                    :class="{ active: item.id === selectedSessionId }"
-                    :disabled="operationBusy"
-                    @click="selectSession(workspace.id, item.id)"
-                    @dblclick="startRename('session', item.id, item.title)"
-                  >
-                    ▢ {{ item.title }}
-                  </button>
-                  <FluentButton
-                    class="tree-delete"
-                    tone="subtle"
-                    :disabled="operationBusy"
-                    :aria-label="t('sidebar.deleteSessionAria', { name: item.title })"
-                    @click="askDelete('session', item.id, item.title)"
-                    >{{ t("common.delete") }}</FluentButton
-                  >
-                </div>
-              </template>
-            </section>
-          </div>
-          <div v-else class="sidebar-tree knowledge-tree">
-            <div class="knowledge-head">
-              <FluentSelect
-                v-model="selectedWorkspaceId"
-                :label="t('sidebar.knowledge.workspaceLabel')"
-                :options="workspaceOptions"
-                :disabled="operationBusy"
-              />
-              <span>{{ t("sidebar.knowledge.localMaterials") }}</span
-              ><FluentButton
-                tone="subtle"
-                :disabled="!selectedWorkspaceId"
-                @click="importMaterial"
-                >{{ t("sidebar.knowledge.import") }}</FluentButton
-              >
-            </div>
-            <p v-if="!selectedWorkspaceId" class="empty">{{ t("sidebar.knowledge.selectWorkspaceFirst") }}</p>
-            <p v-else-if="!filteredMaterials.length" class="empty">
-              {{
-                normalizedSearch
-                  ? t("sidebar.knowledge.noSearchResults")
-                  : t("sidebar.knowledge.emptyMaterials")
-              }}
-            </p>
-            <div
-              v-for="item in filteredMaterials"
-              :key="item.id"
-              class="tree-row"
-              @contextmenu.prevent="
-                openContextMenu($event, 'material', item.id, item.name)
-              "
-            >
-              <input
-                v-if="renamingId === item.id"
-                class="rename-input"
-                :value="renameDraft"
-                :ref="focusElement"
-                @input="updateRenameDraft"
-                @keydown.enter.prevent="commitRename"
-                @keydown.escape.prevent="cancelRename"
-                @blur="commitRename"
-                @click.stop
-              />
-              <button
-                v-else
-                class="tree-session"
-                :class="{ active: item.id === selectedMaterialId }"
-                :disabled="operationBusy"
-                @click="selectedMaterialId = item.id"
-                @dblclick="startRename('material', item.id, item.name)"
-              >
-                ▤ {{ item.name }}
-              </button>
-              <FluentButton
-                class="tree-delete"
-                tone="subtle"
-                :disabled="operationBusy"
-                :aria-label="t('sidebar.deleteMaterialAria', { name: item.name })"
-                @click="askDelete('material', item.id, item.name)"
-                >{{ t("common.delete") }}</FluentButton
-              >
-            </div>
-          </div>
-          <footer class="sidebar-footer" v-if="sidebarMode === 'session'">
-            <FluentButton
-              tone="subtle"
-              :disabled="!workspaces.length || operationBusy"
-              @click="createQuickSession"
-              >{{ t("sidebar.createSession") }}</FluentButton
-            >
-            <form @submit.prevent="createWorkspace">
-              <FluentField
-                v-model="workspaceName"
-                :label="t('sidebar.knowledge.workspaceLabel')"
-                :placeholder="t('sidebar.newWorkspacePlaceholder')"
-              /><FluentButton
-                type="submit"
-                tone="subtle"
-                :disabled="operationBusy"
-                >{{ t("sidebar.createWorkspace") }}</FluentButton
-              >
-            </form>
-          </footer>
-          <footer
-            class="sidebar-footer"
-            v-else-if="sidebarMode === 'knowledge'"
-          >
-            <FluentButton
-              tone="subtle"
-              :disabled="!selectedWorkspaceId"
-              @click="importMaterial"
-              >{{ t("sidebar.knowledge.import") }}</FluentButton
-            >
-          </footer>
-        </aside>
+        <AppSidebar
+          v-if="sidebarOpen"
+          v-model:search-query="searchQuery"
+          v-model:sidebar-mode="sidebarMode"
+          v-model:selected-workspace-id="selectedWorkspaceId"
+          v-model:rename-draft="renameDraft"
+          v-model:workspace-name="workspaceName"
+          :filtered-workspaces="filteredWorkspaces"
+          :normalized-search="normalizedSearch"
+          :sessions="data.sessions"
+          :selected-session-id="selectedSessionId"
+          :selected-material-id="selectedMaterialId"
+          :expanded-workspaces="expandedWorkspaces"
+          :renaming-id="renamingId"
+          :operation-busy="operationBusy"
+          :filtered-materials="filteredMaterials"
+          :workspace-options="workspaceOptions"
+          :workspaces="workspaces"
+          @toggle-workspace="toggleWorkspaceExpand"
+          @context-menu="
+            openContextMenu(
+              $event.event,
+              $event.kind,
+              $event.id,
+              $event.label,
+              $event.workspaceId,
+            )
+          "
+          @select-workspace="selectWorkspace"
+          @select-session="selectSession"
+          @select-material="selectMaterial"
+          @start-rename="startRename"
+          @cancel-rename="cancelRename"
+          @commit-rename="commitRename"
+          @ask-delete="askDelete"
+          @import-material="importMaterial"
+          @create-quick-session="createQuickSession"
+          @create-workspace="createWorkspace"
+        />
         <section
           ref="layoutRef"
           class="workbench-layout"
@@ -1277,140 +1082,34 @@ onUnmounted(() => {
             </div>
           </header>
           <template v-if="session">
-            <section class="main-workspace">
-              <div class="session-tabs">
-                <FluentButton
-                  :class="{ active: activeSessionTab === 'chat' }"
-                  tone="subtle"
-                  @click="activeSessionTab = 'chat'"
-                  >{{ t("session.tabs.chat") }}</FluentButton
-                ><FluentButton
-                  :class="{ active: activeSessionTab === 'summary' }"
-                  tone="subtle"
-                  @click="activeSessionTab = 'summary'"
-                  >{{ t("session.tabs.summary") }}</FluentButton
-                >
-              </div>
-              <template v-if="activeSessionTab === 'chat'"
-                ><div ref="messagesRef" class="messages" @click="handleContentClick">
-                  <article
-                    v-for="message in renderedMessages"
-                    :key="message.id"
-                    :class="['message', message.role]"
-                  >
-                    <label>{{
-                      message.role === "user" ? t("session.you") : t("session.assistant")
-                    }}</label>
-                    <div class="message-actions">
-                      <button
-                        type="button"
-                        :disabled="operationBusy"
-                        @click="copyMessage(message.content)"
-                      >
-                        {{ t("session.actions.copy") }}
-                      </button>
-                      <button
-                        v-if="message.role === 'user'"
-                        type="button"
-                        :disabled="operationBusy"
-                        @click="startEditMessage(message.id, message.content)"
-                      >
-                        {{ t("session.actions.edit") }}
-                      </button>
-                      <button
-                        v-if="message.role === 'assistant'"
-                        type="button"
-                        :disabled="operationBusy"
-                        @click="regenerateMessage(message.id)"
-                      >
-                        {{ t("session.actions.regenerate") }}
-                      </button>
-                      <button
-                        type="button"
-                        :disabled="operationBusy"
-                        @click="deleteMessage(message.id)"
-                      >
-                        {{ t("session.actions.delete") }}
-                      </button>
-                    </div>
-                    <div
-                      v-if="editingMessageId === message.id"
-                      class="message-edit"
-                    >
-                      <FluentTextArea v-model="editDraft" :label="t('session.editMessageLabel')" />
-                      <div class="message-edit-actions">
-                        <FluentButton
-                          tone="subtle"
-                          :disabled="operationBusy"
-                          @click="cancelEditMessage"
-                          >{{ t("common.cancel") }}</FluentButton
-                        ><FluentButton
-                          tone="primary"
-                          :disabled="operationBusy"
-                          @click="commitEditMessage"
-                          >{{ t("common.save") }}</FluentButton
-                        >
-                      </div>
-                    </div>
-                    <div v-else class="message-body" v-html="message.html"></div>
-                  </article>
-                  <div v-if="!renderedMessages.length" class="empty center">
-                    {{ t("session.emptyChat") }}
-                  </div>
-                </div>
-                <form class="composer" @submit.prevent="send">
-                  <FluentTextArea
-                    v-model="draft"
-                    :label="t('session.inputLabel')"
-                    :disabled="operationBusy"
-                    :placeholder="t('session.inputPlaceholder')"
-                    @keydown.enter.exact.prevent="handleComposerEnter"
-                    @input="handleComposerInput"
-                  /><FluentButton v-if="streaming" tone="danger" @click="cancel"
-                    >{{ t("session.stop") }}</FluentButton
-                  ><FluentButton
-                    v-else
-                    tone="primary"
-                    type="submit"
-                    :disabled="
-                      !draft.trim() || !currentProvider?.hasKey || operationBusy
-                    "
-                    >{{ t("session.send") }}</FluentButton
-                  >
-                </form></template
-              >
-              <section v-else class="summary-page">
-                <header>
-                  <div>
-                    <h2>{{ t("summary.title") }}</h2>
-                    <p>{{ t("summary.description") }}</p>
-                  </div>
-                  <FluentButton
-                    :tone="summaryLoading ? 'danger' : 'secondary'"
-                    :disabled="operationBusy && !summaryLoading"
-                    @click="summaryLoading ? cancel() : summarize()"
-                    >{{
-                      summaryLoading ? t("summary.stop") : t("summary.generate")
-                    }}</FluentButton
-                  >
-                </header>
-                <p v-if="summaryUpdatedLabel" class="summary-meta">
-                  {{ t("summary.updatedAt", { time: summaryUpdatedLabel }) }}
-                </p>
-                <div v-if="summaryLoading && !summaryStream" class="empty">
-                  <span class="spinner"></span> {{ t("summary.generating") }}
-                </div>
-                <div
-                  v-else-if="session.summary || summaryStream"
-                  class="summary-content"
-                  v-html="md.render(summaryStream || session.summary || '')"
-                  @click="handleContentClick"
-                ></div>
-                <div v-else class="empty">
-                  {{ t("summary.empty") }}
-                </div>
-              </section>
-            </section>
+            <WorkbenchChat
+              ref="workbenchChatRef"
+              v-model:active-tab="activeSessionTab"
+              v-model:draft="draft"
+              v-model:edit-draft="editDraft"
+              :rendered-messages="renderedMessages"
+              :editing-message-id="editingMessageId"
+              :operation-busy="operationBusy"
+              :streaming="streaming"
+              :has-provider-key="Boolean(currentProvider?.hasKey)"
+              :summary-loading="summaryLoading"
+              :summary-stream="summaryStream"
+              :summary-updated-label="summaryUpdatedLabel"
+              :session-summary="session.summary"
+              :summary-html="summaryHtml"
+              @content-click="handleContentClick"
+              @copy-message="copyMessage"
+              @start-edit-message="startEditMessage"
+              @cancel-edit-message="cancelEditMessage"
+              @commit-edit-message="commitEditMessage"
+              @regenerate-message="regenerateMessage"
+              @delete-message="deleteMessage"
+              @submit-message="send"
+              @cancel="cancel"
+              @composer-enter="handleComposerEnter"
+              @composer-input="handleComposerInput"
+              @summarize="summarize"
+            />
             <div
               class="resize-handle"
               role="separator"
@@ -1421,77 +1120,22 @@ onUnmounted(() => {
               @pointerdown="beginResize"
               @keydown="resizeWithKeyboard"
             ></div>
-            <aside class="transcript-panel">
-              <header>
-                <div>
-                  <h2>{{ t("transcript.title") }}</h2>
-                  <p>
-                    {{
-                      stt.ready ? t("transcript.readyHint") : t("transcript.notReadyHint")
-                    }}
-                  </p>
-                </div>
-                <FluentButton
-                  tone="subtle"
-                  :busy="transcriptionLoading"
-                  :disabled="!session || operationBusy"
-                  @click="uploadAudio"
-                  >{{ t("transcript.import") }}</FluentButton
-                >
-              </header>
-              <div ref="transcriptScrollRef" class="transcript-content">
-                <p v-if="session?.transcription">{{ session.transcription }}</p>
-                <div v-else class="empty transcript-empty">
-                  <svg
-                    width="32"
-                    height="32"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    aria-hidden="true"
-                  >
-                    <path
-                      d="M12 15a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Z"
-                      stroke="currentColor"
-                      stroke-width="1.4"
-                    /><path
-                      d="M5 11v1a7 7 0 0 0 14 0v-1M12 19v3"
-                      stroke="currentColor"
-                      stroke-width="1.4"
-                      stroke-linecap="round"
-                    />
-                  </svg>
-                  <p>{{ t("transcript.empty") }}</p>
-                </div>
-              </div>
-              <footer class="recording-bar">
-                <span class="recording-state">{{
-                  recordingStarting
-                    ? t("transcript.recording.loadingModel")
-                    : recording
-                      ? t("transcript.recording.active")
-                      : transcriptionLoading
-                        ? t("transcript.recording.transcribing")
-                        : t("transcript.recording.idle")
-                }}</span
-                ><FluentButton
-                  v-if="transcriptionLoading && !recordingSessionId"
-                  tone="danger"
-                  @click="cancel"
-                  >{{ t("transcript.recording.cancel") }}</FluentButton
-                ><FluentButton
-                  :tone="recording ? 'danger' : 'primary'"
-                  :busy="recordingStarting"
-                  :disabled="
-                    !session ||
-                    streaming ||
-                    summaryLoading ||
-                    transcriptionLoading
-                  "
-                  @click="toggleRecording"
-                  >{{ recording ? t("transcript.recording.stop") : t("transcript.recording.start") }}</FluentButton
-                >
-              </footer>
-            </aside>
+            <TranscriptPanel
+              ref="transcriptPanelRef"
+              :stt-ready="stt.ready"
+              :transcription-loading="transcriptionLoading"
+              :operation-busy="operationBusy"
+              :has-session="Boolean(session)"
+              :transcription="session?.transcription"
+              :recording-starting="recordingStarting"
+              :recording="recording"
+              :recording-session-id="recordingSessionId"
+              :streaming="streaming"
+              :summary-loading="summaryLoading"
+              @upload-audio="uploadAudio"
+              @cancel="cancel"
+              @toggle-recording="toggleRecording"
+            />
           </template>
           <section v-else class="main-workspace">
             <div v-if="material" class="material-editor-panel">
