@@ -34,6 +34,8 @@ enum Control {
 type WorkerResult = Result<Option<PathBuf>, String>;
 type TranscriptCallback = Arc<dyn Fn(String) -> Result<(), String> + Send + Sync>;
 type ErrorCallback = Arc<dyn Fn(String) + Send + Sync>;
+type LevelCallback = Arc<dyn Fn(f32) + Send + Sync>;
+const LEVEL_EMIT_INTERVAL: Duration = Duration::from_millis(75);
 
 struct ActiveRecording {
     session_id: String,
@@ -99,13 +101,16 @@ impl RecordingManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         &self,
         session_id: &str,
         data_root: &Path,
         stt: &SttManager,
+        language: Option<String>,
         on_transcript: TranscriptCallback,
         on_error: ErrorCallback,
+        on_level: LevelCallback,
     ) -> Result<(), String> {
         if session_id.trim().is_empty() {
             return Err("找不到录音会话。".into());
@@ -134,8 +139,10 @@ impl RecordingManager {
                     commands,
                     ready,
                     stt_root,
+                    language,
                     guarded_transcript,
                     worker_canceled,
+                    on_level,
                 );
                 if let Err(error) = &result {
                     worker_error(error.clone());
@@ -277,6 +284,39 @@ impl Drop for WavCapture {
     }
 }
 
+// Folds capture chunks to a normalised RMS level, rate-limited so the UI meter
+// doesn't get flooded with an event for every 4096-sample chunk.
+struct LevelMeter {
+    last_emit: Option<std::time::Instant>,
+}
+impl LevelMeter {
+    fn new() -> Self {
+        Self { last_emit: None }
+    }
+    fn sample(&mut self, chunk: &[i16]) -> Option<f32> {
+        if chunk.is_empty() {
+            return None;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .last_emit
+            .is_some_and(|last| now.duration_since(last) < LEVEL_EMIT_INTERVAL)
+        {
+            return None;
+        }
+        self.last_emit = Some(now);
+        let sum_squares: f64 = chunk
+            .iter()
+            .map(|sample| {
+                let normalized = f64::from(*sample) / f64::from(i16::MAX);
+                normalized * normalized
+            })
+            .sum();
+        let rms = (sum_squares / chunk.len() as f64).sqrt();
+        Some((rms as f32).clamp(0.0, 1.0))
+    }
+}
+
 fn failure_message(failure: &AtomicU8) -> Result<(), String> {
     match failure.load(Ordering::Acquire) {
         0 => Ok(()),
@@ -367,13 +407,16 @@ fn forward_transcript_audio(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn recording_worker(
     path: PathBuf,
     commands: Receiver<Control>,
     ready: SyncSender<Result<(), String>>,
     stt_root: PathBuf,
+    language: Option<String>,
     on_transcript: TranscriptCallback,
     canceled: Arc<std::sync::atomic::AtomicBool>,
+    on_level: LevelCallback,
 ) -> WorkerResult {
     let initialize = || {
         let host = cpal::default_host();
@@ -399,7 +442,8 @@ fn recording_worker(
                 "麦克风格式 {format:?} 不受支持，请选择 PCM16 或 Float32 输入。"
             )),
         }?;
-        let mut live = SttManager::from_root(stt_root).live_transcriber(config.sample_rate)?;
+        let mut live =
+            SttManager::from_root(stt_root).live_transcriber(config.sample_rate, language)?;
         let transcript_queue_chunks =
             ((config.sample_rate as usize * 8).div_ceil(CHUNK_FRAMES)).max(48);
         let (transcript_sender, transcript_audio) = mpsc::sync_channel(transcript_queue_chunks);
@@ -442,6 +486,7 @@ fn recording_worker(
     }
     let mut outcome: Result<bool, String> = Ok(false);
     let mut pending_transcript_audio = Vec::with_capacity(CHUNK_FRAMES);
+    let mut level_meter = LevelMeter::new();
     loop {
         match commands.try_recv() {
             Ok(Control::Stop) => {
@@ -457,6 +502,11 @@ fn recording_worker(
         }
         match audio.recv_timeout(Duration::from_millis(10)) {
             Ok(samples) => {
+                // Folding to a level and rate-limiting happens here, on the
+                // dedicated writer thread, never on the CPAL audio callback.
+                if let Some(level) = level_meter.sample(&samples) {
+                    on_level(level);
+                }
                 if let Err(error) = writer.write(&samples).and_then(|_| {
                     forward_transcript_audio(
                         &mut pending_transcript_audio,

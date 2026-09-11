@@ -178,3 +178,89 @@ fn preexisting_database_without_summary_column_does_not_crash() {
     )
     .unwrap();
 }
+
+#[test]
+fn created_at_round_trips_through_save_session_edits() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
+    let db = state.db().unwrap();
+    db.execute("INSERT INTO workspaces VALUES('w','Class')", [])
+        .unwrap();
+    db.execute(
+        "INSERT INTO sessions(id,workspace_id,title) VALUES('s','w','Lesson')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+
+    // A brand-new message with no created_at gets stamped on its first save.
+    let first = Session {
+        id: "s".into(),
+        workspace_id: "w".into(),
+        title: "Lesson".into(),
+        messages: vec![Message {
+            id: "m1".into(),
+            role: "user".into(),
+            content: "hello".into(),
+            created_at: String::new(),
+        }],
+        transcription: None,
+        summary: None,
+        summary_updated_at: None,
+        transcription_words: None,
+    };
+    save_session_with(first, &state).unwrap();
+    let loaded = load_data(&state).unwrap();
+    let session = loaded.sessions.iter().find(|s| s.id == "s").unwrap();
+    let stamped = session.messages[0].created_at.clone();
+    assert!(!stamped.is_empty(), "expected a created_at to be assigned");
+
+    // Editing the session (adding a second message) must not disturb the
+    // first message's created_at, even though save_session deletes and
+    // reinserts every row.
+    let mut edited = session.clone();
+    edited.messages.push(Message {
+        id: "m2".into(),
+        role: "assistant".into(),
+        content: "hi".into(),
+        created_at: String::new(),
+    });
+    save_session_with(edited, &state).unwrap();
+    let reloaded = load_data(&state).unwrap();
+    let session = reloaded.sessions.iter().find(|s| s.id == "s").unwrap();
+    assert_eq!(session.messages[0].created_at, stamped);
+    assert!(!session.messages[1].created_at.is_empty());
+    assert_ne!(
+        session.messages[0].created_at,
+        session.messages[1].created_at.clone()
+    );
+}
+
+#[test]
+fn legacy_messages_get_an_empty_created_at_not_a_crash() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("state.sqlite3");
+    {
+        // Simulate a pre-existing database from before the created_at column existed.
+        let db = open_database(&path).unwrap();
+        db.execute("ALTER TABLE messages DROP COLUMN created_at", [])
+            .unwrap();
+        db.execute("INSERT INTO workspaces VALUES('w','Class')", [])
+            .unwrap();
+        db.execute(
+            "INSERT INTO sessions(id,workspace_id,title) VALUES('s','w','Lesson')",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO messages(id,session_id,role,content,position) VALUES('m','s','user','hi',0)",
+            [],
+        )
+        .unwrap();
+    }
+    // Reopening must not crash, and must additively repair the missing column.
+    let state = AppState::open(path).unwrap();
+    let data = load_data(&state).unwrap();
+    let session = data.sessions.iter().find(|s| s.id == "s").unwrap();
+    assert_eq!(session.messages[0].created_at, "");
+}

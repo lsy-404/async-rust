@@ -3,6 +3,14 @@ export interface Message {
   id: string;
   role: "user" | "assistant" | "system";
   content: string;
+  // Absent for an optimistic local message not yet round-tripped through the
+  // backend; empty string for one persisted before this field existed.
+  createdAt?: string;
+}
+export interface Word {
+  word: string;
+  start: number;
+  end: number;
 }
 export interface Workspace {
   id: string;
@@ -23,6 +31,9 @@ export interface Session {
   transcription?: string;
   summary?: string;
   summaryUpdatedAt?: string | null;
+  // Null unless the bundled Whisper export carries alignment heads (it does
+  // not, today) and the most recent transcribe call produced word timings.
+  transcriptionWords?: Word[] | null;
 }
 export interface Provider {
   id: string;
@@ -58,8 +69,16 @@ export interface StreamEvent {
   text: string;
 }
 
+// The wire shape per variant is exactly:
+//   { type: "transcript"; sessionId: string; text: string }
+//   { type: "error"; sessionId: string; text: string }
+//   { type: "level"; sessionId: string; level: number }
+// Loosened to one interface (rather than a discriminated union) so existing
+// call sites that only branch on "error" keep type-checking; a caller that
+// starts handling "level" should narrow on `type` and can tighten this.
 export interface RecordingEvent {
-  type: "transcript" | "error";
+  type: "transcript" | "error" | "level";
   sessionId: string;
-  text: string;
+  text?: string;
+  level?: number;
 }

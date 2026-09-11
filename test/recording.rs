@@ -133,7 +133,9 @@ async fn lifecycle_pins_session_and_cancel_or_drop_joins_worker() {
             "new",
             Path::new("unused"),
             &SttManager::new(PathBuf::from("unused")),
+            None,
             Arc::new(|_| Ok(())),
+            Arc::new(|_| {}),
             Arc::new(|_| {}),
         )
         .await
@@ -147,6 +149,41 @@ async fn lifecycle_pins_session_and_cancel_or_drop_joins_worker() {
     *manager.active.lock().await = Some(fake_active("original", canceled.clone()));
     drop(manager);
     assert_eq!(canceled.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn level_meter_rate_limits_and_normalizes() {
+    let mut meter = LevelMeter::new();
+    let loud = vec![i16::MAX; 256];
+    let first = meter.sample(&loud);
+    assert!(first.is_some());
+    assert!((first.unwrap() - 1.0).abs() < 1e-4);
+    // A second sample immediately after must be suppressed by the rate limit.
+    assert!(meter.sample(&loud).is_none());
+    assert!(meter.sample(&[]).is_none());
+    let quiet = vec![0i16; 256];
+    let mut fresh = LevelMeter::new();
+    assert_eq!(fresh.sample(&quiet), Some(0.0));
+}
+
+#[test]
+fn recording_event_serializes_with_a_type_tag_and_camel_case_fields() {
+    let transcript = crate::RecordingEvent::Transcript {
+        session_id: "s".into(),
+        text: "hello".into(),
+    };
+    assert_eq!(
+        serde_json::to_value(&transcript).unwrap(),
+        serde_json::json!({"type":"transcript","sessionId":"s","text":"hello"})
+    );
+    let level = crate::RecordingEvent::Level {
+        session_id: "s".into(),
+        level: 0.5,
+    };
+    assert_eq!(
+        serde_json::to_value(&level).unwrap(),
+        serde_json::json!({"type":"level","sessionId":"s","level":0.5})
+    );
 }
 
 #[test]

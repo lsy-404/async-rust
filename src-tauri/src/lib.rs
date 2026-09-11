@@ -39,6 +39,9 @@ pub struct Message {
     pub id: String,
     pub role: String,
     pub content: String,
+    // Empty for messages persisted before this field existed; never rewritten afterward.
+    #[serde(default)]
+    pub created_at: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +54,8 @@ pub struct Session {
     pub transcription: Option<String>,
     pub summary: Option<String>,
     pub summary_updated_at: Option<String>,
+    #[serde(default)]
+    pub transcription_words: Option<Vec<stt::Word>>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -119,12 +124,14 @@ pub struct StreamEvent {
     pub text: String,
 }
 #[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RecordingEvent {
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub session_id: String,
-    pub text: String,
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum RecordingEvent {
+    #[serde(rename_all = "camelCase")]
+    Transcript { session_id: String, text: String },
+    #[serde(rename_all = "camelCase")]
+    Error { session_id: String, text: String },
+    #[serde(rename_all = "camelCase")]
+    Level { session_id: String, level: f32 },
 }
 
 pub struct AppState {
@@ -184,16 +191,11 @@ fn open_database(path: &Path) -> Result<Connection, String> {
       CREATE TABLE IF NOT EXISTS materials(id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE, name TEXT NOT NULL, content TEXT NOT NULL, path TEXT);
       CREATE TABLE IF NOT EXISTS providers(id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, models_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS settings(singleton INTEGER PRIMARY KEY CHECK(singleton=1), json TEXT NOT NULL);") .map_err(|e| e.to_string())?;
-    // CREATE TABLE IF NOT EXISTS does not add columns to a table that already exists on disk.
-    let has_summary_updated_at: bool = db
-        .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name='summary_updated_at'")
-        .map_err(|e| e.to_string())?
-        .exists([])
-        .map_err(|e| e.to_string())?;
-    if !has_summary_updated_at {
-        db.execute("ALTER TABLE sessions ADD COLUMN summary_updated_at TEXT", [])
-            .map_err(|e| e.to_string())?;
-    }
+    // Additive migrations for columns that postdate a user's existing database;
+    // guarded so they only ever run once and never touch existing rows.
+    ensure_column(&db, "sessions", "summary_updated_at", "TEXT")?;
+    ensure_column(&db, "sessions", "transcription_words", "TEXT")?;
+    ensure_column(&db, "messages", "created_at", "TEXT NOT NULL DEFAULT ''")?;
     for (id, name, base) in [
         ("workbuddy", "WorkBuddy", "https://copilot.tencent.com/v2"),
         ("traecode", "TraeCode", "https://www.trae.ai"),
@@ -206,6 +208,29 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     }
     connections::initialize(&db)?;
     Ok(db)
+}
+
+fn ensure_column(
+    db: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), String> {
+    let exists: i64 = db
+        .query_row(
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name=?"),
+            [column],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if exists == 0 {
+        db.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 fn id() -> String {
@@ -244,7 +269,9 @@ fn load_data(state: &AppState) -> Result<AppData, String> {
         .map_err(|e| e.to_string())?;
     let mut sessions = Vec::new();
     let mut statement = db
-        .prepare("SELECT id,workspace_id,title,transcription,summary,summary_updated_at FROM sessions ORDER BY rowid")
+        .prepare(
+            "SELECT id,workspace_id,title,transcription,summary,summary_updated_at,transcription_words FROM sessions ORDER BY rowid",
+        )
         .map_err(|e| e.to_string())?;
     let rows = statement
         .query_map([], |r| {
@@ -255,20 +282,34 @@ fn load_data(state: &AppState) -> Result<AppData, String> {
                 r.get::<_, Option<String>>(3)?,
                 r.get::<_, Option<String>>(4)?,
                 r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
             ))
         })
         .map_err(|e| e.to_string())?;
     for row in rows {
-        let (sid, workspace_id, title, transcription, summary, summary_updated_at) =
-            row.map_err(|e| e.to_string())?;
+        let (
+            sid,
+            workspace_id,
+            title,
+            transcription,
+            summary,
+            summary_updated_at,
+            transcription_words,
+        ) = row.map_err(|e| e.to_string())?;
+        let transcription_words = transcription_words
+            .map(|raw| serde_json::from_str(&raw).map_err(|e| e.to_string()))
+            .transpose()?;
         let messages = db
-            .prepare("SELECT id,role,content FROM messages WHERE session_id=? ORDER BY position")
+            .prepare(
+                "SELECT id,role,content,created_at FROM messages WHERE session_id=? ORDER BY position",
+            )
             .map_err(|e| e.to_string())?
             .query_map([&sid], |r| {
                 Ok(Message {
                     id: r.get(0)?,
                     role: r.get(1)?,
                     content: r.get(2)?,
+                    created_at: r.get(3)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -282,6 +323,7 @@ fn load_data(state: &AppState) -> Result<AppData, String> {
             transcription,
             summary,
             summary_updated_at,
+            transcription_words,
         });
     }
     let materials = db
@@ -404,6 +446,7 @@ fn create_session(
         transcription: None,
         summary: None,
         summary_updated_at: None,
+        transcription_words: None,
     };
     state
         .db()?
@@ -446,6 +489,9 @@ fn delete_session(id: String, state: tauri::State<'_, AppState>) -> Result<(), S
 }
 #[tauri::command]
 fn save_session(session: Session, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    save_session_with(session, &state)
+}
+fn save_session_with(session: Session, state: &AppState) -> Result<(), String> {
     let mut db = state.db()?;
     let tx = db.transaction().map_err(|e| e.to_string())?;
     let updated = tx
@@ -466,9 +512,17 @@ fn save_session(session: Session, state: tauri::State<'_, AppState>) -> Result<(
     tx.execute("DELETE FROM messages WHERE session_id=?", [&session.id])
         .map_err(|e| e.to_string())?;
     for (position, m) in session.messages.iter().enumerate() {
+        // Reinserted on every save, so a blank created_at (edit/regenerate of an
+        // existing message) keeps its original value instead of being reset here;
+        // only a genuinely new message without one gets stamped now.
+        let created_at = if m.created_at.trim().is_empty() {
+            chrono::Utc::now().to_rfc3339()
+        } else {
+            m.created_at.clone()
+        };
         tx.execute(
-            "INSERT INTO messages(id,session_id,role,content,position) VALUES(?,?,?,?,?)",
-            params![m.id, session.id, m.role, m.content, position],
+            "INSERT INTO messages(id,session_id,role,content,position,created_at) VALUES(?,?,?,?,?,?)",
+            params![m.id, session.id, m.role, m.content, position, created_at],
         )
         .map_err(|e| e.to_string())?;
     }
@@ -627,8 +681,15 @@ fn persist_message(
         )
         .map_err(|e| e.to_string())?;
     tx.execute(
-        "INSERT INTO messages(id,session_id,role,content,position) VALUES(?,?,?,?,?)",
-        params![id(), session_id, role, content, position],
+        "INSERT INTO messages(id,session_id,role,content,position,created_at) VALUES(?,?,?,?,?,?)",
+        params![
+            id(),
+            session_id,
+            role,
+            content,
+            position,
+            chrono::Utc::now().to_rfc3339()
+        ],
     )
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())
@@ -831,11 +892,34 @@ fn append_transcription_at(
     Ok(combined)
 }
 
+fn set_transcription_words(
+    state: &AppState,
+    session_id: &str,
+    words: &[stt::Word],
+) -> Result<(), String> {
+    // Words describe a single audio file's own timeline, so a new transcription
+    // replaces rather than appends to whatever the previous one stored.
+    let json = if words.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(words).map_err(|e| e.to_string())?)
+    };
+    state
+        .db()?
+        .execute(
+            "UPDATE sessions SET transcription_words=? WHERE id=?",
+            params![json, session_id],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 async fn transcribe(
     state: &AppState,
     session_id: &str,
     name: String,
     bytes: Vec<u8>,
+    language: Option<String>,
 ) -> Result<String, String> {
     let exists: bool = state
         .db()?
@@ -851,10 +935,15 @@ async fn transcribe(
     let cancellation = generation_token(state, session_id)?;
     let result = state
         .stt
-        .transcribe(name, bytes, cancellation.clone())
+        .transcribe(name, bytes, language, cancellation.clone())
         .await;
     let output = match result {
-        Ok(text) if !cancellation.is_cancelled() => append_transcription(state, session_id, &text),
+        Ok(transcription) if !cancellation.is_cancelled() => {
+            append_transcription(state, session_id, &transcription.text).and_then(|combined| {
+                set_transcription_words(state, session_id, &transcription.words)?;
+                Ok(combined)
+            })
+        }
         Ok(_) => Err("语音任务已取消。".into()),
         Err(error) => Err(error),
     };
@@ -869,6 +958,7 @@ async fn transcribe(
 async fn transcribe_audio(
     session_id: String,
     path: String,
+    language: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
     let name = Path::new(&path)
@@ -891,7 +981,7 @@ async fn transcribe_audio(
         .read_to_end(&mut bytes)
         .await
         .map_err(|e| e.to_string())?;
-    transcribe(&state, &session_id, name, bytes).await
+    transcribe(&state, &session_id, name, bytes, language).await
 }
 #[tauri::command]
 async fn transcribe_bytes(
@@ -900,13 +990,25 @@ async fn transcribe_bytes(
     bytes: Vec<u8>,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
-    transcribe(&state, &session_id, name, bytes).await
+    transcribe(&state, &session_id, name, bytes, None).await
+}
+#[tauri::command]
+async fn read_audio_file(path: String) -> Result<tauri::ipc::Response, String> {
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > stt::MAX_AUDIO_BYTES {
+        return Err("音频为空、不是普通文件或超过 512 MiB。".into());
+    }
+    let bytes = tokio::fs::read(&path).await.map_err(|e| e.to_string())?;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 #[tauri::command]
 async fn start_recording(
     session_id: String,
     on_event: Channel<RecordingEvent>,
+    language: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     let exists: bool = state
@@ -926,8 +1028,7 @@ async fn start_recording(
     let on_transcript = std::sync::Arc::new(move |segment: String| {
         let text = append_transcription_at(&database, &active_session, &segment)?;
         channel
-            .send(RecordingEvent {
-                kind: "transcript".into(),
+            .send(RecordingEvent::Transcript {
                 session_id: active_session.clone(),
                 text,
             })
@@ -936,10 +1037,17 @@ async fn start_recording(
     let error_session = session_id.clone();
     let error_channel = on_event.clone();
     let on_error = std::sync::Arc::new(move |text: String| {
-        let _ = error_channel.send(RecordingEvent {
-            kind: "error".into(),
+        let _ = error_channel.send(RecordingEvent::Error {
             session_id: error_session.clone(),
             text,
+        });
+    });
+    let level_session = session_id.clone();
+    let level_channel = on_event.clone();
+    let on_level = std::sync::Arc::new(move |level: f32| {
+        let _ = level_channel.send(RecordingEvent::Level {
+            session_id: level_session.clone(),
+            level,
         });
     });
     match state
@@ -948,15 +1056,16 @@ async fn start_recording(
             &session_id,
             state.db_path.parent().ok_or("本地数据路径无效。")?,
             &state.stt,
+            language,
             on_transcript,
             on_error,
+            on_level,
         )
         .await
     {
         Ok(()) => Ok(()),
         Err(error) => {
-            let _ = on_event.send(RecordingEvent {
-                kind: "error".into(),
+            let _ = on_event.send(RecordingEvent::Error {
                 session_id,
                 text: error.clone(),
             });
@@ -1022,6 +1131,7 @@ pub fn run() {
             summarize,
             transcribe_audio,
             transcribe_bytes,
+            read_audio_file,
             start_recording,
             stop_recording,
             cancel_recording,

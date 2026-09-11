@@ -279,10 +279,15 @@ async fn missing_models_do_not_need_api_credentials_or_leave_busy_session() {
     )
     .unwrap();
     for _ in 0..2 {
-        let failure =
-            crate::transcribe(&state, "s", "voice.wav".into(), wave(16_000, 1, [0; 1024]))
-                .await
-                .unwrap_err();
+        let failure = crate::transcribe(
+            &state,
+            "s",
+            "voice.wav".into(),
+            wave(16_000, 1, [0; 1024]),
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(failure.contains("模型未就绪"), "{failure}");
         assert!(state.cancellations.lock().unwrap().is_empty());
     }
@@ -340,7 +345,7 @@ async fn actual_whisper_jfk_recognizes_capture_rates_and_persists_without_key() 
                     .map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16),
             )
         };
-        let output = crate::transcribe(&state, "jfk", "capture.wav".into(), bytes)
+        let output = crate::transcribe(&state, "jfk", "capture.wav".into(), bytes, None)
             .await
             .unwrap();
         eprintln!("{rate} Hz transcript: {output}");
@@ -381,7 +386,7 @@ async fn actual_whisper_jfk_recognizes_capture_rates_and_persists_without_key() 
         )
         .unwrap();
     let (result, ()) = tokio::join!(
-        crate::transcribe(&state, "jfk", "capture.wav".into(), original.clone()),
+        crate::transcribe(&state, "jfk", "capture.wav".into(), original.clone(), None),
         async {
             tokio::time::sleep(Duration::from_millis(20)).await;
             state
@@ -407,14 +412,19 @@ async fn actual_whisper_jfk_recognizes_capture_rates_and_persists_without_key() 
     canceled.cancel();
     assert!(state
         .stt
-        .transcribe("jfk.wav".into(), original, canceled)
+        .transcribe("jfk.wav".into(), original, None, canceled)
         .await
         .unwrap_err()
         .contains("取消"));
     let silence = wave(16_000, 1, std::iter::repeat_n(0, 16_000 * 2));
     assert!(state
         .stt
-        .transcribe("silence.wav".into(), silence, CancellationToken::new())
+        .transcribe(
+            "silence.wav".into(),
+            silence,
+            None,
+            CancellationToken::new()
+        )
         .await
         .unwrap_err()
         .contains("未检测到"));
@@ -440,7 +450,7 @@ fn actual_live_transcriber_emits_segments_before_finish_and_flushes_tail() {
                 .resample(&samples, true)
         };
         let mut live = SttManager::new(model_root.clone())
-            .live_transcriber(rate as u32)
+            .live_transcriber(rate as u32, None)
             .unwrap();
         let mut output = Vec::new();
         let mut first_segment_at = None;
@@ -480,4 +490,80 @@ fn actual_live_transcriber_emits_segments_before_finish_and_flushes_tail() {
         assert!(text.contains("your country can do for you"));
         assert!(text.contains("what you can do for your country"));
     }
+}
+
+#[tokio::test]
+#[ignore = "Set ASYNC_STT_MODEL_ROOT and ASYNC_STT_JFK_WAV to run against an installed local model"]
+async fn actual_recognize_documents_real_word_timestamp_support() {
+    let model_root = PathBuf::from(std::env::var("ASYNC_STT_MODEL_ROOT").unwrap());
+    let source = PathBuf::from(std::env::var("ASYNC_STT_JFK_WAV").unwrap());
+    let bytes = fs::read(source).unwrap();
+    let transcription = SttManager::new(model_root)
+        .transcribe("jfk.wav".into(), bytes, None, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(transcription
+        .text
+        .to_lowercase()
+        .contains("what you can do for your country"));
+    // Whether `words` comes back empty documents whether the installed export
+    // carries Whisper alignment heads; both are valid outcomes, so this test
+    // only reports the fact rather than asserting either way.
+    eprintln!(
+        "word count for the installed model: {}",
+        transcription.words.len()
+    );
+}
+
+#[test]
+fn missing_or_blank_language_means_auto_detect() {
+    assert_eq!(normalize_language(None), "");
+    assert_eq!(normalize_language(Some(String::new())), "");
+    assert_eq!(normalize_language(Some("   ".into())), "");
+    assert_eq!(normalize_language(Some(" en ".into())), "en");
+    assert_eq!(normalize_language(Some("zh".into())), "zh");
+}
+
+fn result_with(
+    tokens: &[&str],
+    timestamps: Option<Vec<f32>>,
+    durations: Option<Vec<f32>>,
+) -> OfflineRecognizerResult {
+    OfflineRecognizerResult {
+        text: tokens.concat(),
+        tokens: tokens.iter().map(|t| t.to_string()).collect(),
+        timestamps,
+        durations,
+    }
+}
+
+#[test]
+fn segment_words_splits_on_leading_space_and_merges_punctuation() {
+    let result = result_with(
+        &[" And", " so", ","],
+        Some(vec![0.1, 0.4, 0.6]),
+        Some(vec![0.2, 0.15, 0.05]),
+    );
+    let words = segment_words(&result, 10.0);
+    assert_eq!(words.len(), 2);
+    assert_eq!(words[0].word, "And");
+    assert!((words[0].start - 10.1).abs() < 1e-6);
+    assert!((words[0].end - 10.3).abs() < 1e-6);
+    assert_eq!(words[1].word, "so,");
+    assert!((words[1].start - 10.4).abs() < 1e-6);
+    // The merged word's end extends to the trailing punctuation token's end.
+    assert!((words[1].end - 10.65).abs() < 1e-6);
+}
+
+#[test]
+fn segment_words_reports_none_when_the_model_has_no_alignment_head() {
+    // This is exactly what the bundled Whisper tiny INT8 export returns:
+    // tokens are present, but timestamps/durations come back empty.
+    let result = result_with(&[" And", " so"], Some(vec![]), Some(vec![]));
+    assert!(segment_words(&result, 0.0).is_empty());
+    let result = result_with(&[" And", " so"], None, None);
+    assert!(segment_words(&result, 0.0).is_empty());
+    // A length mismatch is treated the same defensive way.
+    let result = result_with(&[" And", " so"], Some(vec![0.0]), None);
+    assert!(segment_words(&result, 0.0).is_empty());
 }

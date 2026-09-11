@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sherpa_onnx::{
     LinearResampler, OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
-    OfflineWhisperModelConfig, SileroVadModelConfig, VadModelConfig, VoiceActivityDetector,
+    OfflineRecognizerResult, OfflineWhisperModelConfig, SileroVadModelConfig, VadModelConfig,
+    VoiceActivityDetector,
 };
 use symphonia::core::{
     audio::SampleBuffer, codecs::DecoderOptions, errors::Error as AudioError,
@@ -65,6 +66,19 @@ pub struct DownloadProgress {
     pub downloaded: u64,
     pub total: u64,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Word {
+    pub word: String,
+    pub start: f32,
+    pub end: f32,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Transcription {
+    pub text: String,
+    pub words: Vec<Word>,
+}
 #[derive(Serialize, Deserialize)]
 struct Receipt {
     whisper: String,
@@ -104,6 +118,14 @@ impl Drop for StagingGuard {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+// Empty string is how sherpa-onnx spells "auto-detect"; keep that meaning for a missing/blank request.
+fn normalize_language(language: Option<String>) -> String {
+    language
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
 }
 
 fn check_canceled(cancel: &CancellationToken) -> Result<(), String> {
@@ -180,10 +202,14 @@ impl SttManager {
         self.root.join("whisper-tiny-multilingual-int8")
     }
 
-    pub(crate) fn live_transcriber(&self, source_rate: u32) -> Result<LiveTranscriber, String> {
+    pub(crate) fn live_transcriber(
+        &self,
+        source_rate: u32,
+        language: Option<String>,
+    ) -> Result<LiveTranscriber, String> {
         let root = self.model_path();
         verified_install(&root, &CancellationToken::new())?;
-        LiveTranscriber::create(root, source_rate)
+        LiveTranscriber::create(root, source_rate, language)
     }
     pub async fn status(&self) -> Result<SttStatus, String> {
         let root = self.model_path();
@@ -311,8 +337,9 @@ impl SttManager {
         &self,
         name: String,
         bytes: Vec<u8>,
+        language: Option<String>,
         cancel: CancellationToken,
-    ) -> Result<String, String> {
+    ) -> Result<Transcription, String> {
         if bytes.is_empty() || bytes.len() as u64 > MAX_AUDIO_BYTES {
             return Err("音频为空或超过 512 MiB。".into());
         }
@@ -326,7 +353,7 @@ impl SttManager {
             check_canceled(&cancel)?;
             verified_install(&root, &cancel).map_err(|e| format!("本地语音模型未就绪：{e}"))?;
             let samples = decode_audio(&name, bytes, &cancel)?;
-            recognize(&root, &samples, &cancel)
+            recognize(&root, &samples, language, &cancel)
         })
         .await
         .map_err(|e| e.to_string())?
@@ -334,7 +361,7 @@ impl SttManager {
 }
 
 impl LiveTranscriber {
-    fn create(root: PathBuf, source_rate: u32) -> Result<Self, String> {
+    fn create(root: PathBuf, source_rate: u32, language: Option<String>) -> Result<Self, String> {
         if !(8_000..=192_000).contains(&source_rate) {
             return Err("麦克风采样率不受支持。".into());
         }
@@ -344,9 +371,13 @@ impl LiveTranscriber {
                 whisper: OfflineWhisperModelConfig {
                     encoder: Some(path(EXPECTED_FILES[0])),
                     decoder: Some(path(EXPECTED_FILES[1])),
-                    language: Some(String::new()),
+                    language: Some(normalize_language(language)),
                     task: Some("transcribe".into()),
                     tail_paddings: -1,
+                    // The bundled Whisper export has no cross-attention output, so token
+                    // timestamps are left off here: turning them on would only add a
+                    // per-segment warning with no consumer, since live segments don't
+                    // persist words (see recognize() for the one-shot path that does).
                     ..Default::default()
                 },
                 tokens: Some(path(EXPECTED_FILES[2])),
@@ -649,7 +680,45 @@ fn decode_audio(
     Ok(samples)
 }
 
-fn recognize(root: &Path, samples: &[f32], cancel: &CancellationToken) -> Result<String, String> {
+// A token starting with a leading space begins a new word (GPT2-style BPE);
+// anything else (continuations, attached punctuation) extends the previous one.
+fn segment_words(result: &OfflineRecognizerResult, offset: f32) -> Vec<Word> {
+    let count = result.tokens.len();
+    let Some(timestamps) = result
+        .timestamps
+        .as_ref()
+        .filter(|t| !t.is_empty() && t.len() == count)
+    else {
+        // The bundled Whisper export has no alignment head: timestamps come back
+        // empty. Report no words rather than fabricating start/end times.
+        return Vec::new();
+    };
+    let durations = result.durations.as_ref().filter(|d| d.len() == count);
+    let mut words: Vec<Word> = Vec::new();
+    for (i, token) in result.tokens.iter().enumerate() {
+        let start = offset + timestamps[i];
+        let end = durations.map_or(start, |d| start + d[i]);
+        let piece = token.strip_prefix(' ').unwrap_or(token);
+        if token.starts_with(' ') || words.is_empty() {
+            words.push(Word {
+                word: piece.to_owned(),
+                start,
+                end,
+            });
+        } else if let Some(last) = words.last_mut() {
+            last.word.push_str(piece);
+            last.end = end;
+        }
+    }
+    words
+}
+
+fn recognize(
+    root: &Path,
+    samples: &[f32],
+    language: Option<String>,
+    cancel: &CancellationToken,
+) -> Result<Transcription, String> {
     check_canceled(cancel)?;
     let path = |name: &str| root.join(name).to_string_lossy().into_owned();
     let config = OfflineRecognizerConfig {
@@ -657,10 +726,11 @@ fn recognize(root: &Path, samples: &[f32], cancel: &CancellationToken) -> Result
             whisper: OfflineWhisperModelConfig {
                 encoder: Some(path(EXPECTED_FILES[0])),
                 decoder: Some(path(EXPECTED_FILES[1])),
-                language: Some(String::new()),
+                language: Some(normalize_language(language)),
                 task: Some("transcribe".into()),
                 tail_paddings: -1,
-                ..Default::default()
+                enable_token_timestamps: true,
+                enable_segment_timestamps: true,
             },
             tokens: Some(path(EXPECTED_FILES[2])),
             num_threads: 2,
@@ -689,9 +759,13 @@ fn recognize(root: &Path, samples: &[f32], cancel: &CancellationToken) -> Result
     let vad =
         VoiceActivityDetector::create(&vad_config, 30.0).ok_or("无法启动 Silero 语音检测引擎。")?;
     let mut text = Vec::new();
+    let mut words = Vec::new();
     let mut drain = || -> Result<(), String> {
         while let Some(segment) = vad.front() {
             check_canceled(cancel)?;
+            // Per-segment timestamps are relative to the segment; shift them by its
+            // own start (in samples) to land in absolute audio time.
+            let offset = segment.start() as f32 / SAMPLE_RATE as f32;
             let stream = recognizer.create_stream();
             stream.accept_waveform(SAMPLE_RATE, segment.samples());
             recognizer.decode(&stream);
@@ -700,6 +774,7 @@ fn recognize(root: &Path, samples: &[f32], cancel: &CancellationToken) -> Result
             let transcript = result.text.trim();
             if !transcript.is_empty() {
                 text.push(transcript.to_owned());
+                words.extend(segment_words(&result, offset));
             }
             vad.pop();
         }
@@ -722,7 +797,10 @@ fn recognize(root: &Path, samples: &[f32], cancel: &CancellationToken) -> Result
     if text.is_empty() {
         return Err("未检测到可识别的语音。".into());
     }
-    Ok(text.join("\n"))
+    Ok(Transcription {
+        text: text.join("\n"),
+        words,
+    })
 }
 
 #[cfg(test)]
