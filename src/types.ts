@@ -53,6 +53,18 @@ export interface Session {
   // Null unless the bundled Whisper export carries alignment heads (it does
   // not, today) and the most recent transcribe call produced word timings.
   transcriptionWords?: Word[] | null;
+  // Gates the background notes job only; the explicit Generate/Refresh button
+  // always works. Absent means true (matches the backend's own default).
+  notesEnabled?: boolean;
+}
+// Pushed as the "notes-status" event while a session's background notes job
+// runs; `summary`/`summaryUpdatedAt` are only present on "idle" (finished).
+export type NotesStatus = "idle" | "generating" | "needs-provider" | "error";
+export interface NotesStatusEvent {
+  sessionId: string;
+  status: NotesStatus;
+  summary?: string | null;
+  summaryUpdatedAt?: string | null;
 }
 export interface Provider {
   id: string;

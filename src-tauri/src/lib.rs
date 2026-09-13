@@ -20,12 +20,18 @@ use quick_xml::{events::Event, Reader};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{ipc::Channel, Manager};
+use tauri::{ipc::Channel, Emitter, Manager};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zip::ZipArchive;
 
 const CONTEXT_LIMIT: usize = 48_000;
+// Background notes trigger rule: while a session is recording, once the
+// transcript has grown by this many new characters since the last covered
+// point, a notes update runs; the chunk sent carries this many characters of
+// overlap from before that point so context isn't lost at the boundary.
+const NOTES_THRESHOLD_CHARS: usize = 800;
+const NOTES_OVERLAP_CHARS: usize = 200;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,6 +76,13 @@ pub struct Session {
     pub summary_updated_at: Option<String>,
     #[serde(default)]
     pub transcription_words: Option<Vec<stt::Word>>,
+    // Gates the background notes job only; the explicit Generate/Refresh
+    // button always works regardless of this flag.
+    #[serde(default = "default_true")]
+    pub notes_enabled: bool,
+}
+fn default_true() -> bool {
+    true
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -180,6 +193,22 @@ pub struct AppState {
     recording: recording::RecordingManager,
     client: reqwest::Client,
     cancellations: Mutex<HashMap<String, CancellationToken>>,
+    // Separate from `cancellations` so a background notes job can never
+    // reserve the same slot chat needs and block the user from chatting.
+    notes_cancellations: Mutex<HashMap<String, CancellationToken>>,
+    notes: Mutex<HashMap<String, NotesTracker>>,
+}
+
+#[derive(Default)]
+struct NotesTracker {
+    // Transcript characters already folded into the notes.
+    cursor: usize,
+    running: bool,
+    // Set when the transcript crosses the threshold again while a job for
+    // this session is already running (or chat/explicit-summarize is using
+    // the session); picked up as one more round once that clears, so jobs
+    // never stack for the same session.
+    pending: bool,
 }
 
 impl AppState {
@@ -198,6 +227,8 @@ impl AppState {
                 .build()
                 .map_err(|e| e.to_string())?,
             cancellations: Mutex::new(HashMap::new()),
+            notes_cancellations: Mutex::new(HashMap::new()),
+            notes: Mutex::new(HashMap::new()),
         };
         state.db().map(|_| state)
     }
@@ -235,6 +266,12 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     // guarded so they only ever run once and never touch existing rows.
     ensure_column(&db, "sessions", "summary_updated_at", "TEXT")?;
     ensure_column(&db, "sessions", "transcription_words", "TEXT")?;
+    ensure_column(
+        &db,
+        "sessions",
+        "notes_enabled",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
     ensure_column(&db, "messages", "created_at", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(&db, "messages", "tool_calls", "TEXT")?;
     for (id, name, base) in [
@@ -311,7 +348,7 @@ fn load_data(state: &AppState) -> Result<AppData, String> {
     let mut sessions = Vec::new();
     let mut statement = db
         .prepare(
-            "SELECT id,workspace_id,title,transcription,summary,summary_updated_at,transcription_words FROM sessions ORDER BY rowid",
+            "SELECT id,workspace_id,title,transcription,summary,summary_updated_at,transcription_words,notes_enabled FROM sessions ORDER BY rowid",
         )
         .map_err(|e| e.to_string())?;
     let rows = statement
@@ -324,6 +361,7 @@ fn load_data(state: &AppState) -> Result<AppData, String> {
                 r.get::<_, Option<String>>(4)?,
                 r.get::<_, Option<String>>(5)?,
                 r.get::<_, Option<String>>(6)?,
+                r.get::<_, bool>(7)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -336,6 +374,7 @@ fn load_data(state: &AppState) -> Result<AppData, String> {
             summary,
             summary_updated_at,
             transcription_words,
+            notes_enabled,
         ) = row.map_err(|e| e.to_string())?;
         let transcription_words = transcription_words
             .map(|raw| serde_json::from_str(&raw).map_err(|e| e.to_string()))
@@ -380,6 +419,7 @@ fn load_data(state: &AppState) -> Result<AppData, String> {
             summary,
             summary_updated_at,
             transcription_words,
+            notes_enabled,
         });
     }
     let materials = db
@@ -503,6 +543,7 @@ fn create_session(
         summary: None,
         summary_updated_at: None,
         transcription_words: None,
+        notes_enabled: true,
     };
     state
         .db()?
@@ -535,8 +576,33 @@ fn rename_session(
 ) -> Result<(), String> {
     rename_session_impl(&state, &id, &title)
 }
+fn set_notes_enabled_impl(state: &AppState, id: &str, enabled: bool) -> Result<(), String> {
+    let updated = state
+        .db()?
+        .execute(
+            "UPDATE sessions SET notes_enabled=? WHERE id=?",
+            params![enabled, id],
+        )
+        .map_err(|e| e.to_string())?;
+    if updated == 0 {
+        return Err("找不到会话。".into());
+    }
+    if !enabled {
+        stop_notes_for_session(state, id);
+    }
+    Ok(())
+}
+#[tauri::command]
+fn set_notes_enabled(
+    id: String,
+    enabled: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    set_notes_enabled_impl(&state, &id, enabled)
+}
 #[tauri::command]
 fn delete_session(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    stop_notes_for_session(&state, &id);
     state
         .db()?
         .execute("DELETE FROM sessions WHERE id=?", [id])
@@ -552,12 +618,13 @@ fn save_session_with(session: Session, state: &AppState) -> Result<(), String> {
     let tx = db.transaction().map_err(|e| e.to_string())?;
     let updated = tx
         .execute(
-            "UPDATE sessions SET title=?,transcription=?,summary=?,summary_updated_at=? WHERE id=?",
+            "UPDATE sessions SET title=?,transcription=?,summary=?,summary_updated_at=?,notes_enabled=? WHERE id=?",
             params![
                 session.title,
                 session.transcription,
                 session.summary,
                 session.summary_updated_at,
+                session.notes_enabled,
                 session.id
             ],
         )
@@ -762,14 +829,41 @@ fn persist_message(
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())
 }
-fn generation_token(state: &AppState, session_id: &str) -> Result<CancellationToken, String> {
-    let mut active = state.cancellations.lock().map_err(|_| "生成状态不可用。")?;
-    if active.contains_key(session_id) {
-        return Err("该会话已有生成任务。".into());
+fn reserve_token(
+    map: &Mutex<HashMap<String, CancellationToken>>,
+    key: &str,
+    busy_message: &str,
+) -> Result<CancellationToken, String> {
+    let mut active = map.lock().map_err(|_| "生成状态不可用。")?;
+    if active.contains_key(key) {
+        return Err(busy_message.into());
     }
     let token = CancellationToken::new();
-    active.insert(session_id.into(), token.clone());
+    active.insert(key.into(), token.clone());
     Ok(token)
+}
+fn generation_token(state: &AppState, session_id: &str) -> Result<CancellationToken, String> {
+    reserve_token(&state.cancellations, session_id, "该会话已有生成任务。")
+}
+// Its own map, distinct from `cancellations`: a background notes job must
+// never reserve the same slot chat needs, or it would block the user from
+// chatting in the session they are recording.
+fn notes_generation_token(state: &AppState, session_id: &str) -> Result<CancellationToken, String> {
+    reserve_token(
+        &state.notes_cancellations,
+        session_id,
+        "该会话已有笔记生成任务。",
+    )
+}
+fn stop_notes_for_session(state: &AppState, session_id: &str) {
+    if let Ok(mut jobs) = state.notes.lock() {
+        jobs.remove(session_id);
+    }
+    if let Ok(mut tokens) = state.notes_cancellations.lock() {
+        if let Some(token) = tokens.remove(session_id) {
+            token.cancel();
+        }
+    }
 }
 async fn streamed_completion(
     state: &AppState,
@@ -879,6 +973,10 @@ async fn summarize(
     on_event: Channel<StreamEvent>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    // The explicit button always wins: cancel any in-flight or pending
+    // background notes round first, since both write the same summary
+    // column and must never race each other.
+    stop_notes_for_session(&state, &session_id);
     let (session, materials, _) = session_context(&state, &session_id)?;
     let mut source = session
         .messages
@@ -908,15 +1006,199 @@ async fn summarize(
         .map_err(|_| "生成状态不可用。")?
         .remove(&session_id);
     let (summary, _) = result?;
+    persist_notes(&state, &session_id, &summary)
+}
+fn persist_notes(state: &AppState, session_id: &str, notes: &str) -> Result<(), String> {
     let updated_at = chrono::Utc::now().to_rfc3339();
     state
         .db()?
         .execute(
             "UPDATE sessions SET summary=?,summary_updated_at=? WHERE id=?",
-            params![summary, updated_at, session_id],
+            params![notes, updated_at, session_id],
         )
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// True once at least one enabled, healthy credential can serve the
+/// configured provider/model; lets the background notes job skip a doomed
+/// model call instead of erroring on every threshold crossing.
+fn provider_ready(state: &AppState, settings: &Settings) -> bool {
+    if settings.model.trim().is_empty() {
+        return false;
+    }
+    connections::candidates(state, &settings.provider_id, &settings.model)
+        .map(|items| !items.is_empty())
+        .unwrap_or(false)
+}
+/// Pure trigger rule shared by production and tests: once the transcript has
+/// grown by NOTES_THRESHOLD_CHARS past `cursor`, returns the chunk to send
+/// (carrying NOTES_OVERLAP_CHARS of context from before the boundary) plus the
+/// new cursor, or None when there isn't enough new transcript yet.
+fn next_notes_chunk(transcript: &str, cursor: usize) -> Option<(String, usize)> {
+    let len = transcript.len();
+    if len <= cursor || len - cursor < NOTES_THRESHOLD_CHARS {
+        return None;
+    }
+    let start = transcript.floor_char_boundary(cursor.saturating_sub(NOTES_OVERLAP_CHARS));
+    let new_cursor = transcript.floor_char_boundary(len.saturating_sub(NOTES_OVERLAP_CHARS));
+    Some((transcript[start..].to_string(), new_cursor))
+}
+async fn generate_notes_impl(
+    state: &AppState,
+    session_id: &str,
+    chunk: &str,
+    on_event: Channel<StreamEvent>,
+) -> Result<(), String> {
+    let (session, _, _) = session_context(state, session_id)?;
+    let token = notes_generation_token(state, session_id)?;
+    let mut user_content = String::new();
+    if let Some(existing) = session.summary.as_deref().filter(|s| !s.trim().is_empty()) {
+        user_content.push_str("Notes so far:\n");
+        user_content.push_str(existing);
+        user_content.push_str("\n\n");
+    }
+    user_content.push_str("New transcript excerpt since the last update:\n");
+    user_content.push_str(&limit(chunk.to_owned()));
+    let messages = vec![
+        json!({"role":"system","content":"You maintain structured Markdown lecture notes for a class transcript that is still being recorded live. You are given the notes written so far (if any) and a new transcript excerpt. Reply with the complete, updated notes in well-structured Markdown, folding the new excerpt in rather than just appending it, and without mentioning that this is an update."}),
+        json!({"role":"user","content":user_content}),
+    ];
+    let result = streamed_completion(state, session_id, messages, None, on_event, token).await;
+    state
+        .notes_cancellations
+        .lock()
+        .map_err(|_| "笔记生成状态不可用。")?
+        .remove(session_id);
+    let (notes, _) = result?;
+    persist_notes(state, session_id, &notes)
+}
+/// Fires once per notes round so the caller can push a "notes-status" event
+/// to the frontend without polling the database.
+enum NotesEvent {
+    NeedsProvider,
+    Started,
+    Finished {
+        summary: Option<String>,
+        summary_updated_at: Option<String>,
+        error: Option<String>,
+    },
+}
+/// Drives the background notes job for one session after new transcript has
+/// been appended: coalesces (a job already running, or chat/explicit-summarize
+/// holding the generation slot, just marks growth pending for the next append
+/// to retry) and never reserves `cancellations` (chat's own map), so at most
+/// one notes request is ever in flight and chat is never blocked by it.
+async fn on_transcript_appended(
+    state: &AppState,
+    session_id: &str,
+    on_event: &(impl Fn(NotesEvent) + Send + Sync),
+) {
+    loop {
+        let (session, _, settings) = match session_context(state, session_id) {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        if !session.notes_enabled {
+            return;
+        }
+        if !provider_ready(state, &settings) {
+            on_event(NotesEvent::NeedsProvider);
+            return;
+        }
+        let transcript = session.transcription.unwrap_or_default();
+        let chunk = {
+            let Ok(mut jobs) = state.notes.lock() else {
+                return;
+            };
+            let entry = jobs.entry(session_id.to_string()).or_default();
+            if entry.running {
+                entry.pending = true;
+                return;
+            }
+            match next_notes_chunk(&transcript, entry.cursor) {
+                Some((chunk, new_cursor)) => {
+                    // Defer to chat/explicit-summarize instead of racing them
+                    // over the shared summary column; retried on the next
+                    // transcript append.
+                    let busy = state
+                        .cancellations
+                        .lock()
+                        .map(|active| active.contains_key(session_id))
+                        .unwrap_or(false);
+                    if busy {
+                        entry.pending = true;
+                        return;
+                    }
+                    entry.running = true;
+                    entry.pending = false;
+                    entry.cursor = new_cursor;
+                    chunk
+                }
+                None => return,
+            }
+        };
+        on_event(NotesEvent::Started);
+        let channel = Channel::<StreamEvent>::new(|_| Ok(()));
+        let result = generate_notes_impl(state, session_id, &chunk, channel).await;
+        let finished = match result {
+            Ok(()) => {
+                let (session, _, _) = match session_context(state, session_id) {
+                    Ok(value) => value,
+                    // Session was deleted while the job ran; nothing left to report.
+                    Err(_) => return,
+                };
+                NotesEvent::Finished {
+                    summary: session.summary,
+                    summary_updated_at: session.summary_updated_at,
+                    error: None,
+                }
+            }
+            Err(error) => NotesEvent::Finished {
+                summary: None,
+                summary_updated_at: None,
+                error: Some(error),
+            },
+        };
+        on_event(finished);
+        let rerun = {
+            let Ok(mut jobs) = state.notes.lock() else {
+                return;
+            };
+            match jobs.get_mut(session_id) {
+                // Removed means recording stopped, notes were disabled, the
+                // session was deleted, or an explicit summarize preempted
+                // this job while it ran; never start another round for it.
+                None => false,
+                Some(entry) => {
+                    entry.running = false;
+                    std::mem::take(&mut entry.pending)
+                }
+            }
+        };
+        if !rerun {
+            return;
+        }
+    }
+}
+/// Turns one `NotesEvent` into a "notes-status" event the frontend listens
+/// for, so it can update the summary panel without polling.
+fn emit_notes_event(app: &tauri::AppHandle, session_id: &str, event: NotesEvent) {
+    let payload = match event {
+        NotesEvent::NeedsProvider => json!({"sessionId": session_id, "status": "needs-provider"}),
+        NotesEvent::Started => json!({"sessionId": session_id, "status": "generating"}),
+        NotesEvent::Finished {
+            summary,
+            summary_updated_at,
+            error,
+        } => json!({
+            "sessionId": session_id,
+            "status": if error.is_some() { "error" } else { "idle" },
+            "summary": summary,
+            "summaryUpdatedAt": summary_updated_at,
+        }),
+    };
+    let _ = app.emit("notes-status", payload);
 }
 
 #[tauri::command]
@@ -1087,6 +1369,7 @@ async fn read_audio_file(path: String) -> Result<tauri::ipc::Response, String> {
 
 #[tauri::command]
 async fn start_recording(
+    app: tauri::AppHandle,
     session_id: String,
     on_event: Channel<RecordingEvent>,
     source: recording::RecordingSource,
@@ -1107,6 +1390,7 @@ async fn start_recording(
     let database = state.db_path.clone();
     let active_session = session_id.clone();
     let channel = on_event.clone();
+    let notes_app = app.clone();
     let on_transcript = std::sync::Arc::new(move |segment: String| {
         let text = append_transcription_at(&database, &active_session, &segment)?;
         channel
@@ -1114,7 +1398,24 @@ async fn start_recording(
                 session_id: active_session.clone(),
                 text,
             })
-            .map_err(|_| "转写状态通道已关闭。".into())
+            // A `?` mid-closure needs a concrete error type before it can convert;
+            // an unannotated `.into()` here leaves that type ambiguous.
+            .map_err(|_| "转写状态通道已关闭。".to_string())?;
+        // Fire-and-forget: the recording worker thread must never block on a
+        // network call, and this spawned task never touches the synchronous
+        // callback path again.
+        let app = notes_app.clone();
+        let sid = active_session.clone();
+        tauri::async_runtime::spawn(async move {
+            let state = app.state::<AppState>();
+            let emit_app = app.clone();
+            let emit_sid = sid.clone();
+            on_transcript_appended(&state, &sid, &move |event| {
+                emit_notes_event(&emit_app, &emit_sid, event)
+            })
+            .await;
+        });
+        Ok(())
     });
     let error_session = session_id.clone();
     let error_channel = on_event.clone();
@@ -1162,6 +1463,10 @@ async fn stop_recording(
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
     let path = state.recording.stop(&session_id).await?;
+    // Recording has stopped, so no more transcript will arrive to fold in;
+    // cancel any in-flight or pending background notes job for this session
+    // rather than let it write a note after the fact.
+    stop_notes_for_session(&state, &session_id);
     tokio::fs::remove_file(&path)
         .await
         .map_err(|_| "转写完成，但无法清理临时录音。")?;
@@ -1175,7 +1480,13 @@ async fn stop_recording(
         .map_err(|e| e.to_string())
 }
 #[tauri::command]
-async fn cancel_recording(state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn cancel_recording(
+    session_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    if let Some(session_id) = &session_id {
+        stop_notes_for_session(&state, session_id);
+    }
     state.recording.cancel().await
 }
 #[tauri::command]
@@ -1205,6 +1516,7 @@ pub fn run() {
             delete_workspace,
             create_session,
             rename_session,
+            set_notes_enabled,
             delete_session,
             save_session,
             import_material,

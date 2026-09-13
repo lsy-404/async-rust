@@ -95,6 +95,11 @@ export default {
     generating: "Generating summary…",
     empty: "No class summary yet.",
     updatedAt: "Updated: {time}",
+    autoToggle: "Auto-generate notes",
+    autoGenerating: "Auto-generating notes…",
+    autoNeedsProvider: "Connect a model to auto-generate notes",
+    autoError: "Auto-generated notes failed",
+    autoEmpty: "No class summary yet. Keep talking — notes generate in the background.",
   },
   transcript: {
     title: "Class transcript",

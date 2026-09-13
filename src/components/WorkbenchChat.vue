@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { ref } from "vue";
 import { i18n } from "../locales";
-import { FluentButton, FluentTextArea } from "@platform-kit/fluent/vue";
+import { FluentButton, FluentSwitch, FluentTextArea } from "@platform-kit/fluent/vue";
 import WorkbenchToolCallCard from "./WorkbenchToolCallCard.vue";
-import type { Message } from "../types";
+import type { Message, NotesStatus } from "../types";
 
 const { t, locale } = i18n.global;
 
@@ -21,11 +21,14 @@ defineProps<{
   summaryUpdatedLabel: string;
   sessionSummary: string | undefined;
   summaryHtml: string;
+  notesEnabled: boolean;
+  notesStatus: NotesStatus;
 }>();
 const emit = defineEmits<{
   "update:activeTab": [value: "chat" | "summary"];
   "update:draft": [value: string];
   "update:editDraft": [value: string];
+  "update:notesEnabled": [value: boolean];
   "content-click": [event: MouseEvent];
   "copy-message": [content: string];
   "start-edit-message": [id: string, content: string];
@@ -268,6 +271,24 @@ function handleUncertainAsk() {
           }}</FluentButton
         >
       </header>
+      <div class="summary-auto-row">
+        <FluentSwitch
+          :model-value="notesEnabled"
+          :label="t('summary.autoToggle')"
+          @update:model-value="emit('update:notesEnabled', $event)"
+        />
+        <span v-if="notesEnabled" class="summary-auto-status">
+          <template v-if="notesStatus === 'generating'"
+            ><span class="spinner"></span>
+            {{ t("summary.autoGenerating") }}</template
+          ><template v-else-if="notesStatus === 'needs-provider'">{{
+            t("summary.autoNeedsProvider")
+          }}</template
+          ><template v-else-if="notesStatus === 'error'">{{
+            t("summary.autoError")
+          }}</template>
+        </span>
+      </div>
       <p v-if="summaryUpdatedLabel" class="summary-meta">
         {{ t("summary.updatedAt", { time: summaryUpdatedLabel }) }}
       </p>
@@ -281,7 +302,11 @@ function handleUncertainAsk() {
         @click="emit('content-click', $event)"
       ></div>
       <div v-else class="empty">
-        {{ t("summary.empty") }}
+        {{
+          notesEnabled && notesStatus !== "needs-provider"
+            ? t("summary.autoEmpty")
+            : t("summary.empty")
+        }}
       </div>
     </section>
   </section>

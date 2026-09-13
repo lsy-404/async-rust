@@ -683,6 +683,19 @@ textarea {
   margin: -12px 0 16px;
   font-size: 11px;
 }
+.summary-auto-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.summary-auto-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--fluent-muted);
+}
 .resize-handle {
   position: relative;
   cursor: col-resize;

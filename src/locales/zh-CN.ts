@@ -93,6 +93,11 @@ export default {
     generating: "正在生成摘要…",
     empty: "还没有课堂摘要。",
     updatedAt: "更新时间：{time}",
+    autoToggle: "自动生成笔记",
+    autoGenerating: "正在自动生成笔记…",
+    autoNeedsProvider: "连接模型后可自动生成笔记",
+    autoError: "自动生成笔记失败",
+    autoEmpty: "还没有课堂摘要。继续说话，我们会在后台自动生成。",
   },
   transcript: {
     title: "课堂转写",

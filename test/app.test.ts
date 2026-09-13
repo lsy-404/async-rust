@@ -5,7 +5,10 @@ import App from "../src/App.vue";
 import ModelConnections from "../src/components/ModelConnections.vue";
 import type { AppData } from "../src/types";
 
-const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
+const { invoke, listen } = vi.hoisted(() => ({
+  invoke: vi.fn(),
+  listen: vi.fn(),
+}));
 vi.mock("@tauri-apps/api/core", () => ({
   invoke,
   Channel: class {
@@ -13,6 +16,7 @@ vi.mock("@tauri-apps/api/core", () => ({
   },
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
+vi.mock("@tauri-apps/api/event", () => ({ listen }));
 const state = (): AppData => ({
   workspaces: [
     { id: "w1", name: "Class A" },
@@ -85,6 +89,8 @@ describe("desktop workbench interactions", () => {
   beforeEach(() => {
     data = state();
     invoke.mockReset();
+    listen.mockReset();
+    listen.mockResolvedValue(() => {});
     invoke.mockImplementation(
       async (command: string, args?: Record<string, unknown>) => {
         if (command === "load_state") return structuredClone(data);
@@ -313,10 +319,55 @@ describe("desktop workbench interactions", () => {
     });
     await flushPromises();
     expect(wrapper.text()).toContain("音频处理队列已满");
-    expect(invoke).toHaveBeenCalledWith("cancel_recording");
+    expect(invoke).toHaveBeenCalledWith("cancel_recording", { sessionId: "s1" });
     expect(
       buttonWithText(wrapper, "开始录音").attributes("disabled"),
     ).toBeUndefined();
+    wrapper.unmount();
+  });
+
+  it("shows the auto-notes toggle on by default and can turn it off", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await buttonWithText(wrapper, "摘要").trigger("click");
+    await nextTick();
+    const toggle = wrapper.find('button[role="switch"]');
+    expect(toggle.exists()).toBe(true);
+    expect(toggle.attributes("aria-checked")).toBe("true");
+
+    await toggle.trigger("click");
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("set_notes_enabled", {
+      id: "s1",
+      enabled: false,
+    });
+    expect(toggle.attributes("aria-checked")).toBe("false");
+    wrapper.unmount();
+  });
+
+  it("reflects background notes status pushed through the notes-status event", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await buttonWithText(wrapper, "摘要").trigger("click");
+    await nextTick();
+    const handler = listen.mock.calls.find(
+      ([name]) => name === "notes-status",
+    )![1];
+
+    handler({ payload: { sessionId: "s1", status: "generating" } });
+    await nextTick();
+    expect(wrapper.text()).toContain("正在自动生成笔记");
+
+    handler({
+      payload: {
+        sessionId: "s1",
+        status: "idle",
+        summary: "自动生成的课堂笔记。",
+        summaryUpdatedAt: "2024-03-05T10:00:00.000Z",
+      },
+    });
+    await nextTick();
+    expect(wrapper.text()).toContain("自动生成的课堂笔记。");
     wrapper.unmount();
   });
 });

@@ -12,6 +12,7 @@ import MarkdownIt from "markdown-it";
 import texmath from "markdown-it-texmath";
 import katex from "katex";
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import ModelConnections from "./components/ModelConnections.vue";
 import AppSidebar from "./components/AppSidebar.vue";
@@ -32,6 +33,8 @@ import type {
   AppData,
   CaptureMode,
   Material,
+  NotesStatus,
+  NotesStatusEvent,
   RecordingSource,
   Session,
   Settings,
@@ -94,6 +97,10 @@ const loading = ref(true);
 const streaming = ref(false);
 const summaryLoading = ref(false);
 const summaryStream = ref("");
+// Pushed by the backend's background notes job, keyed by session id; absent
+// means no background round has reported in for that session yet.
+const notesStatusBySession = reactive<Record<string, NotesStatus>>({});
+let unlistenNotesStatus: UnlistenFn | undefined;
 const transcriptionLoading = ref(false);
 const stt = ref<SttStatus>({
   ready: false,
@@ -234,6 +241,26 @@ const renderedMessages = computed(
 const summaryHtml = computed(() =>
   md.render(summaryStream.value || session.value?.summary || ""),
 );
+const notesEnabled = computed(() => session.value?.notesEnabled ?? true);
+const providerConnected = computed(() =>
+  Boolean(currentProvider.value?.hasKey && data.value.settings.model),
+);
+const notesStatus = computed<NotesStatus>(() => {
+  if (!notesEnabled.value) return "idle";
+  if (!providerConnected.value) return "needs-provider";
+  return notesStatusBySession[session.value?.id ?? ""] ?? "idle";
+});
+async function toggleNotesEnabled(enabled: boolean) {
+  if (!session.value) return;
+  const target = session.value;
+  target.notesEnabled = enabled;
+  try {
+    await invoke("set_notes_enabled", { id: target.id, enabled });
+  } catch (cause) {
+    target.notesEnabled = !enabled;
+    report(cause);
+  }
+}
 const summaryUpdatedLabel = computed(() => {
   const iso = session.value?.summaryUpdatedAt;
   if (!iso) return "";
@@ -886,7 +913,7 @@ async function toggleRecording() {
       recordingSessionId.value = "";
       recordingGeneration += 1;
       recordingLevel.value = 0;
-      void invoke("cancel_recording").catch(report);
+      void invoke("cancel_recording", { sessionId }).catch(report);
       return;
     }
     if (event.type === "level") {
@@ -1041,14 +1068,33 @@ onMounted(() => {
   window.addEventListener("click", handleWindowClick);
   window.addEventListener("keydown", handleWindowKeydown);
   window.addEventListener("scroll", handleWindowScroll, true);
+  listen<NotesStatusEvent>("notes-status", (event) => {
+    const payload = event.payload;
+    notesStatusBySession[payload.sessionId] = payload.status;
+    if (payload.status !== "idle" && payload.status !== "error") return;
+    const target = data.value.sessions.find(
+      (item) => item.id === payload.sessionId,
+    );
+    if (target && payload.summary !== undefined) {
+      target.summary = payload.summary ?? undefined;
+      target.summaryUpdatedAt = payload.summaryUpdatedAt ?? undefined;
+    }
+  })
+    .then((unlisten) => {
+      unlistenNotesStatus = unlisten;
+    })
+    .catch(() => {});
 });
 onUnmounted(() => {
   window.removeEventListener("click", handleWindowClick);
   window.removeEventListener("keydown", handleWindowKeydown);
   window.removeEventListener("scroll", handleWindowScroll, true);
+  unlistenNotesStatus?.();
   recordingGeneration += 1;
   if (recording.value || recordingStarting.value)
-    void invoke("cancel_recording").catch(() => undefined);
+    void invoke("cancel_recording", { sessionId: recordingSessionId.value }).catch(
+      () => undefined,
+    );
   revokeImportedAudio();
 });
 </script>
@@ -1196,7 +1242,10 @@ onUnmounted(() => {
               :summary-updated-label="summaryUpdatedLabel"
               :session-summary="session.summary"
               :summary-html="summaryHtml"
+              :notes-enabled="notesEnabled"
+              :notes-status="notesStatus"
               @content-click="handleContentClick"
+              @update:notes-enabled="toggleNotesEnabled"
               @copy-message="copyMessage"
               @start-edit-message="startEditMessage"
               @cancel-edit-message="cancelEditMessage"
