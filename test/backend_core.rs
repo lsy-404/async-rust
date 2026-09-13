@@ -567,7 +567,9 @@ fn stop_notes_for_session_cancels_the_token_and_clears_tracking() {
     assert!(token.is_cancelled());
     {
         let jobs = state.notes.lock().unwrap();
-        let entry = jobs.get("s").expect("stop marks the tracker, not removes it");
+        let entry = jobs
+            .get("s")
+            .expect("stop marks the tracker, not removes it");
         assert!(entry.stopped);
         assert!(!entry.running);
         assert!(!entry.pending);

@@ -576,10 +576,7 @@ fn rename_workspace_impl(state: &AppState, id: &str, name: &str) -> Result<(), S
     }
     let updated = state
         .db()?
-        .execute(
-            "UPDATE workspaces SET name=? WHERE id=?",
-            params![name, id],
-        )
+        .execute("UPDATE workspaces SET name=? WHERE id=?", params![name, id])
         .map_err(|e| e.to_string())?;
     if updated == 0 {
         return Err("找不到工作区。".into());

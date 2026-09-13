@@ -167,7 +167,8 @@ fn cjk_ratio(text: &str) -> (f32, usize) {
 // auto-detected CJK output as Chinese, since a Traditional-to-Simplified table
 // would corrupt Japanese kanji.
 fn contains_kana(text: &str) -> bool {
-    text.chars().any(|ch| ('\u{3040}'..='\u{30FF}').contains(&ch))
+    text.chars()
+        .any(|ch| ('\u{3040}'..='\u{30FF}').contains(&ch))
 }
 
 // A recognizer VAD segment is often a single short phrase, and a kanji-heavy

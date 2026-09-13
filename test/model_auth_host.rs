@@ -281,12 +281,7 @@ async fn tool_call_arguments_accumulate_across_streamed_chunks_before_the_tool_r
         .unwrap()
         .execute(
             "INSERT INTO materials(id,workspace_id,name,content) VALUES(?,?,?,?)",
-            params![
-                "m1",
-                "ws-accum",
-                "notes.txt",
-                "Algebra is fun and useful."
-            ],
+            params!["m1", "ws-accum", "notes.txt", "Algebra is fun and useful."],
         )
         .unwrap();
     let cred = Credential::new("custom", "api-key", "Key".into(), vec!["model".into()]);
@@ -301,7 +296,12 @@ async fn tool_call_arguments_accumulate_across_streamed_chunks_before_the_tool_r
                 // The id and the function name arrive once; the JSON arguments are
                 // split across two separate chunks and must be concatenated in order.
                 sse_body(&[
-                    tool_call_chunk(0, Some("call_abc"), Some("search_local_materials"), "{\"que"),
+                    tool_call_chunk(
+                        0,
+                        Some("call_abc"),
+                        Some("search_local_materials"),
+                        "{\"que",
+                    ),
                     tool_call_chunk(0, None, None, "ry\":\"algebra\"}"),
                 ])
             } else {
@@ -372,8 +372,10 @@ async fn provider_without_tool_support_falls_back_and_still_completes_the_turn()
             if body.get("tools").is_some() {
                 ResponseTemplate::new(400)
             } else {
-                ResponseTemplate::new(200)
-                    .set_body_raw(sse_body(&[content_chunk("plain answer")]), "text/event-stream")
+                ResponseTemplate::new(200).set_body_raw(
+                    sse_body(&[content_chunk("plain answer")]),
+                    "text/event-stream",
+                )
             }
         })
         .expect(2)
@@ -613,7 +615,12 @@ fn search_local_finds_real_rows_from_materials_and_session_transcripts() {
     // A matching row that belongs to a different workspace must never leak in.
     db.execute(
         "INSERT INTO materials(id,workspace_id,name,content) VALUES(?,?,?,?)",
-        params!["m2", "ws-other", "other.txt", "mitochondria appears here too"],
+        params![
+            "m2",
+            "ws-other",
+            "other.txt",
+            "mitochondria appears here too"
+        ],
     )
     .unwrap();
     drop(db);
@@ -666,12 +673,7 @@ fn like_escaping_prevents_percent_and_underscore_from_matching_everything() {
         .unwrap()
         .execute(
             "INSERT INTO materials(id,workspace_id,name,content) VALUES(?,?,?,?)",
-            params![
-                "m3",
-                "ws-escape",
-                "promo.txt",
-                "Save 100%_off today only."
-            ],
+            params!["m3", "ws-escape", "promo.txt", "Save 100%_off today only."],
         )
         .unwrap();
     // A query that legitimately contains those characters must still find the

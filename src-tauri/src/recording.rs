@@ -508,7 +508,8 @@ where
 {
     build_capture_stream::<T>(device, config, sender, failure).map_err(|e| {
         if e.kind() == cpal::ErrorKind::PermissionDenied {
-            "系统音频权限被拒绝。请在系统设置的隐私与安全性中允许 Async 录制系统音频，然后重试。".into()
+            "系统音频权限被拒绝。请在系统设置的隐私与安全性中允许 Async 录制系统音频，然后重试。"
+                .into()
         } else {
             format!("无法开启系统音频采集，请检查权限和设备：{e}")
         }

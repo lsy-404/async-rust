@@ -459,9 +459,8 @@ fn actual_live_pipeline_cancel_mid_stream_stops_cleanly_and_persists_nothing() {
         }),
     );
     let worker_canceled = canceled.clone();
-    let worker = thread::spawn(move || {
-        transcription_worker(&mut live, receiver, callback, worker_canceled)
-    });
+    let worker =
+        thread::spawn(move || transcription_worker(&mut live, receiver, callback, worker_canceled));
 
     let chunk_duration = Duration::from_secs_f32(CHUNK_FRAMES as f32 / rate as f32);
     // Cut off once a real segment has actually been persisted, rather than at a

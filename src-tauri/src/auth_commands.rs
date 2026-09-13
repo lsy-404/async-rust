@@ -34,7 +34,10 @@ struct PendingToolCall {
 }
 enum RoundOutcome {
     Answer(String),
-    ToolCalls { text: String, calls: Vec<PendingToolCall> },
+    ToolCalls {
+        text: String,
+        calls: Vec<PendingToolCall>,
+    },
 }
 // Bundles the per-credential request context so the streaming helpers stay
 // under clippy's argument-count lint instead of growing a parameter each.
@@ -680,7 +683,15 @@ async fn stream_with(
                     model,
                     cancel: cancel.clone(),
                 };
-                api_stream(state, &req, tool_workspace_id, &messages, delta, &tool_guard).await
+                api_stream(
+                    state,
+                    &req,
+                    tool_workspace_id,
+                    &messages,
+                    delta,
+                    &tool_guard,
+                )
+                .await
             }
         }
         .await;
@@ -734,8 +745,15 @@ async fn api_stream(
         let tools = allow_tools.then(retrieval_tool_schema);
         let round_id = format!("{attempt_token}_{attempt}");
         let mut round_sent_tools = tools.is_some();
-        let round = api_stream_round(state, req, &working, tools.as_ref(), &track_delta, &round_id)
-            .await;
+        let round = api_stream_round(
+            state,
+            req,
+            &working,
+            tools.as_ref(),
+            &track_delta,
+            &round_id,
+        )
+        .await;
         let outcome = match round {
             Ok(outcome) => outcome,
             // A provider that rejects the tools array fails the request outright
@@ -829,7 +847,11 @@ fn retrieval_tool_schema() -> Value {
         },
     }])
 }
-fn run_tool(state: &AppState, workspace_id: &str, call: &PendingToolCall) -> Result<String, String> {
+fn run_tool(
+    state: &AppState,
+    workspace_id: &str,
+    call: &PendingToolCall,
+) -> Result<String, String> {
     if call.name != RETRIEVAL_TOOL_NAME {
         return Err(format!("未知工具：{}。", call.name));
     }
@@ -881,9 +903,10 @@ fn search_local(state: &AppState, workspace_id: &str, query: &str) -> Result<Str
         .prepare("SELECT name,content FROM materials WHERE workspace_id=?1 AND (name LIKE ?2 ESCAPE '\\' OR content LIKE ?2 ESCAPE '\\') ORDER BY rowid LIMIT ?3")
         .map_err(|e| e.to_string())?;
     let materials = materials_stmt
-        .query_map(params![workspace_id, pattern, RETRIEVAL_RESULT_LIMIT], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
+        .query_map(
+            params![workspace_id, pattern, RETRIEVAL_RESULT_LIMIT],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
@@ -894,9 +917,10 @@ fn search_local(state: &AppState, workspace_id: &str, query: &str) -> Result<Str
         .prepare("SELECT title,transcription FROM sessions WHERE workspace_id=?1 AND transcription LIKE ?2 ESCAPE '\\' ORDER BY rowid LIMIT ?3")
         .map_err(|e| e.to_string())?;
     let sessions = sessions_stmt
-        .query_map(params![workspace_id, pattern, RETRIEVAL_RESULT_LIMIT], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
+        .query_map(
+            params![workspace_id, pattern, RETRIEVAL_RESULT_LIMIT],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
@@ -907,7 +931,9 @@ fn search_local(state: &AppState, workspace_id: &str, query: &str) -> Result<Str
         ));
     }
     if results.is_empty() {
-        return Ok(format!("No local materials or session transcripts matched \"{query}\"."));
+        return Ok(format!(
+            "No local materials or session transcripts matched \"{query}\"."
+        ));
     }
     Ok(results.join("\n\n"))
 }
@@ -1003,8 +1029,7 @@ async fn api_stream_round(
                         if let Some(name) = function.get("name").and_then(Value::as_str) {
                             entry.name.push_str(name);
                         }
-                        if let Some(arguments) = function.get("arguments").and_then(Value::as_str)
-                        {
+                        if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
                             entry.arguments.push_str(arguments);
                         }
                     }

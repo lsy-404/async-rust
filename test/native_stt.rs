@@ -638,7 +638,9 @@ fn chinese_script_normalization_converts_traditional_to_simplified_when_requeste
 fn chinese_script_normalization_converts_auto_detected_chinese_too() {
     let traditional = "今天天氣非常好，謝謝大家認真聽講。";
     let normalized = normalize_chinese_script(traditional, "");
-    assert!(normalized.contains("天气") && normalized.contains("谢谢") && normalized.contains("认真"));
+    assert!(
+        normalized.contains("天气") && normalized.contains("谢谢") && normalized.contains("认真")
+    );
 }
 
 #[test]
@@ -667,10 +669,7 @@ fn chinese_script_normalization_leaves_a_short_kanji_only_auto_detected_segment_
 
 #[test]
 fn chinese_script_normalization_leaves_english_and_other_languages_untouched() {
-    assert_eq!(
-        normalize_chinese_script("hello world", ""),
-        "hello world"
-    );
+    assert_eq!(normalize_chinese_script("hello world", ""), "hello world");
     assert_eq!(
         normalize_chinese_script("這是繁體字測試", "en"),
         "這是繁體字測試"
