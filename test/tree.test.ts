@@ -3,6 +3,7 @@ import type { Node } from "../src/types";
 import {
   flattenVisible,
   isValidMoveTarget,
+  moveDestinations,
   nextFocusAfterDelete,
   resolveCreateTarget,
   subtreeCounts,
@@ -69,6 +70,26 @@ describe("isValidMoveTarget", () => {
   });
   it("refuses an unknown dragged id", () => {
     expect(isValidMoveTarget(nodes, "missing", "f1")).toBe(false);
+  });
+});
+
+describe("moveDestinations", () => {
+  it("offers root plus every unrelated folder, labelled by full path, excluding the current parent", () => {
+    expect(moveDestinations(nodes, "s1", "(Root)")).toEqual([
+      { parentId: null, label: "(Root)" },
+      { parentId: "f2", label: "Folder A / Nested" },
+    ]);
+  });
+  it("excludes root when the node is already there, and excludes the node's own subtree", () => {
+    // f1 is already at root (no root option), and f2 is inside f1's own
+    // subtree (a cycle), so nothing is offered.
+    expect(moveDestinations(nodes, "f1", "(Root)")).toEqual([]);
+  });
+  it("excludes root for a node already at root, but still offers every folder", () => {
+    expect(moveDestinations(nodes, "s3", "(Root)")).toEqual([
+      { parentId: "f1", label: "Folder A" },
+      { parentId: "f2", label: "Folder A / Nested" },
+    ]);
   });
 });
 

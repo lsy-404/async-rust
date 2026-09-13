@@ -326,7 +326,7 @@ describe("explorer node actions", () => {
     expect(menuItemTexts(wrapper)).toEqual(["新建会话", "新建文件夹", "导入材料…"]);
   });
 
-  it("shows New/Import plus Rename and Delete on a folder, no Open", async () => {
+  it("shows New/Import plus Move to/Rename and Delete on a folder, no Open", async () => {
     const wrapper = mountApp();
     await flushPromises();
     await treeRow(wrapper, ".tree-folder", "Folder A").trigger("contextmenu");
@@ -334,18 +334,57 @@ describe("explorer node actions", () => {
       "新建会话",
       "新建文件夹",
       "导入材料…",
+      "移动到…",
       "重命名",
       "删除",
     ]);
   });
 
-  it("shows only Open, Rename and Delete on a session or material", async () => {
+  it("shows only Open, Move to, Rename and Delete on a session or material", async () => {
     const wrapper = mountApp();
     await flushPromises();
     await treeRow(wrapper, ".tree-session", "Session One").trigger("contextmenu");
-    expect(menuItemTexts(wrapper)).toEqual(["打开", "重命名", "删除"]);
+    expect(menuItemTexts(wrapper)).toEqual(["打开", "移动到…", "重命名", "删除"]);
     await treeRow(wrapper, ".tree-material", "Notes.md").trigger("contextmenu");
-    expect(menuItemTexts(wrapper)).toEqual(["打开", "重命名", "删除"]);
+    expect(menuItemTexts(wrapper)).toEqual(["打开", "移动到…", "重命名", "删除"]);
+  });
+
+  it("opens the Move to dialog with valid destinations and moves the node on confirm", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await treeRow(wrapper, ".tree-session", "Session One").trigger("contextmenu");
+    await clickMenuItem(wrapper, "移动到…");
+    const dialog = wrapper.get(".dialog-stub");
+    const select = dialog.get("select");
+    // Session One's parent is Folder A: root is offered, Folder A itself
+    // (the current, no-op parent) is not, and Nested (unrelated) is.
+    expect(select.findAll("option").map((option) => option.text())).toEqual([
+      "（根目录）",
+      "Folder A / Nested",
+    ]);
+    await select.setValue("f2");
+    await buttonWithText(wrapper, "移动").trigger("click");
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("move_node", { id: "s1", parentId: "f2" });
+    expect(wrapper.find(".dialog-stub").exists()).toBe(false);
+  });
+
+  it("disables the Move confirm button until a destination is selected", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await treeRow(wrapper, ".tree-session", "Session One").trigger("contextmenu");
+    await clickMenuItem(wrapper, "移动到…");
+    expect(buttonWithText(wrapper, "移动").attributes("disabled")).toBeDefined();
+  });
+
+  it("Cancel on the Move dialog invokes nothing", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await treeRow(wrapper, ".tree-session", "Session One").trigger("contextmenu");
+    await clickMenuItem(wrapper, "移动到…");
+    await buttonWithText(wrapper, "取消").trigger("click");
+    expect(wrapper.find(".dialog-stub").exists()).toBe(false);
+    expect(invoke).not.toHaveBeenCalledWith("move_node", expect.anything());
   });
 
   it("closes the context menu on Escape and on an outside click", async () => {

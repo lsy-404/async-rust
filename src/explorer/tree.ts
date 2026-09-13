@@ -126,6 +126,31 @@ export function isValidMoveTarget(
   return true;
 }
 
+export interface MoveDestination {
+  parentId: string | null;
+  label: string;
+}
+
+// The "Move to..." dialog's option list: root plus every folder, labelled by
+// its full path, excluding the node itself, anything in its own subtree (a
+// cycle - also rejected server-side) and its current parent (a no-op move).
+export function moveDestinations(
+  nodes: Node[],
+  id: string,
+  rootLabel: string,
+): MoveDestination[] {
+  const options: MoveDestination[] = [];
+  if (isValidMoveTarget(nodes, id, null)) {
+    options.push({ parentId: null, label: rootLabel });
+  }
+  for (const node of nodes) {
+    if (node.kind !== "folder") continue;
+    if (!isValidMoveTarget(nodes, id, node.id)) continue;
+    options.push({ parentId: node.id, label: pathLabel(nodes, node.id) });
+  }
+  return options;
+}
+
 // A folder resolves to that folder; a session or material resolves to its
 // parent; null (root focused or nothing focused) resolves to root.
 export function resolveCreateTarget(focused: Node | null): string | null {

@@ -39,6 +39,7 @@ const emit = defineEmits<{
   "commit-rename": [];
   "update:renameDraft": [value: string];
   "open-delete-dialog": [id: string];
+  "open-move-dialog": [id: string];
   "cancel-delete": [];
   "confirm-delete": [];
   "drag-start": [id: string];
@@ -244,6 +245,10 @@ function menuImport() {
 }
 function menuOpen() {
   if (contextNode.value) emit("open-node", contextNode.value.id);
+  closeMenu();
+}
+function menuMove() {
+  if (contextNode.value) emit("open-move-dialog", contextNode.value.id);
   closeMenu();
 }
 function menuRename() {
@@ -551,6 +556,9 @@ const deleteMessage = computed(() => {
           @click="menuOpen"
         >
           {{ t("explorer.open") }}
+        </button>
+        <button type="button" role="menuitem" @click="menuMove">
+          {{ t("explorer.moveTo") }}
         </button>
         <button type="button" role="menuitem" @click="menuRename">
           {{ t("explorer.rename") }}

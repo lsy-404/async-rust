@@ -17,6 +17,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import ModelConnections from "./components/ModelConnections.vue";
 import ActivityBar from "./components/ActivityBar.vue";
 import ExplorerView from "./components/ExplorerView.vue";
+import MoveNodeDialog from "./components/MoveNodeDialog.vue";
 import SearchView from "./components/SearchView.vue";
 import WorkbenchChat from "./components/WorkbenchChat.vue";
 import TranscriptPanel from "./components/TranscriptPanel.vue";
@@ -184,6 +185,7 @@ const createDraft = ref("");
 const renamingId = ref("");
 const renameDraft = ref("");
 const deleteTarget = ref<{ nodeId: string }>();
+const moveTarget = ref<{ nodeId: string }>();
 const dragNodeId = ref<string>();
 const dropParent = ref<string | null>();
 const activeView = ref<"explorer" | "search">("explorer");
@@ -629,20 +631,44 @@ function autoExpandFolder(id: string) {
   expandedFolders.value.add(id);
   schedulePersistExpandedFolders();
 }
+// Shared by drag-and-drop and the "Move to..." dialog: invoke move_node,
+// refresh, expand the destination folder and its ancestors, then focus and
+// scroll to the moved row.
+async function moveNodeAndFocus(id: string, parentId: string | null) {
+  await invoke("move_node", { id, parentId });
+  await refresh();
+  if (parentId) {
+    expandedFolders.value.add(parentId);
+    for (const ancestor of ancestorsOf(data.value.nodes, parentId)) {
+      expandedFolders.value.add(ancestor.id);
+    }
+  }
+  focusedNodeId.value = id;
+  await nextTick();
+  explorerViewRef.value?.scrollRowIntoView(id);
+}
 async function handleNodeDrop(payload: { id: string; parentId: string | null }) {
   if (operationBusy.value) return;
   try {
-    await invoke("move_node", { id: payload.id, parentId: payload.parentId });
-    await refresh();
-    if (payload.parentId) {
-      expandedFolders.value.add(payload.parentId);
-      for (const ancestor of ancestorsOf(data.value.nodes, payload.parentId)) {
-        expandedFolders.value.add(ancestor.id);
-      }
-    }
-    focusedNodeId.value = payload.id;
-    await nextTick();
-    explorerViewRef.value?.scrollRowIntoView(payload.id);
+    await moveNodeAndFocus(payload.id, payload.parentId);
+  } catch (cause) {
+    report(cause);
+  }
+}
+function openMoveDialog(id: string) {
+  if (operationBusy.value) return;
+  contextMenu.value = undefined;
+  moveTarget.value = { nodeId: id };
+}
+function cancelMove() {
+  moveTarget.value = undefined;
+}
+async function confirmMove(parentId: string | null) {
+  const target = moveTarget.value;
+  if (!target || operationBusy.value) return;
+  moveTarget.value = undefined;
+  try {
+    await moveNodeAndFocus(target.nodeId, parentId);
   } catch (cause) {
     report(cause);
   }
@@ -1500,6 +1526,7 @@ onUnmounted(() => {
           @open-delete-dialog="openDeleteDialog"
           @cancel-delete="cancelDelete"
           @confirm-delete="confirmDelete"
+          @open-move-dialog="openMoveDialog"
           @drag-start="handleDragStart"
           @drag-over="handleDragOver"
           @drag-leave="handleDragLeave"
@@ -1507,6 +1534,14 @@ onUnmounted(() => {
           @drop="handleNodeDrop"
           @auto-expand-folder="autoExpandFolder"
           @collapse-all="collapseAll"
+        />
+        <MoveNodeDialog
+          v-if="moveTarget"
+          :nodes="data.nodes"
+          :node-id="moveTarget.nodeId"
+          :operation-busy="operationBusy"
+          @cancel="cancelMove"
+          @confirm="confirmMove"
         />
         <SearchView
           v-if="sidebarOpen && activeView === 'search'"
