@@ -723,6 +723,17 @@ describe("explorer drag and drop", () => {
     expect(invoke).toHaveBeenCalledWith("move_node", { id: "s1", parentId: null });
   });
 
+  it("tints every row while dragging over the root blank area, like a folder target tints its descendants", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    const dataTransfer = fakeDataTransfer();
+    await rowDiv(wrapper, "Session One").trigger("dragstart", { dataTransfer });
+    await wrapper.get(".explorer-blank").trigger("dragover", { dataTransfer });
+    expect(rowDiv(wrapper, "Folder A").classes()).toContain("drop-descendant");
+    expect(rowDiv(wrapper, "Nested").classes()).toContain("drop-descendant");
+    expect(rowDiv(wrapper, "Root Session").classes()).toContain("drop-descendant");
+  });
+
   it("ignores a dragover/drop carrying a foreign MIME type", async () => {
     const wrapper = mountApp();
     await flushPromises();

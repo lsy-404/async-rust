@@ -216,7 +216,11 @@ function handleTreeDragLeave(event: DragEvent) {
   emit("drag-leave");
 }
 const dropDescendantIds = computed(() => {
-  if (typeof props.dropParent !== "string") return new Set<string>();
+  // undefined: nothing is being dragged. null: root is the drop target, and
+  // (matching subtreeIds' own recursive semantics for a folder target) every
+  // node in the tree counts as one of its descendants.
+  if (props.dropParent === undefined) return new Set<string>();
+  if (props.dropParent === null) return new Set(props.nodes.map((node) => node.id));
   return new Set(subtreeIds(props.nodes, props.dropParent));
 });
 
