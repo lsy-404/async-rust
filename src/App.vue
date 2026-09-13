@@ -28,7 +28,9 @@ import {
   nextFocusAfterDelete,
   resolveCreateTarget,
   subtreeIds,
+  timestampName,
 } from "./explorer/tree";
+import { systemAudioUnavailableLabel } from "./system-audio-reason";
 import {
   FluentButton,
   FluentDialog,
@@ -191,6 +193,14 @@ const searchQuery = ref("");
 const searchResults = ref<SearchResults>();
 let searchDebounceTimer: ReturnType<typeof setTimeout> | undefined;
 let searchToken = 0;
+// The session created by quick transcription in this run ('' when none), the
+// dialog shown when it ends up with no content, and the id of a quick
+// session whose start_quick_transcription call has not yet settled (covers
+// an error event that arrives before the invoke's own reply).
+const quickSessionId = ref("");
+const emptyQuickSession = ref<{ id: string; name: string }>();
+let pendingQuickId = "";
+let quickStart: Promise<Node> | undefined;
 const themeChoices = computed<{ value: Theme; label: string }[]>(() => [
   { value: "system", label: t("theme.system") },
   { value: "light", label: t("theme.light") },
@@ -229,6 +239,31 @@ const operationBusy = computed(
     recording.value ||
     recordingStarting.value,
 );
+const quickButtonDisabled = computed(
+  () =>
+    recordingStarting.value ||
+    operationBusy.value ||
+    (captureMode.value === "system" && !systemAudioCapability.value.available),
+);
+const quickButtonLabel = computed(() =>
+  recordingStarting.value ? t("quickTranscription.starting") : t("quickTranscription.button"),
+);
+const quickButtonModeLabel = computed(() => {
+  if (captureMode.value === "system") return t("quickTranscription.modeSystem");
+  if (captureMode.value === "upload") return t("quickTranscription.modeUpload");
+  return t("quickTranscription.modeMicrophone");
+});
+const quickButtonTitle = computed(() => {
+  if (recordingStarting.value) return "";
+  if (operationBusy.value) return t("quickTranscription.busyTitle");
+  if (captureMode.value === "system" && !systemAudioCapability.value.available) {
+    return (
+      systemAudioUnavailableLabel(systemAudioCapability.value) +
+      t("quickTranscription.switchToMicrophoneSuffix")
+    );
+  }
+  return "";
+});
 const renderedMessages = computed(
   () =>
     session.value?.messages.map((message) => ({
@@ -946,6 +981,32 @@ async function loadImportedAudio(path: string) {
     report(cause);
   }
 }
+// Shared by uploadAudio and quick transcription's upload flow: opens the
+// audio-file picker and returns the chosen path, or undefined on cancel.
+async function pickAudioPath(): Promise<string | undefined> {
+  const path = await open({
+    multiple: false,
+    title: t("audioPicker.title"),
+    filters: [
+      {
+        name: t("audioPicker.filterName"),
+        extensions: ["wav", "mp3", "flac", "ogg", "m4a", "aac"],
+      },
+    ],
+  });
+  return typeof path === "string" ? path : undefined;
+}
+// Shared by uploadAudio and quick transcription's upload flow: loads the
+// file for playback, transcribes it into the given session, and refreshes.
+async function transcribeFileInto(sessionId: string, path: string) {
+  await loadImportedAudio(path);
+  await invoke("transcribe_audio", {
+    sessionId,
+    path,
+    language: transcriptionLanguage.value || null,
+  });
+  await refresh();
+}
 async function uploadAudio() {
   if (
     !session.value ||
@@ -957,25 +1018,8 @@ async function uploadAudio() {
   const sessionId = session.value.id;
   transcriptionLoading.value = true;
   try {
-    const path = await open({
-      multiple: false,
-      title: t("audioPicker.title"),
-      filters: [
-        {
-          name: t("audioPicker.filterName"),
-          extensions: ["wav", "mp3", "flac", "ogg", "m4a", "aac"],
-        },
-      ],
-    });
-    if (typeof path === "string") {
-      await loadImportedAudio(path);
-      await invoke("transcribe_audio", {
-        sessionId,
-        path,
-        language: transcriptionLanguage.value || null,
-      });
-      await refresh();
-    }
+    const path = await pickAudioPath();
+    if (path) await transcribeFileInto(sessionId, path);
   } catch (cause) {
     report(cause);
   } finally {
@@ -1006,6 +1050,73 @@ async function cancelStt() {
     report(cause);
   }
 }
+// Shared by toggleRecording and quick transcription's live flow: builds the
+// RecordingEvent handler for one recording attempt, identified by the
+// session id it targets and the generation counter active when it started
+// (a later generation means this attempt was superseded or torn down, so a
+// late-arriving event for it is ignored). A quick-transcription session's id
+// is known before start_quick_transcription's reply arrives, so an error
+// event racing ahead of that reply is still matched and handled here rather
+// than dropped - and once handled, it awaits the pending invoke (swallowing
+// its rejection, already reported) before checking whether the new session
+// ended up empty.
+function makeRecordingHandler(id: string, generation: number) {
+  return (event: RecordingEvent) => {
+    if (generation !== recordingGeneration || event.sessionId !== id) return;
+    if (event.type === "error") {
+      report(event.text);
+      recording.value = false;
+      recordingSessionId.value = "";
+      recordingGeneration += 1;
+      recordingLevel.value = 0;
+      void invoke("cancel_recording", { sessionId: id }).catch(report);
+      if (id === quickSessionId.value || id === pendingQuickId) {
+        void (quickStart?.catch(() => undefined) ?? Promise.resolve()).then(() =>
+          checkEmptyQuickSession(id),
+        );
+      }
+      return;
+    }
+    if (event.type === "level") {
+      recordingLevel.value = event.level ?? 0;
+      return;
+    }
+    const target = data.value.sessions.find((item) => item.id === id);
+    if (target) target.transcription = event.text;
+  };
+}
+// Refreshes, then shows the keep/delete dialog if the session ended up with
+// no transcript, no messages and no summary; otherwise clears quickSessionId
+// so a later stop of some other session never re-checks it. Never deletes on
+// its own - that only happens through the dialog's Delete button. A session
+// created by New Session (quickSessionId never set to it) is never checked.
+async function checkEmptyQuickSession(id: string) {
+  await refresh();
+  const target = data.value.sessions.find((item) => item.id === id);
+  if (!target) return;
+  if (!(target.transcription ?? "").trim() && target.messages.length === 0 && !target.summary) {
+    emptyQuickSession.value = { id, name: nodeName(id) };
+  } else {
+    quickSessionId.value = "";
+  }
+}
+function keepEmptyQuickSession() {
+  emptyQuickSession.value = undefined;
+}
+async function deleteEmptyQuickSession() {
+  const target = emptyQuickSession.value;
+  if (!target || operationBusy.value) return;
+  try {
+    await invoke("delete_node", { id: target.id });
+    await refresh();
+    if (openNodeId.value === target.id) openNodeId.value = "";
+    if (quickSessionId.value === target.id) quickSessionId.value = "";
+  } catch (cause) {
+    report(cause);
+    return;
+  }
+  emptyQuickSession.value = undefined;
+}
 async function toggleRecording() {
   if (
     !session.value ||
@@ -1030,6 +1141,7 @@ async function toggleRecording() {
       recordingGeneration += 1;
       recordingLevel.value = 0;
     }
+    if (sessionId === quickSessionId.value) await checkEmptyQuickSession(sessionId);
     return;
   }
   revokeImportedAudio();
@@ -1040,25 +1152,7 @@ async function toggleRecording() {
   const generation = ++recordingGeneration;
   const onEvent = new Channel<RecordingEvent>();
   recordingSessionId.value = sessionId;
-  onEvent.onmessage = (event) => {
-    if (generation !== recordingGeneration || event.sessionId !== sessionId)
-      return;
-    if (event.type === "error") {
-      report(event.text);
-      recording.value = false;
-      recordingSessionId.value = "";
-      recordingGeneration += 1;
-      recordingLevel.value = 0;
-      void invoke("cancel_recording", { sessionId }).catch(report);
-      return;
-    }
-    if (event.type === "level") {
-      recordingLevel.value = event.level ?? 0;
-      return;
-    }
-    const target = data.value.sessions.find((item) => item.id === sessionId);
-    if (target) target.transcription = event.text;
-  };
+  onEvent.onmessage = makeRecordingHandler(sessionId, generation);
   const source: RecordingSource =
     captureMode.value === "system" ? "systemAudio" : "microphone";
   try {
@@ -1076,6 +1170,105 @@ async function toggleRecording() {
     report(cause);
   } finally {
     recordingStarting.value = false;
+  }
+}
+// Quick transcription: one click creates a root session named with the
+// local timestamp and immediately starts recording in the currently
+// selected capture mode, or (in upload mode) walks the same picker ->
+// create -> transcribe path as uploadAudio but into a freshly created
+// session. Steps 1-4 (this function) never invoke a write; recordingStarting
+// is set synchronously before any await so a double click produces exactly
+// one invoke.
+async function quickTranscription() {
+  if (recordingStarting.value || operationBusy.value) return;
+  recordingStarting.value = true;
+  let freshSttStatus: SttStatus;
+  try {
+    freshSttStatus = await invoke<SttStatus>("stt_status");
+  } catch (cause) {
+    recordingStarting.value = false;
+    report(cause);
+    return;
+  }
+  stt.value = freshSttStatus;
+  if (!freshSttStatus.ready) {
+    recordingStarting.value = false;
+    report(t("quickTranscription.modelNotReady"));
+    return;
+  }
+  if (captureMode.value === "system" && !systemAudioCapability.value.available) {
+    recordingStarting.value = false;
+    report(
+      systemAudioUnavailableLabel(systemAudioCapability.value) +
+        t("quickTranscription.switchToMicrophoneSuffix"),
+    );
+    return;
+  }
+  if (captureMode.value === "upload") {
+    recordingStarting.value = false;
+    await quickTranscriptionUpload();
+    return;
+  }
+  await quickTranscriptionLive();
+}
+async function quickTranscriptionLive() {
+  revokeImportedAudio();
+  recordingLevel.value = 0;
+  error.value = "";
+  const generation = ++recordingGeneration;
+  const id = crypto.randomUUID();
+  const name = timestampName(new Date());
+  recordingSessionId.value = id;
+  const onEvent = new Channel<RecordingEvent>();
+  onEvent.onmessage = makeRecordingHandler(id, generation);
+  const source: RecordingSource =
+    captureMode.value === "system" ? "systemAudio" : "microphone";
+  pendingQuickId = id;
+  quickStart = invoke<Node>("start_quick_transcription", {
+    id,
+    name,
+    source,
+    language: transcriptionLanguage.value || null,
+    onEvent,
+  });
+  try {
+    await quickStart;
+    quickSessionId.value = id;
+    if (generation !== recordingGeneration) return;
+    recording.value = true;
+    await refresh();
+    openNode(id, { force: true });
+    focusedNodeId.value = id;
+  } catch (cause) {
+    if (generation === recordingGeneration) {
+      report(cause);
+      recordingSessionId.value = "";
+      recordingGeneration += 1;
+    }
+  } finally {
+    recordingStarting.value = false;
+    pendingQuickId = "";
+  }
+}
+async function quickTranscriptionUpload() {
+  transcriptionLoading.value = true;
+  let insertedId = "";
+  try {
+    const path = await pickAudioPath();
+    if (!path) return;
+    const name = timestampName(new Date());
+    const node = await invoke<Node>("create_session", { parentId: null, name });
+    insertedId = node.id;
+    quickSessionId.value = node.id;
+    await refresh();
+    openNode(node.id, { force: true });
+    focusedNodeId.value = node.id;
+    await transcribeFileInto(node.id, path);
+  } catch (cause) {
+    report(cause);
+  } finally {
+    transcriptionLoading.value = false;
+    if (insertedId) await checkEmptyQuickSession(insertedId);
   }
 }
 async function saveSettings() {
@@ -1346,6 +1539,23 @@ onUnmounted(() => {
                   stroke-linecap="round"
                 /></svg
             ></FluentButton>
+            <FluentButton
+              tone="primary"
+              class="quick-transcription-btn"
+              :disabled="quickButtonDisabled"
+              :title="quickButtonTitle"
+              @click="quickTranscription"
+              ><svg
+                width="10"
+                height="10"
+                viewBox="0 0 10 10"
+                aria-hidden="true"
+              ><circle cx="5" cy="5" r="5" fill="currentColor" /></svg>
+              <span class="quick-transcription-label">
+                <strong>{{ quickButtonLabel }}</strong>
+                <small>{{ quickButtonModeLabel }}</small>
+              </span></FluentButton
+            >
             <h1>{{ (session && nodeName(openNodeId)) || t("appTitle") }}</h1>
             <div class="header-actions">
               <div class="header-switches" role="group" :aria-label="t('theme.switch')">
@@ -1535,6 +1745,28 @@ onUnmounted(() => {
             >{{ t("common.close") }}</FluentButton
           ><FluentButton tone="primary" @click="saveSettings"
             >{{ t("settingsDialog.save") }}</FluentButton
+          ></template
+        ></FluentDialog
+      >
+      <FluentDialog
+        v-if="emptyQuickSession"
+        :open="true"
+        :label="t('quickTranscription.emptyDialogTitle')"
+        ><template #title><h2>{{ t("quickTranscription.emptyDialogTitle") }}</h2></template>
+        <template #default
+          ><p>
+            {{
+              t("quickTranscription.emptyDialogBody", { name: emptyQuickSession.name })
+            }}
+          </p></template
+        ><template #footer
+          ><FluentButton tone="subtle" @click="keepEmptyQuickSession"
+            >{{ t("quickTranscription.keep") }}</FluentButton
+          ><FluentButton
+            tone="danger"
+            :disabled="operationBusy"
+            @click="deleteEmptyQuickSession"
+            >{{ t("quickTranscription.delete") }}</FluentButton
           ></template
         ></FluentDialog
       >

@@ -896,6 +896,23 @@ textarea {
   background: var(--fluent-surface);
   box-shadow: var(--fluent-shadow);
 }
+.quick-transcription-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: none;
+}
+.quick-transcription-label {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  line-height: 1.2;
+}
+.quick-transcription-label small {
+  font-weight: 400;
+  opacity: 0.8;
+  font-size: 11px;
+}
 
 .spinner {
   width: 16px;

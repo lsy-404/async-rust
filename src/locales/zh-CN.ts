@@ -29,7 +29,7 @@ export default {
   },
   explorer: {
     title: "资源管理器",
-    empty: "还没有内容。",
+    empty: "还没有内容。新建会话、文件夹，或点击上方的快速转写。",
     expandAria: "展开文件夹",
     collapseAria: "折叠文件夹",
     newSession: "新建会话",
@@ -203,6 +203,21 @@ export default {
   audioPicker: {
     title: "选择录音文件",
     filterName: "音频",
+  },
+  quickTranscription: {
+    button: "快速转写",
+    starting: "正在启动…",
+    modeMicrophone: "麦克风",
+    modeSystem: "系统音频",
+    modeUpload: "上传音频",
+    busyTitle: "请先停止录音或等待当前任务完成",
+    switchToMicrophoneSuffix: "，可在转写面板切换为麦克风",
+    modelNotReady:
+      "需要先下载本地语音模型才能快速转写。可在转写面板或设置中下载。",
+    emptyDialogTitle: "没有录到内容",
+    emptyDialogBody: "快速转写会话「{name}」没有任何转写内容。要删除它吗？",
+    keep: "保留",
+    delete: "删除",
   },
   loading: "正在加载本地课堂数据…",
   appTitle: "Async",

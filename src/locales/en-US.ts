@@ -29,7 +29,7 @@ export default {
   },
   explorer: {
     title: "Explorer",
-    empty: "Nothing here yet.",
+    empty: "Nothing here yet. Create a session or folder, or use Quick transcription.",
     expandAria: "Expand folder",
     collapseAria: "Collapse folder",
     newSession: "New Session",
@@ -210,6 +210,21 @@ export default {
   audioPicker: {
     title: "Choose an audio recording",
     filterName: "Audio",
+  },
+  quickTranscription: {
+    button: "Quick transcription",
+    starting: "Starting…",
+    modeMicrophone: "Microphone",
+    modeSystem: "System audio",
+    modeUpload: "Uploaded audio",
+    busyTitle: "Stop the recording or wait for the current task first",
+    switchToMicrophoneSuffix: ". Switch to microphone in the transcript panel",
+    modelNotReady:
+      "Download the local speech model first (transcript panel or Settings).",
+    emptyDialogTitle: "Nothing was captured",
+    emptyDialogBody: 'Quick transcription session "{name}" has no transcript. Delete it?',
+    keep: "Keep",
+    delete: "Delete",
   },
   loading: "Loading local class data…",
   appTitle: "Async",

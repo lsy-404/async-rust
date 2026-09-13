@@ -143,3 +143,14 @@ export function nextFocusAfterDelete(flat: FlatRow[], id: string): string | null
   if (index > 0) return flat[index - 1]!.node.id;
   return null;
 }
+
+// "YYYY-MM-DD HH:mm:ss" in local time, independent of the UI locale - used to
+// name a quick-transcription session so it sorts chronologically under
+// sortChildren's numeric collation.
+export function timestampName(date: Date): string {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+  );
+}

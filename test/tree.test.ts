@@ -7,6 +7,7 @@ import {
   resolveCreateTarget,
   subtreeCounts,
   subtreeIds,
+  timestampName,
 } from "../src/explorer/tree";
 
 const nodes: Node[] = [
@@ -89,5 +90,14 @@ describe("nextFocusAfterDelete", () => {
   });
   it("returns null when the id is not in the flattened list", () => {
     expect(nextFocusAfterDelete(flat, "missing")).toBeNull();
+  });
+});
+
+describe("timestampName", () => {
+  it("formats as YYYY-MM-DD HH:mm:ss in local time, zero-padded", () => {
+    expect(timestampName(new Date(2024, 2, 5, 9, 3, 7))).toBe("2024-03-05 09:03:07");
+  });
+  it("pads a single-digit month, day, hour, minute and second all at once", () => {
+    expect(timestampName(new Date(2024, 0, 1, 0, 0, 0))).toBe("2024-01-01 00:00:00");
   });
 });

@@ -185,7 +185,9 @@ describe("explorer tree behaviour", () => {
     data.sessions = [];
     const wrapper = mountApp();
     await flushPromises();
-    expect(wrapper.find(".explorer-empty").text()).toBe("还没有内容。");
+    expect(wrapper.find(".explorer-empty").text()).toBe(
+      "还没有内容。新建会话、文件夹，或点击上方的快速转写。",
+    );
   });
 });
 
@@ -1578,6 +1580,275 @@ describe("transcript gap fixes: capture mode, language, level meter, playback", 
     expect(pauseSpy).toHaveBeenCalled();
     expect(revokeSpy).toHaveBeenCalled();
     expect(wrapper.find(".playback-bar").exists()).toBe(false);
+  });
+});
+
+// One click creates a root session named with the local timestamp and
+// starts recording in the currently selected capture mode. The mocked
+// start_quick_transcription/create_session/delete_node handlers below mutate
+// `data` the same way the real backend's node tree would, so a fresh
+// load_state call after a failure is a genuine check for an orphaned node -
+// not just an assertion on which invoke calls were made.
+describe("quick transcription", () => {
+  function quickState(): AppData {
+    return {
+      nodes: [{ id: "existing", parentId: null, kind: "session", name: "Existing" }],
+      sessions: [{ id: "existing", messages: [], transcription: "", summary: "" }],
+      materials: [],
+      settings: {
+        providerId: "openai",
+        model: "classroom-test",
+        theme: "system",
+        language: "zh",
+      },
+      providers: [
+        {
+          id: "openai",
+          name: "OpenAI",
+          baseUrl: "http://fixture/v1",
+          models: ["classroom-test"],
+          hasKey: true,
+        },
+      ],
+    };
+  }
+
+  function mockQuick(
+    state: AppData,
+    opts: {
+      sttReady?: boolean;
+      systemAvailable?: boolean;
+      startQuickRejects?: string;
+    } = {},
+  ) {
+    invoke.mockImplementation(async (command: string, args?: Record<string, any>) => {
+      if (command === "load_state") return structuredClone(state);
+      if (command === "stt_status")
+        return {
+          ready: opts.sttReady ?? true,
+          modelName: "fixture",
+          modelPath: "/tmp/model",
+          sizeBytes: 1,
+        };
+      if (command === "get_system_audio_capability")
+        return {
+          available: opts.systemAvailable ?? false,
+          reason: opts.systemAvailable ? null : "unsupported-os",
+        };
+      if (command === "start_quick_transcription") {
+        // Mirrors the backend: the node (and its session payload) is
+        // inserted before start() is awaited, then deleted again if start
+        // fails - never left behind.
+        state.nodes.push({ id: args!.id, parentId: null, kind: "session", name: args!.name });
+        state.sessions.push({ id: args!.id, messages: [], transcription: "", summary: "" });
+        if (opts.startQuickRejects) {
+          state.nodes = state.nodes.filter((n) => n.id !== args!.id);
+          state.sessions = state.sessions.filter((s) => s.id !== args!.id);
+          throw new Error(opts.startQuickRejects);
+        }
+        return { id: args!.id, parentId: null, kind: "session", name: args!.name };
+      }
+      if (command === "create_session") {
+        const node = {
+          id: "upload-session",
+          parentId: args?.parentId ?? null,
+          kind: "session" as const,
+          name: args?.name,
+        };
+        state.nodes.push(node);
+        state.sessions.push({ id: node.id, messages: [], transcription: "", summary: "" });
+        return node;
+      }
+      if (command === "delete_node") {
+        state.nodes = state.nodes.filter((n) => n.id !== args?.id);
+        state.sessions = state.sessions.filter((s) => s.id !== args?.id);
+        return undefined;
+      }
+      if (command === "transcribe_audio") return undefined;
+      if (command === "save_settings") {
+        state.settings = args?.settings as AppData["settings"];
+      }
+      return undefined;
+    });
+  }
+
+  let data: AppData;
+  beforeEach(() => {
+    data = quickState();
+    invoke.mockReset();
+    vi.mocked(open).mockReset();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2024, 2, 5, 10, 20, 30));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("creates a root session named with the current timestamp and starts recording in the current capture mode", async () => {
+    mockQuick(data);
+    const wrapper = mountApp();
+    await flushPromises();
+    await wrapper.get(".quick-transcription-btn").trigger("click");
+    await flushPromises();
+    const call = invoke.mock.calls.find(
+      ([command]) => command === "start_quick_transcription",
+    )!;
+    expect(call[1]).toMatchObject({
+      name: "2024-03-05 10:20:30",
+      source: "microphone",
+      language: null,
+    });
+    expect(data.nodes).toHaveLength(2);
+    expect(wrapper.get("h1").text()).toBe("2024-03-05 10:20:30");
+    expect(buttonWithText(wrapper, "停止录音").exists()).toBe(true);
+  });
+
+  it("honors the currently selected capture mode, starting system-audio capture when that mode is selected", async () => {
+    mockQuick(data, { systemAvailable: true });
+    const wrapper = mountApp();
+    await flushPromises();
+    await openSessionNode(wrapper, "Existing");
+    await wrapper.get('[aria-label="输入方式"]').setValue("system");
+    await wrapper.get(".quick-transcription-btn").trigger("click");
+    await flushPromises();
+    const call = invoke.mock.calls.find(
+      ([command]) => command === "start_quick_transcription",
+    )!;
+    expect(call[1]).toMatchObject({ source: "systemAudio" });
+  });
+
+  it("refuses cleanly when no local STT model is ready, creating nothing", async () => {
+    mockQuick(data, { sttReady: false });
+    const wrapper = mountApp();
+    await flushPromises();
+    const before = data.nodes.length;
+    await wrapper.get(".quick-transcription-btn").trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("需要先下载本地语音模型才能快速转写");
+    expect(
+      invoke.mock.calls.some(([command]) => command === "start_quick_transcription"),
+    ).toBe(false);
+    const fresh = (await invoke("load_state")) as AppData;
+    expect(fresh.nodes).toHaveLength(before);
+  });
+
+  it("is refused while a recording is already in progress elsewhere, without creating a session", async () => {
+    mockQuick(data);
+    const wrapper = mountApp();
+    await flushPromises();
+    await openSessionNode(wrapper, "Existing");
+    await buttonWithText(wrapper, "开始录音").trigger("click");
+    await flushPromises();
+    const before = data.nodes.length;
+    invoke.mockClear();
+    const quickButton = wrapper.get(".quick-transcription-btn");
+    expect(quickButton.attributes("disabled")).toBeDefined();
+    await quickButton.trigger("click");
+    await flushPromises();
+    expect(
+      invoke.mock.calls.some(([command]) => command === "start_quick_transcription"),
+    ).toBe(false);
+    const fresh = (await invoke("load_state")) as AppData;
+    expect(fresh.nodes).toHaveLength(before);
+  });
+
+  it("deletes the session when starting capture fails, leaving no orphan session behind", async () => {
+    mockQuick(data, { startQuickRejects: "麦克风权限被拒绝。" });
+    const wrapper = mountApp();
+    await flushPromises();
+    const before = data.nodes.length;
+    await wrapper.get(".quick-transcription-btn").trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("麦克风权限被拒绝");
+    const fresh = (await invoke("load_state")) as AppData;
+    expect(fresh.nodes).toHaveLength(before);
+    expect(fresh.nodes.some((node) => node.name === "2024-03-05 10:20:30")).toBe(false);
+    // The button unlocks again rather than getting stuck disabled.
+    expect(wrapper.get(".quick-transcription-btn").attributes("disabled")).toBeUndefined();
+  });
+
+  it("cancels and shows the empty-session dialog when an error event arrives before start_quick_transcription's own reply", async () => {
+    let resolveStart: (node: unknown) => void = () => undefined;
+    let captured: Record<string, any> | undefined;
+    invoke.mockImplementation(async (command: string, args?: Record<string, any>) => {
+      if (command === "load_state") return structuredClone(data);
+      if (command === "stt_status")
+        return { ready: true, modelName: "f", modelPath: "/tmp", sizeBytes: 1 };
+      if (command === "start_quick_transcription") {
+        captured = args;
+        data.nodes.push({ id: args!.id, parentId: null, kind: "session", name: args!.name });
+        data.sessions.push({ id: args!.id, messages: [], transcription: "", summary: "" });
+        return new Promise((resolve) => {
+          resolveStart = resolve;
+        });
+      }
+      if (command === "delete_node") {
+        data.nodes = data.nodes.filter((n) => n.id !== args?.id);
+        data.sessions = data.sessions.filter((s) => s.id !== args?.id);
+        return undefined;
+      }
+      return undefined;
+    });
+    const wrapper = mountApp();
+    await flushPromises();
+    await wrapper.get(".quick-transcription-btn").trigger("click");
+    await flushPromises();
+    captured!.onEvent.onmessage({
+      type: "error",
+      sessionId: captured!.id,
+      text: "设备被占用",
+    });
+    await flushPromises();
+    expect(
+      invoke.mock.calls.some(
+        ([command, args]) =>
+          command === "cancel_recording" && args?.sessionId === captured!.id,
+      ),
+    ).toBe(true);
+
+    resolveStart({ id: captured!.id, parentId: null, kind: "session", name: captured!.name });
+    await flushPromises();
+    expect(wrapper.text()).toContain("没有录到内容");
+    // The button unlocks again once the delayed reply is handled, rather
+    // than getting stuck disabled by the now-superseded generation.
+    expect(wrapper.get(".quick-transcription-btn").attributes("disabled")).toBeUndefined();
+
+    await buttonWithText(wrapper, "删除").trigger("click");
+    await flushPromises();
+    expect(
+      invoke.mock.calls.some(
+        ([command, args]) => command === "delete_node" && args?.id === captured!.id,
+      ),
+    ).toBe(true);
+    expect(data.nodes.some((node) => node.id === captured!.id)).toBe(false);
+  });
+
+  it("upload mode: a cancelled picker creates nothing; a chosen file creates the session and transcribes into it", async () => {
+    mockQuick(data);
+    const wrapper = mountApp();
+    await flushPromises();
+    await openSessionNode(wrapper, "Existing");
+    await wrapper.get('[aria-label="输入方式"]').setValue("upload");
+
+    vi.mocked(open).mockResolvedValueOnce(null);
+    await wrapper.get(".quick-transcription-btn").trigger("click");
+    await flushPromises();
+    expect(
+      invoke.mock.calls.some(([command]) => command === "create_session"),
+    ).toBe(false);
+
+    vi.mocked(open).mockResolvedValueOnce("/tmp/quick.wav");
+    await wrapper.get(".quick-transcription-btn").trigger("click");
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith(
+      "create_session",
+      expect.objectContaining({ parentId: null, name: "2024-03-05 10:20:30" }),
+    );
+    expect(invoke).toHaveBeenCalledWith(
+      "transcribe_audio",
+      expect.objectContaining({ sessionId: "upload-session", path: "/tmp/quick.wav" }),
+    );
+    expect(wrapper.get("h1").text()).toBe("2024-03-05 10:20:30");
   });
 });
 
