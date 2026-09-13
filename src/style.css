@@ -53,35 +53,6 @@ textarea {
   display: flex;
   overflow: hidden;
 }
-.app-sidebar {
-  width: 264px;
-  flex: none;
-  display: flex;
-  flex-direction: column;
-  border-right: 1px solid var(--fluent-border);
-  background: color-mix(in srgb, var(--fluent-surface) 78%, transparent);
-}
-.sidebar-search {
-  padding: 12px 12px 8px;
-}
-.sidebar-search input,
-.sidebar-footer input {
-  width: 100%;
-  border: 1px solid var(--fluent-border);
-  border-radius: 6px;
-  padding: 8px 10px;
-  background: var(--fluent-control);
-  color: var(--fluent-text);
-}
-.sidebar-tabs {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  margin: 0 12px 8px;
-  padding: 3px;
-  border-radius: 7px;
-  background: color-mix(in srgb, var(--fluent-muted) 12%, transparent);
-}
-.sidebar-tabs button,
 .session-tabs button {
   border: 0;
   border-radius: 5px;
@@ -90,93 +61,30 @@ textarea {
   background: transparent;
   color: var(--fluent-muted);
 }
-.sidebar-tabs button.active,
 .session-tabs button.active {
   color: var(--fluent-text);
   background: var(--fluent-surface);
   box-shadow: var(--fluent-shadow);
 }
-.sidebar-tabs button:hover:not(.active),
 .session-tabs button:hover:not(.active) {
   background: color-mix(in srgb, var(--fluent-muted) 10%, transparent);
 }
-.sidebar-tree {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
+.explorer {
+  width: 264px;
+  flex: none;
+  border-right: 1px solid var(--fluent-border);
+  background: color-mix(in srgb, var(--fluent-surface) 78%, transparent);
   padding: 4px 8px 12px;
   scrollbar-width: thin;
   scrollbar-color: var(--fluent-border) transparent;
 }
-.sidebar-tree::-webkit-scrollbar {
+.explorer::-webkit-scrollbar {
   width: 8px;
 }
-.sidebar-tree::-webkit-scrollbar-thumb {
+.explorer::-webkit-scrollbar-thumb {
   background: var(--fluent-border);
   border-radius: 4px;
 }
-.workspace-node {
-  margin-bottom: 6px;
-}
-.tree-row {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-}
-.tree-workspace,
-.tree-session {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  width: 100%;
-  border: 0;
-  border-radius: 5px;
-  padding: 8px;
-  text-align: left;
-  background: transparent;
-  color: inherit;
-  cursor: pointer;
-}
-.tree-workspace:hover:not(.active),
-.tree-session:hover:not(.active) {
-  background: color-mix(in srgb, var(--fluent-muted) 8%, transparent);
-}
-.tree-row .tree-workspace,
-.tree-row .tree-session {
-  min-width: 0;
-  flex: 1;
-}
-.tree-delete {
-  flex: none;
-  opacity: 0;
-}
-.tree-row:hover .tree-delete,
-.tree-delete:focus-visible {
-  opacity: 1;
-}
-.tree-workspace {
-  font-weight: 600;
-}
-.tree-expand {
-  flex: none;
-  width: 16px;
-  border: 0;
-  padding: 0;
-  background: transparent;
-  color: var(--fluent-muted);
-  font-size: 11px;
-  cursor: pointer;
-}
-.tree-session {
-  padding-left: 18px;
-  font-size: 13px;
-}
-.tree-workspace.active,
-.tree-session.active {
-  color: var(--fluent-accent);
-  background: color-mix(in srgb, var(--fluent-accent) 13%, transparent);
-}
-.knowledge-head,
 .material-actions {
   display: flex;
   align-items: center;
@@ -206,17 +114,6 @@ textarea {
   flex: 1;
   min-height: 0;
   margin: 0;
-}
-.sidebar-footer {
-  flex: none;
-  display: grid;
-  gap: 7px;
-  padding: 10px;
-  border-top: 1px solid var(--fluent-border);
-}
-.sidebar-footer form {
-  display: grid;
-  gap: 6px;
 }
 .workbench-layout {
   flex: 1;
@@ -912,55 +809,13 @@ textarea {
 .settings h2 {
   margin: 0;
 }
-.dialog-description {
-  margin: 0 0 4px;
-  color: var(--fluent-muted);
-  font-size: 12px;
-}
 @media (max-width: 1050px) {
-  .app-sidebar {
+  .explorer {
     width: 220px !important;
   }
   .status {
     display: none;
   }
-}
-
-.rename-input {
-  width: 100%;
-  border: 1px solid var(--fluent-accent);
-  border-radius: 5px;
-  padding: 6px 8px;
-  background: var(--fluent-control);
-  color: var(--fluent-text);
-}
-
-.context-menu {
-  position: absolute;
-  z-index: 40;
-  display: grid;
-  min-width: 160px;
-  padding: 4px;
-  border: 1px solid var(--fluent-border);
-  border-radius: 7px;
-  background: var(--fluent-surface);
-  box-shadow: var(--fluent-shadow);
-}
-.context-menu button {
-  border: 0;
-  border-radius: 5px;
-  padding: 7px 10px;
-  text-align: left;
-  background: transparent;
-  color: var(--fluent-text);
-  cursor: pointer;
-  font-size: 13px;
-}
-.context-menu button:hover {
-  background: color-mix(in srgb, var(--fluent-muted) 10%, transparent);
-}
-.context-menu button.danger {
-  color: #d13438;
 }
 
 .workbench-empty {

@@ -63,15 +63,13 @@ const stubs = {
 
 function baseState(): AppData {
   return {
-    workspaces: [
-      { id: "w1", name: "Class A" },
-      { id: "w2", name: "Class B" },
+    nodes: [
+      { id: "s1", parentId: null, kind: "session", name: "Lesson one" },
+      { id: "s2", parentId: null, kind: "session", name: "Lesson two" },
     ],
     sessions: [
       {
         id: "s1",
-        workspaceId: "w1",
-        title: "Lesson one",
         messages: [
           { id: "m1", role: "user", content: "Hello" },
           { id: "m2", role: "assistant", content: "Hi there" },
@@ -81,8 +79,6 @@ function baseState(): AppData {
       },
       {
         id: "s2",
-        workspaceId: "w1",
-        title: "Lesson two",
         messages: [],
         transcription: "",
         summary: "",
@@ -120,20 +116,10 @@ function mockInvoke(data: AppData) {
         };
       if (command === "save_settings")
         data.settings = args?.settings as AppData["settings"];
-      if (command === "rename_workspace") {
-        const workspace = data.workspaces.find((w) => w.id === args?.id);
-        if (workspace) workspace.name = args?.name as string;
-      }
-      if (command === "rename_session") {
-        const session = data.sessions.find((s) => s.id === args?.id);
-        if (session) session.title = args?.title as string;
-      }
-      if (command === "save_session") {
-        const index = data.sessions.findIndex(
-          (s) => s.id === (args?.session as { id: string }).id,
-        );
-        if (index !== -1)
-          data.sessions[index] = args?.session as AppData["sessions"][number];
+      if (command === "save_messages") {
+        const session = data.sessions.find((s) => s.id === args?.sessionId);
+        if (session)
+          session.messages = args?.messages as AppData["sessions"][number]["messages"];
       }
       return undefined;
     },
@@ -149,126 +135,19 @@ function buttonWithText(wrapper: VueWrapper, text: string) {
   if (!button) throw new Error(`Missing button: ${text}`);
   return button;
 }
+async function openSessionNode(wrapper: VueWrapper, name: string) {
+  const button = wrapper
+    .findAll(".tree-session")
+    .find((item) => item.text() === name);
+  if (!button) throw new Error(`Missing session node: ${name}`);
+  await button.trigger("click");
+  await flushPromises();
+}
 
-describe("sidebar tree behaviour", () => {
-  let data: AppData;
-  beforeEach(() => {
-    data = baseState();
-    invoke.mockReset();
-    mockInvoke(data);
-  });
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
-  it("opens a context menu on right-click and closes it on Escape or outside click", async () => {
-    const wrapper = mountApp();
-    await flushPromises();
-    const workspaceRow = wrapper.find(".workspace-node .tree-row");
-    await workspaceRow.trigger("contextmenu");
-    expect(wrapper.find(".context-menu").exists()).toBe(true);
-    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
-    await nextTick();
-    expect(wrapper.find(".context-menu").exists()).toBe(false);
-    await workspaceRow.trigger("contextmenu");
-    expect(wrapper.find(".context-menu").exists()).toBe(true);
-    window.dispatchEvent(new MouseEvent("click"));
-    await nextTick();
-    expect(wrapper.find(".context-menu").exists()).toBe(false);
-  });
-
-  it("commits an inline session rename on Enter via rename_session, not save_session", async () => {
-    const wrapper = mountApp();
-    await flushPromises();
-    await wrapper.get(".tree-session").trigger("dblclick");
-    const input = wrapper.get(".rename-input");
-    await input.setValue("Renamed lesson");
-    await input.trigger("keydown", { key: "Enter" });
-    await flushPromises();
-    expect(invoke).toHaveBeenCalledWith("rename_session", {
-      id: "s1",
-      title: "Renamed lesson",
-    });
-    expect(
-      invoke.mock.calls.some(([command]) => command === "save_session"),
-    ).toBe(false);
-  });
-
-  it("commits an inline workspace rename with the trimmed name via rename_workspace", async () => {
-    const wrapper = mountApp();
-    await flushPromises();
-    await wrapper.get(".tree-workspace").trigger("dblclick");
-    const input = wrapper.get(".rename-input");
-    await input.setValue("  Renamed class  ");
-    await input.trigger("keydown", { key: "Enter" });
-    await flushPromises();
-    expect(invoke).toHaveBeenCalledWith("rename_workspace", {
-      id: "w1",
-      name: "Renamed class",
-    });
-  });
-
-  it("cancels a rename on Escape and leaves the original name", async () => {
-    const wrapper = mountApp();
-    await flushPromises();
-    await wrapper.get(".tree-workspace").trigger("dblclick");
-    const input = wrapper.get(".rename-input");
-    await input.setValue("Should not stick");
-    await input.trigger("keydown", { key: "Escape" });
-    await flushPromises();
-    expect(
-      invoke.mock.calls.some(([command]) => command === "rename_workspace"),
-    ).toBe(false);
-    expect(wrapper.get(".tree-workspace").text()).toBe("Class A");
-  });
-
-  it("does not invoke anything for an empty or unchanged rename", async () => {
-    const wrapper = mountApp();
-    await flushPromises();
-    await wrapper.get(".tree-workspace").trigger("dblclick");
-    let input = wrapper.get(".rename-input");
-    await input.trigger("keydown", { key: "Enter" });
-    await flushPromises();
-    expect(
-      invoke.mock.calls.some(([command]) => command === "rename_workspace"),
-    ).toBe(false);
-
-    await wrapper.get(".tree-workspace").trigger("dblclick");
-    input = wrapper.get(".rename-input");
-    await input.setValue("Class A");
-    await input.trigger("keydown", { key: "Enter" });
-    await flushPromises();
-    expect(
-      invoke.mock.calls.some(([command]) => command === "rename_workspace"),
-    ).toBe(false);
-  });
-
-  it("collapses a workspace to hide its sessions", async () => {
-    const wrapper = mountApp();
-    await flushPromises();
-    expect(wrapper.findAll(".tree-session").length).toBeGreaterThan(0);
-    await wrapper.get(".tree-expand").trigger("click");
-    expect(wrapper.findAll(".tree-session").length).toBe(0);
-    await wrapper.get(".tree-expand").trigger("click");
-    expect(wrapper.findAll(".tree-session").length).toBeGreaterThan(0);
-  });
-
-  it("shows a different empty state when a search term matches nothing versus no workspaces", async () => {
-    const wrapper = mountApp();
-    await flushPromises();
-    await wrapper.get(".sidebar-search input").setValue("nonexistent-term");
-    await nextTick();
-    expect(wrapper.find(".empty").text()).toBe("未找到匹配的工作区或会话");
-
-    data.workspaces = [];
-    data.sessions = [];
-    const emptyWrapper = mountApp();
-    await flushPromises();
-    expect(emptyWrapper.find(".empty").text()).toBe("创建一个工作区开始整理课堂。");
-  });
-});
-
-describe("dialog copy", () => {
+// Context menus, inline rename, create and delete are not wired to the tree
+// yet (a later step); this only covers rendering, expand/collapse and
+// selection against the node tree.
+describe("explorer tree behaviour", () => {
   let data: AppData;
   beforeEach(() => {
     data = baseState();
@@ -276,66 +155,36 @@ describe("dialog copy", () => {
     mockInvoke(data);
   });
 
-  it("renders a visible title for the new-session, settings and delete dialogs", async () => {
+  it("selecting a session in the tree opens it exactly as before", async () => {
     const wrapper = mountApp();
     await flushPromises();
-    await buttonWithText(wrapper, "新建会话").trigger("click");
-    expect(wrapper.find(".dialog-title").text()).toBe("新建会话");
-    await buttonWithText(wrapper, "取消").trigger("click");
-
-    await buttonWithText(wrapper, "设置").trigger("click");
-    expect(wrapper.find(".dialog-title").text()).toBe("模型与外观");
-    await buttonWithText(wrapper, "关闭").trigger("click");
-
-    await wrapper.get(".tree-delete").trigger("click");
-    expect(wrapper.find(".dialog-title").text()).toBe("删除工作区");
+    expect(wrapper.find(".workbench-empty").exists()).toBe(true);
+    await openSessionNode(wrapper, "Lesson one");
+    expect(wrapper.find(".app-header h1").text()).toBe("Lesson one");
+    expect(wrapper.find(".transcript-content").exists()).toBe(true);
   });
 
-  it("uses distinct delete copy for a workspace, a session and a material", async () => {
-    data.materials = [
-      {
-        id: "mat1",
-        workspaceId: "w1",
-        name: "Notes.md",
-        content: "content",
-        path: "/tmp/notes.md",
-      },
+  it("collapses a folder to hide its children", async () => {
+    data.nodes = [
+      { id: "w1", parentId: null, kind: "folder", name: "Class A" },
+      { id: "s1", parentId: "w1", kind: "session", name: "Lesson one" },
     ];
     const wrapper = mountApp();
     await flushPromises();
-    const deleteButtons = wrapper.findAll(".tree-delete");
-    await deleteButtons[0]!.trigger("click");
-    expect(wrapper.find(".dialog-title").text()).toBe("删除工作区");
-    expect(wrapper.text()).toContain('删除工作区"Class A"会同时删除其中的全部会话与材料');
-    await buttonWithText(wrapper, "取消").trigger("click");
-
-    const sessionDeleteButton = wrapper
-      .findAll(".tree-delete")
-      .find((_, index) => index > 0)!;
-    await sessionDeleteButton.trigger("click");
-    expect(wrapper.find(".dialog-title").text()).toBe("删除会话");
-    expect(wrapper.text()).toContain('删除会话"Lesson one"后，其中的对话与转写记录将无法恢复');
+    // Not expanded by default (no persisted explorerExpanded).
+    expect(wrapper.findAll(".tree-session").length).toBe(0);
+    await wrapper.get(".tree-folder").trigger("click");
+    expect(wrapper.findAll(".tree-session").length).toBe(1);
+    await wrapper.get(".tree-folder").trigger("click");
+    expect(wrapper.findAll(".tree-session").length).toBe(0);
   });
 
-  it("passes the chosen workspace from the new-session dialog's picker to create_session", async () => {
+  it("shows the empty state when there are no nodes at all", async () => {
+    data.nodes = [];
+    data.sessions = [];
     const wrapper = mountApp();
     await flushPromises();
-    await buttonWithText(wrapper, "新建会话").trigger("click");
-    const selects = wrapper.findAll("select");
-    const workspaceSelect = selects.find((select) =>
-      select.findAll("option").some((option) => option.text() === "Class B"),
-    )!;
-    await workspaceSelect.setValue("w2");
-    const titleLabel = wrapper
-      .findAll("label")
-      .find((label) => label.text().startsWith("会话标题"))!;
-    await titleLabel.get("input").setValue("New topic");
-    await buttonWithText(wrapper, "新建").trigger("click");
-    await flushPromises();
-    expect(invoke).toHaveBeenCalledWith("create_session", {
-      workspaceId: "w2",
-      title: "New topic",
-    });
+    expect(wrapper.find(".explorer-empty").text()).toBe("还没有内容。");
   });
 });
 
@@ -399,29 +248,32 @@ describe("chat pane behaviour", () => {
   it("copies a message's content to the clipboard", async () => {
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     await buttonWithText(wrapper, "复制").trigger("click");
     await flushPromises();
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith("Hello");
   });
 
-  it("persists the shortened message list via save_session when deleting a message", async () => {
+  it("persists the shortened message list via save_messages when deleting a message", async () => {
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     await wrapper
       .findAll(".message-actions")[0]!
       .findAll("button")
       .find((item) => item.text() === "删除")!
       .trigger("click");
     await flushPromises();
-    const call = invoke.mock.calls.find(([command]) => command === "save_session");
+    const call = invoke.mock.calls.find(([command]) => command === "save_messages");
     expect(call).toBeTruthy();
-    const savedSession = (call![1] as any).session;
-    expect(savedSession.messages).toHaveLength(1);
-    expect(savedSession.messages[0].id).toBe("m2");
+    const args = call![1] as any;
+    expect(args.sessionId).toBe("s1");
+    expect(args.messages).toHaveLength(1);
+    expect(args.messages[0].id).toBe("m2");
   });
 
   it("drops the old assistant turn and re-invokes chat when regenerating", async () => {
-    const savedSessionSnapshots: unknown[] = [];
+    const savedMessageSnapshots: unknown[] = [];
     invoke.mockImplementation((command: string, args?: Record<string, any>) => {
       if (command === "load_state") return Promise.resolve(structuredClone(data));
       if (command === "stt_status")
@@ -431,12 +283,10 @@ describe("chat pane behaviour", () => {
           modelPath: "/tmp",
           sizeBytes: 1,
         });
-      if (command === "save_session") {
-        savedSessionSnapshots.push(JSON.parse(JSON.stringify(args?.session)));
-        const index = data.sessions.findIndex(
-          (item) => item.id === args?.session.id,
-        );
-        if (index !== -1) data.sessions[index] = args?.session;
+      if (command === "save_messages") {
+        savedMessageSnapshots.push(JSON.parse(JSON.stringify(args?.messages)));
+        const session = data.sessions.find((item) => item.id === args?.sessionId);
+        if (session) session.messages = args?.messages;
         return Promise.resolve();
       }
       if (command === "chat") {
@@ -454,14 +304,15 @@ describe("chat pane behaviour", () => {
     });
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     await wrapper
       .findAll(".message-actions")[1]!
       .findAll("button")
       .find((item) => item.text() === "重新生成")!
       .trigger("click");
     await flushPromises();
-    expect(savedSessionSnapshots).toHaveLength(1);
-    expect((savedSessionSnapshots[0] as any).messages).toHaveLength(0);
+    expect(savedMessageSnapshots).toHaveLength(1);
+    expect(savedMessageSnapshots[0]).toHaveLength(0);
     const chatCall = invoke.mock.calls.find(([command]) => command === "chat");
     expect(chatCall![1]).toMatchObject({ sessionId: "s1", content: "Hello" });
     expect(wrapper.text()).not.toContain("Hi there");
@@ -487,6 +338,7 @@ describe("chat pane behaviour", () => {
     });
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     await wrapper.get("textarea").setValue("Another question");
     await wrapper.get("form.composer").trigger("submit");
     await nextTick();
@@ -515,6 +367,7 @@ describe("chat pane behaviour", () => {
     });
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     const panel = wrapper.get(".messages").element as HTMLElement;
     Object.defineProperty(panel, "scrollHeight", {
       value: 500,
@@ -548,6 +401,7 @@ describe("chat pane behaviour", () => {
     });
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     const panel = wrapper.get(".messages").element as HTMLElement;
     Object.defineProperty(panel, "scrollHeight", {
       value: 500,
@@ -580,6 +434,7 @@ describe("summary and transcript panels", () => {
     data.sessions[0]!.summary = "Summary text";
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     await buttonWithText(wrapper, "摘要").trigger("click");
     expect(wrapper.find(".summary-meta").exists()).toBe(true);
     expect(wrapper.find(".summary-meta").text()).toContain("更新时间：");
@@ -587,6 +442,7 @@ describe("summary and transcript panels", () => {
     data.sessions[0]!.summaryUpdatedAt = null;
     const noDateWrapper = mountApp();
     await flushPromises();
+    await openSessionNode(noDateWrapper, "Lesson one");
     await buttonWithText(noDateWrapper, "摘要").trigger("click");
     expect(noDateWrapper.find(".summary-meta").exists()).toBe(false);
   });
@@ -594,6 +450,7 @@ describe("summary and transcript panels", () => {
   it("remembers the chat/summary tab selection per session across a session switch", async () => {
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     await buttonWithText(wrapper, "摘要").trigger("click");
     expect(wrapper.find(".summary-page").exists()).toBe(true);
     await wrapper.findAll(".tree-session")[1]!.trigger("click");
@@ -602,8 +459,7 @@ describe("summary and transcript panels", () => {
     expect(wrapper.find(".summary-page").exists()).toBe(true);
   });
 
-  it("renders the workbench empty state with no chrome when no session is selected", async () => {
-    data.sessions = [];
+  it("renders the workbench empty state with no chrome before any node is opened", async () => {
     const wrapper = mountApp();
     await flushPromises();
     expect(wrapper.find(".workbench-empty").exists()).toBe(true);
@@ -623,6 +479,7 @@ describe("settings persistence", () => {
   it("round-trips the panel ratio and sidebar-open flag through save_settings", async () => {
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     const layout = wrapper.get(".workbench-layout").element as HTMLElement;
     Object.defineProperty(layout, "clientWidth", {
       value: 900,
@@ -647,9 +504,9 @@ describe("settings persistence", () => {
   });
 });
 
-// A stale context menu, rename box or message-edit box committed while a
-// recording or chat stream is live would clobber data the backend is still writing.
-describe("operationBusy guards on the new sidebar and message affordances", () => {
+// A stale message-edit box committed while a chat stream is live would
+// clobber data the backend is still writing.
+describe("operationBusy guards on message affordances", () => {
   let data: AppData;
   beforeEach(() => {
     data = baseState();
@@ -668,14 +525,6 @@ describe("operationBusy guards on the new sidebar and message affordances", () =
         });
       if (command === "save_settings")
         data.settings = args?.settings as AppData["settings"];
-      if (command === "rename_workspace") {
-        const workspace = data.workspaces.find((w) => w.id === args?.id);
-        if (workspace) workspace.name = args?.name as string;
-      }
-      if (command === "rename_session") {
-        const session = data.sessions.find((s) => s.id === args?.id);
-        if (session) session.title = args?.title as string;
-      }
       if (command === "chat") return new Promise(() => undefined); // never resolves: stream stays in flight
       return Promise.resolve();
     });
@@ -687,45 +536,11 @@ describe("operationBusy guards on the new sidebar and message affordances", () =
     await flushPromises();
   }
 
-  it("refuses to open the context menu while a chat stream is in flight, and closes one already open", async () => {
-    mockInvokeWithPendingChat();
-    const wrapper = mountApp();
-    await flushPromises();
-    const row = wrapper.find(".workspace-node .tree-row");
-    await row.trigger("contextmenu");
-    expect(wrapper.find(".context-menu").exists()).toBe(true);
-
-    await startStreaming(wrapper);
-    // The stream now holds the generation slot; a menu left open over it must
-    // not stay open for the user to act on with a now-busy session.
-    expect(wrapper.find(".context-menu").exists()).toBe(false);
-    await row.trigger("contextmenu");
-    expect(wrapper.find(".context-menu").exists()).toBe(false);
-  });
-
-  it("closes an open session rename box and never commits it once a chat stream starts", async () => {
-    mockInvokeWithPendingChat();
-    const wrapper = mountApp();
-    await flushPromises();
-    await wrapper.get(".tree-session").trigger("dblclick");
-    expect(wrapper.find(".rename-input").exists()).toBe(true);
-
-    await startStreaming(wrapper);
-    expect(wrapper.find(".rename-input").exists()).toBe(false);
-    expect(
-      invoke.mock.calls.some(([command]) => command === "rename_session"),
-    ).toBe(false);
-    expect(
-      invoke.mock.calls.some(([command]) => command === "save_session"),
-    ).toBe(false);
-    // The session title in the tree must still read the un-renamed value.
-    expect(wrapper.get(".tree-session").text()).toContain("Lesson one");
-  });
-
   it("closes an open message-edit box and never saves it once a chat stream starts", async () => {
     mockInvokeWithPendingChat();
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     await wrapper
       .findAll(".message-actions")[0]!
       .findAll("button")
@@ -737,28 +552,9 @@ describe("operationBusy guards on the new sidebar and message affordances", () =
     await startStreaming(wrapper);
     expect(wrapper.find(".message-edit").exists()).toBe(false);
     expect(
-      invoke.mock.calls.some(([command]) => command === "save_session"),
+      invoke.mock.calls.some(([command]) => command === "save_messages"),
     ).toBe(false);
     expect(wrapper.text()).not.toContain("Edited content");
-  });
-
-  it("disables the delete-confirmation button once an operation starts, without closing the dialog under it", async () => {
-    mockInvokeWithPendingChat();
-    const wrapper = mountApp();
-    await flushPromises();
-    await wrapper.get(".tree-delete").trigger("click");
-    expect(wrapper.find(".dialog-stub").exists()).toBe(true);
-    expect(
-      buttonWithText(wrapper, "删除工作区").attributes("disabled"),
-    ).toBeUndefined();
-
-    await startStreaming(wrapper);
-    // Unlike the context menu and edit box, the delete dialog itself stays
-    // open -- only the destructive action inside it is locked out.
-    expect(wrapper.find(".dialog-stub").exists()).toBe(true);
-    expect(
-      buttonWithText(wrapper, "删除工作区").attributes("disabled"),
-    ).toBeDefined();
   });
 
   it("marks the session busy before the regenerate save awaits, so a second send is refused in the gap", async () => {
@@ -772,7 +568,7 @@ describe("operationBusy guards on the new sidebar and message affordances", () =
           modelPath: "/tmp",
           sizeBytes: 1,
         });
-      if (command === "save_session")
+      if (command === "save_messages")
         return new Promise<void>((resolve) => {
           releaseSave = resolve;
         });
@@ -780,13 +576,14 @@ describe("operationBusy guards on the new sidebar and message affordances", () =
     });
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     await wrapper
       .findAll(".message-actions")[1]!
       .findAll("button")
       .find((item) => item.text() === "重新生成")!
       .trigger("click");
     await nextTick();
-    // regenerateMessage is now paused awaiting save_session; streaming must
+    // regenerateMessage is now paused awaiting save_messages; streaming must
     // already be true so a second send cannot start a concurrent generation.
     await wrapper.get("form.composer textarea").setValue("Another question");
     await wrapper.get("form.composer").trigger("submit");
@@ -804,21 +601,13 @@ describe("material editor draft", () => {
   beforeEach(() => {
     data = baseState();
     data.sessions = [];
+    data.nodes = [
+      { id: "mat1", parentId: null, kind: "material", name: "Notes.md" },
+      { id: "mat2", parentId: null, kind: "material", name: "Other.md" },
+    ];
     data.materials = [
-      {
-        id: "mat1",
-        workspaceId: "w1",
-        name: "Notes.md",
-        content: "original content",
-        path: "/tmp/notes.md",
-      },
-      {
-        id: "mat2",
-        workspaceId: "w1",
-        name: "Other.md",
-        content: "other content",
-        path: "/tmp/other.md",
-      },
+      { id: "mat1", content: "original content", path: "/tmp/notes.md" },
+      { id: "mat2", content: "other content", path: "/tmp/other.md" },
     ];
     invoke.mockReset();
     mockInvoke(data);
@@ -827,21 +616,20 @@ describe("material editor draft", () => {
   it("keeps an unsaved draft across an unrelated refresh, but swaps it when a different material is selected", async () => {
     const wrapper = mountApp();
     await flushPromises();
+    await wrapper.get(".tree-material").trigger("click");
     expect(
       (wrapper.get(".material-editor textarea").element as HTMLTextAreaElement)
         .value,
     ).toBe("original content");
     await wrapper.get(".material-editor textarea").setValue("unsaved edits");
 
-    // Rename the workspace: an action wholly unrelated to the open material,
-    // but one that still triggers a refresh() and a fresh load_state payload.
-    await wrapper.get(".tree-workspace").trigger("dblclick");
-    const input = wrapper.get(".rename-input");
-    await input.setValue("Renamed class");
-    await input.trigger("keydown", { key: "Enter" });
+    // Save settings: an action wholly unrelated to the open material, but one
+    // that still triggers a refresh() and a fresh load_state payload.
+    await buttonWithText(wrapper, "设置").trigger("click");
+    await buttonWithText(wrapper, "保存设置").trigger("click");
     await flushPromises();
     expect(
-      invoke.mock.calls.some(([command]) => command === "rename_workspace"),
+      invoke.mock.calls.some(([command]) => command === "save_settings"),
     ).toBe(true);
     expect(
       (wrapper.get(".material-editor textarea").element as HTMLTextAreaElement)
@@ -849,8 +637,7 @@ describe("material editor draft", () => {
     ).toBe("unsaved edits");
 
     // Selecting a different material still swaps the draft as expected.
-    await buttonWithText(wrapper, "知识库").trigger("click");
-    const materialRows = wrapper.findAll(".tree-session");
+    const materialRows = wrapper.findAll(".tree-material");
     await materialRows[1]!.trigger("click");
     await nextTick();
     expect(
@@ -893,7 +680,7 @@ describe("chat gap fixes: edit, inline error, uncertainty markup, IME safety", (
   });
 
   it("truncates from the edited turn and re-runs chat instead of leaving the stale reply below it", async () => {
-    const savedSessionSnapshots: unknown[] = [];
+    const savedMessageSnapshots: unknown[] = [];
     invoke.mockImplementation((command: string, args?: Record<string, any>) => {
       if (command === "load_state") return Promise.resolve(structuredClone(data));
       if (command === "stt_status")
@@ -903,12 +690,10 @@ describe("chat gap fixes: edit, inline error, uncertainty markup, IME safety", (
           modelPath: "/tmp",
           sizeBytes: 1,
         });
-      if (command === "save_session") {
-        savedSessionSnapshots.push(JSON.parse(JSON.stringify(args?.session)));
-        const index = data.sessions.findIndex(
-          (item) => item.id === args?.session.id,
-        );
-        if (index !== -1) data.sessions[index] = args?.session;
+      if (command === "save_messages") {
+        savedMessageSnapshots.push(JSON.parse(JSON.stringify(args?.messages)));
+        const session = data.sessions.find((item) => item.id === args?.sessionId);
+        if (session) session.messages = args?.messages;
         return Promise.resolve();
       }
       if (command === "chat") {
@@ -925,6 +710,7 @@ describe("chat gap fixes: edit, inline error, uncertainty markup, IME safety", (
     });
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     await wrapper
       .findAll(".message-actions")[0]!
       .findAll("button")
@@ -937,8 +723,8 @@ describe("chat gap fixes: edit, inline error, uncertainty markup, IME safety", (
       .find((item) => item.text() === "保存")!
       .trigger("click");
     await flushPromises();
-    expect(savedSessionSnapshots).toHaveLength(1);
-    expect((savedSessionSnapshots[0] as any).messages).toHaveLength(0);
+    expect(savedMessageSnapshots).toHaveLength(1);
+    expect(savedMessageSnapshots[0]).toHaveLength(0);
     const chatCall = invoke.mock.calls.find(([command]) => command === "chat");
     expect(chatCall![1]).toMatchObject({
       sessionId: "s1",
@@ -968,6 +754,7 @@ describe("chat gap fixes: edit, inline error, uncertainty markup, IME safety", (
     });
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     await wrapper.get("form.composer textarea").setValue("Will this fail?");
     await wrapper.get("form.composer").trigger("submit");
     await nextTick();
@@ -987,6 +774,7 @@ describe("chat gap fixes: edit, inline error, uncertainty markup, IME safety", (
     });
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     const span = wrapper.get(".uncertain-span");
     expect(span.text()).toBe("scheduled for 3pm");
 
@@ -1006,6 +794,7 @@ describe("chat gap fixes: edit, inline error, uncertainty markup, IME safety", (
   it("ignores Enter during IME composition even without isComposing on the event, and sends once composition ends", async () => {
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     const textarea = wrapper.get("form.composer textarea");
     await textarea.setValue("こんにちは");
     await textarea.trigger("compositionstart");
@@ -1026,6 +815,7 @@ describe("chat gap fixes: edit, inline error, uncertainty markup, IME safety", (
   it("also treats keyCode 229 alone as composition, for browsers that never set isComposing", async () => {
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     const textarea = wrapper.get("form.composer textarea");
     await textarea.setValue("中文输入法");
     await textarea.trigger("keydown", { key: "Enter", keyCode: 229 });
@@ -1074,6 +864,7 @@ describe("transcript gap fixes: capture mode, language, level meter, playback", 
     data.sessions[0]!.transcription = "第一句。第二句！Third sentence.";
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     const sentences = wrapper.findAll(".transcript-sentence");
     expect(sentences.map((item) => item.text())).toEqual([
       "第一句。",
@@ -1085,6 +876,7 @@ describe("transcript gap fixes: capture mode, language, level meter, playback", 
   it("unifies capture behind one mode selector and one action button", async () => {
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     expect(buttonWithText(wrapper, "开始录音").exists()).toBe(true);
     expect(wrapper.findAll("button").some((b) => b.text() === "导入音频")).toBe(
       false,
@@ -1111,6 +903,7 @@ describe("transcript gap fixes: capture mode, language, level meter, playback", 
   it("renders the system-audio option disabled with a short explanation instead of omitting or faking it", async () => {
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     const modeSelect = wrapper.get('[aria-label="输入方式"]');
     const systemOption = modeSelect
       .findAll("option")
@@ -1137,6 +930,7 @@ describe("transcript gap fixes: capture mode, language, level meter, playback", 
     );
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     const modeSelect = wrapper.get('[aria-label="输入方式"]');
     const systemOption = modeSelect
       .findAll("option")
@@ -1157,6 +951,7 @@ describe("transcript gap fixes: capture mode, language, level meter, playback", 
   it("passes the picked transcription language into transcribe_audio", async () => {
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     await wrapper.get('[aria-label="转写语言"]').setValue("ja");
     await wrapper.get('[aria-label="输入方式"]').setValue("upload");
     vi.mocked(open).mockResolvedValue("/tmp/lecture.wav");
@@ -1172,6 +967,7 @@ describe("transcript gap fixes: capture mode, language, level meter, playback", 
   it("passes the picked transcription language into start_recording, and null when left on auto-detect", async () => {
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     await wrapper.get('[aria-label="转写语言"]').setValue("fr");
     await buttonWithText(wrapper, "开始录音").trigger("click");
     await flushPromises();
@@ -1184,6 +980,7 @@ describe("transcript gap fixes: capture mode, language, level meter, playback", 
   it("renders a live level meter while recording and resets it once recording stops", async () => {
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     await buttonWithText(wrapper, "开始录音").trigger("click");
     await flushPromises();
     expect(wrapper.find(".level-meter").exists()).toBe(true);
@@ -1213,6 +1010,7 @@ describe("transcript gap fixes: capture mode, language, level meter, playback", 
     const revokeSpy = vi.spyOn(URL, "revokeObjectURL");
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson one");
     expect(wrapper.find(".playback-bar").exists()).toBe(false);
 
     await wrapper.get('[aria-label="输入方式"]').setValue("upload");

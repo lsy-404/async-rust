@@ -6,42 +6,14 @@ export default {
     close: "Close",
     settings: "Settings",
   },
-  sidebar: {
-    tabs: {
-      sessions: "Sessions",
-      knowledge: "Knowledge",
-    },
-    search: "Search",
-    searchPlaceholder: "Search workspaces, sessions, or knowledge",
-    emptyWorkspaces: "Create a workspace to start organizing your class.",
-    noSearchResults: "No matching workspaces or sessions found",
-    toggleWorkspaceAria: "Expand or collapse workspace",
-    menu: {
-      rename: "Rename",
-      delete: "Delete",
-    },
-    deleteWorkspaceAria: "Delete workspace {name}",
-    deleteSessionAria: "Delete session {name}",
-    deleteMaterialAria: "Delete material {name}",
-    knowledge: {
-      workspaceLabel: "Workspace",
-      localMaterials: "Local materials",
-      import: "Import",
-      selectWorkspaceFirst: "Select a workspace first.",
-      emptyMaterials: "Import TXT, Markdown, or DOCX materials.",
-      noSearchResults: "No matching materials found",
-      materialContent: "Material content",
-    },
-    newWorkspacePlaceholder: "New workspace",
-    createWorkspace: "New workspace",
-    createSession: "New session",
+  explorer: {
+    title: "Explorer",
+    empty: "Nothing here yet.",
+    expandAria: "Expand folder",
+    collapseAria: "Collapse folder",
   },
-  sessionCreate: {
-    title: "New session",
-    description: "Creates a new class session in the workspace selected below.",
-    label: "Session title",
-    placeholder: "e.g. Lesson 3 discussion",
-    submit: "Create",
+  material: {
+    contentLabel: "Material content",
   },
   header: {
     toggleSidebar: "Toggle sidebar",
@@ -175,42 +147,20 @@ export default {
   },
   workbenchEmpty: {
     title: "Select or create a session",
-    body: "Select or create a session to start a class conversation, or choose a material in Knowledge to edit it.",
+    body: "Select a session in the explorer to start a class conversation, or select a material to edit it.",
   },
   codeBlock: {
     copy: "Copy",
     copyAria: "Copy code",
-  },
-  deleteWorkspace: {
-    title: "Delete workspace",
-    body: 'Deleting workspace "{name}" also deletes all of its sessions and materials, and cannot be undone. Continue?',
-    confirm: "Delete workspace",
-  },
-  deleteSession: {
-    title: "Delete session",
-    body: 'Deleting session "{name}" will permanently remove its conversation and transcript. Continue?',
-    confirm: "Delete session",
-  },
-  deleteMaterial: {
-    title: "Delete material",
-    body: 'Deleting material "{name}" cannot be undone.',
-    confirm: "Delete material",
   },
   language: {
     zh: "中文",
     en: "English",
     switch: "Switch language",
   },
-  deleteDialog: {
-    title: "Confirm deletion",
-  },
   notice: {
     materialSaved: "Material saved locally.",
     settingsSaved: "Settings saved locally.",
-  },
-  materialPicker: {
-    title: "Choose a learning material",
-    filterName: "Learning material",
   },
   audioPicker: {
     title: "Choose an audio recording",

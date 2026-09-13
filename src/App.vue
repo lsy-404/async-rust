@@ -15,7 +15,7 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import ModelConnections from "./components/ModelConnections.vue";
-import AppSidebar from "./components/AppSidebar.vue";
+import ExplorerView from "./components/ExplorerView.vue";
 import WorkbenchChat from "./components/WorkbenchChat.vue";
 import TranscriptPanel from "./components/TranscriptPanel.vue";
 import { i18n, setLocale } from "./locales";
@@ -23,17 +23,14 @@ import { splitTranscriptSentences } from "./transcript-sentences";
 import {
   FluentButton,
   FluentDialog,
-  FluentField,
   FluentNotice,
   FluentProgressBar,
-  FluentSelect,
   FluentTextArea,
   FluentTheme,
 } from "@platform-kit/fluent/vue";
 import type {
   AppData,
   CaptureMode,
-  Material,
   NotesStatus,
   NotesStatusEvent,
   RecordingSource,
@@ -47,7 +44,6 @@ import type {
   ToolCall,
   TranslationMode,
   TranslationStatusEvent,
-  Workspace,
 } from "./types";
 import { cancelStream, streamCommand } from "./workbench-commands";
 
@@ -84,15 +80,15 @@ const blankSettings: Settings = {
   language: "zh",
 };
 const data = ref<AppData>({
-  workspaces: [],
+  nodes: [],
   sessions: [],
   materials: [],
   settings: { ...blankSettings },
   providers: [],
 });
-const selectedWorkspaceId = ref("");
-const selectedSessionId = ref("");
-const selectedMaterialId = ref("");
+// The single node currently open in the workbench; empty means the empty
+// state. Selecting a session or material in the explorer sets this.
+const openNodeId = ref("");
 const draft = ref("");
 const notice = ref("");
 const error = ref("");
@@ -136,16 +132,8 @@ const stt = ref<SttStatus>({
 const sttDownloading = ref(false);
 const sttProgress = ref({ downloaded: 0, total: 0 });
 const settingsOpen = ref(false);
-const workspaceName = ref("");
-const sessionTitle = ref("");
-const sessionCreateOpen = ref(false);
 const materialDraft = ref("");
 const recording = ref(false);
-const deleteTarget = ref<{
-  kind: "workspace" | "session" | "material";
-  id: string;
-  label: string;
-}>();
 const recordingStarting = ref(false);
 const recordingSessionId = ref("");
 let recordingGeneration = 0;
@@ -157,8 +145,6 @@ const systemAudioCapability = ref<SystemAudioCapability>({
 });
 const transcriptionLanguage = ref("");
 const importedAudioUrl = ref<string>();
-const sidebarMode = ref<"session" | "knowledge">("session");
-const searchQuery = ref("");
 const sessionTabsById = reactive<Record<string, "chat" | "summary">>({});
 const activeSessionTab = computed<"chat" | "summary">({
   get: () =>
@@ -176,77 +162,34 @@ const transcriptPanelRef = ref<InstanceType<typeof TranscriptPanel>>();
 const composerTextareaEl = ref<HTMLTextAreaElement>();
 const editingMessageId = ref("");
 const editDraft = ref("");
-const expandedWorkspaces = ref(new Set<string>());
-const contextMenu = ref<
-  | {
-      x: number;
-      y: number;
-      kind: "workspace" | "session" | "material";
-      id: string;
-      label: string;
-      workspaceId?: string;
-    }
-  | undefined
->();
-const contextMenuRef = ref<HTMLElement>();
-const renamingId = ref("");
-const renameKind = ref<"workspace" | "session" | "material">("workspace");
-const renameDraft = ref("");
-const sessionCreateWorkspaceId = ref("");
+const expandedFolders = ref(new Set<string>());
+let expandedFoldersPersistTimer: ReturnType<typeof setTimeout> | undefined;
 const themeChoices = computed<{ value: Theme; label: string }[]>(() => [
   { value: "system", label: t("theme.system") },
   { value: "light", label: t("theme.light") },
   { value: "dark", label: t("theme.dark") },
 ]);
 
-const workspaces = computed(() => data.value.workspaces);
-const sessions = computed(() =>
-  data.value.sessions.filter(
-    (item) => item.workspaceId === selectedWorkspaceId.value,
-  ),
-);
-const materials = computed(() =>
-  data.value.materials.filter(
-    (item) => item.workspaceId === selectedWorkspaceId.value,
-  ),
+function nodeName(id: string): string {
+  return data.value.nodes.find((item) => item.id === id)?.name ?? "";
+}
+const activeNode = computed(() =>
+  data.value.nodes.find((item) => item.id === openNodeId.value),
 );
 const session = computed(() =>
-  data.value.sessions.find((item) => item.id === selectedSessionId.value),
+  activeNode.value?.kind === "session"
+    ? data.value.sessions.find((item) => item.id === openNodeId.value)
+    : undefined,
 );
 const material = computed(() =>
-  data.value.materials.find((item) => item.id === selectedMaterialId.value),
+  activeNode.value?.kind === "material"
+    ? data.value.materials.find((item) => item.id === openNodeId.value)
+    : undefined,
 );
 const currentProvider = computed(() =>
   data.value.providers.find(
     (item) => item.id === data.value.settings.providerId,
   ),
-);
-const normalizedSearch = computed(() => searchQuery.value.trim().toLowerCase());
-const filteredWorkspaces = computed(() => {
-  const term = normalizedSearch.value;
-  if (!term) return workspaces.value;
-  return workspaces.value.filter(
-    (workspace) =>
-      workspace.name.toLowerCase().includes(term) ||
-      data.value.sessions.some(
-        (item) =>
-          item.workspaceId === workspace.id &&
-          item.title.toLowerCase().includes(term),
-      ),
-  );
-});
-const filteredMaterials = computed(() => {
-  const term = normalizedSearch.value;
-  if (!term) return materials.value;
-  return materials.value.filter((item) =>
-    item.name.toLowerCase().includes(term),
-  );
-});
-const workspaceOptions = computed(() =>
-  workspaces.value.map((workspace) => ({
-    value: workspace.id,
-    label: workspace.name,
-  })),
 );
 const operationBusy = computed(
   () =>
@@ -402,32 +345,6 @@ const summaryUpdatedLabel = computed(() => {
     timeStyle: "short",
   }).format(date);
 });
-const deleteCopy = computed(() => {
-  const target = deleteTarget.value;
-  if (!target)
-    return {
-      title: t("deleteDialog.title"),
-      body: "",
-      confirmLabel: t("common.delete"),
-    };
-  if (target.kind === "workspace")
-    return {
-      title: t("deleteWorkspace.title"),
-      body: t("deleteWorkspace.body", { name: target.label }),
-      confirmLabel: t("deleteWorkspace.confirm"),
-    };
-  if (target.kind === "session")
-    return {
-      title: t("deleteSession.title"),
-      body: t("deleteSession.body", { name: target.label }),
-      confirmLabel: t("deleteSession.confirm"),
-    };
-  return {
-    title: t("deleteMaterial.title"),
-    body: t("deleteMaterial.body", { name: target.label }),
-    confirmLabel: t("deleteMaterial.confirm"),
-  };
-});
 
 function report(message: unknown) {
   error.value = String(message);
@@ -442,24 +359,22 @@ async function refresh() {
       layoutSettingsInitialized = true;
       mainPanelRatio.value = data.value.settings.mainPanelRatio ?? 0.62;
       sidebarOpen.value = data.value.settings.sidebarOpen ?? true;
+      const folderIds = new Set(
+        data.value.nodes
+          .filter((item) => item.kind === "folder")
+          .map((item) => item.id),
+      );
+      expandedFolders.value = new Set(
+        (data.value.settings.explorerExpanded ?? []).filter((id) =>
+          folderIds.has(id),
+        ),
+      );
     }
     if (
-      !selectedWorkspaceId.value ||
-      !data.value.workspaces.some(
-        (item) => item.id === selectedWorkspaceId.value,
-      )
+      openNodeId.value &&
+      !data.value.nodes.some((item) => item.id === openNodeId.value)
     )
-      selectedWorkspaceId.value = data.value.workspaces[0]?.id ?? "";
-    if (
-      !selectedSessionId.value ||
-      !sessions.value.some((item) => item.id === selectedSessionId.value)
-    )
-      selectedSessionId.value = sessions.value[0]?.id ?? "";
-    if (
-      !selectedMaterialId.value ||
-      !materials.value.some((item) => item.id === selectedMaterialId.value)
-    )
-      selectedMaterialId.value = materials.value[0]?.id ?? "";
+      openNodeId.value = "";
   } catch (cause) {
     report(cause);
   } finally {
@@ -472,132 +387,21 @@ async function refreshModelSettings() {
   data.value.settings.providerId = updated.settings.providerId;
   data.value.settings.model = updated.settings.model;
 }
-async function createWorkspace() {
-  if (!workspaceName.value.trim() || operationBusy.value) return;
-  try {
-    const workspace = await invoke<Workspace>("create_workspace", {
-      name: workspaceName.value.trim(),
-    });
-    workspaceName.value = "";
-    selectedWorkspaceId.value = workspace.id;
-    await refresh();
-  } catch (cause) {
-    report(cause);
-  }
+// Opens a session or material in the workbench. Refused while an operation
+// is busy, unless force is set (used by quick transcription, which must open
+// the session it just started recording into).
+function openNode(id: string, options: { force?: boolean } = {}) {
+  if (operationBusy.value && !options.force && id !== openNodeId.value) return;
+  openNodeId.value = id;
 }
-function askDelete(
-  kind: "workspace" | "session" | "material",
-  id: string,
-  label: string,
-) {
-  deleteTarget.value = { kind, id, label };
-}
-async function confirmDelete() {
-  const target = deleteTarget.value;
-  if (!target || operationBusy.value) return;
-  try {
-    if (target.kind === "workspace")
-      await invoke("delete_workspace", { id: target.id });
-    if (target.kind === "session")
-      await invoke("delete_session", { id: target.id });
-    if (target.kind === "material")
-      await invoke("delete_material", { id: target.id });
-    deleteTarget.value = undefined;
-    await refresh();
-  } catch (cause) {
-    report(cause);
-  }
-}
-function toggleWorkspaceExpand(id: string) {
-  if (expandedWorkspaces.value.has(id)) expandedWorkspaces.value.delete(id);
-  else expandedWorkspaces.value.add(id);
-}
-function openContextMenu(
-  event: MouseEvent,
-  kind: "workspace" | "session" | "material",
-  id: string,
-  label: string,
-  workspaceId?: string,
-) {
-  if (operationBusy.value) return;
-  contextMenu.value = {
-    x: event.clientX,
-    y: event.clientY,
-    kind,
-    id,
-    label,
-    workspaceId,
-  };
-  void nextTick(() => {
-    const el = contextMenuRef.value;
-    const current = contextMenu.value;
-    if (!el || !current) return;
-    const rect = el.getBoundingClientRect();
-    contextMenu.value = {
-      ...current,
-      x: Math.min(current.x, Math.max(4, window.innerWidth - rect.width - 4)),
-      y: Math.min(current.y, Math.max(4, window.innerHeight - rect.height - 4)),
-    };
-  });
-}
-function closeContextMenu() {
-  contextMenu.value = undefined;
-}
-function contextMenuNewSession() {
-  const menu = contextMenu.value;
-  if (!menu || menu.kind !== "workspace") return;
-  sessionCreateWorkspaceId.value = menu.id;
-  sessionCreateOpen.value = true;
-  closeContextMenu();
-}
-function contextMenuRename() {
-  const menu = contextMenu.value;
-  if (!menu || operationBusy.value) return;
-  startRename(menu.kind, menu.id, menu.label);
-  closeContextMenu();
-}
-function contextMenuDelete() {
-  const menu = contextMenu.value;
-  if (!menu || operationBusy.value) return;
-  askDelete(menu.kind, menu.id, menu.label);
-  closeContextMenu();
-}
-function startRename(
-  kind: "workspace" | "session" | "material",
-  id: string,
-  currentName: string,
-) {
-  renameKind.value = kind;
-  renamingId.value = id;
-  renameDraft.value = currentName;
-}
-function cancelRename() {
-  renamingId.value = "";
-}
-async function commitRename() {
-  const id = renamingId.value;
-  const kind = renameKind.value;
-  const name = renameDraft.value.trim();
-  renamingId.value = "";
-  if (!id || !name || operationBusy.value) return;
-  try {
-    if (kind === "workspace") {
-      const current = data.value.workspaces.find((item) => item.id === id);
-      if (!current || current.name === name) return;
-      await invoke("rename_workspace", { id, name });
-    } else if (kind === "session") {
-      const current = data.value.sessions.find((item) => item.id === id);
-      if (!current || current.title === name) return;
-      await invoke("rename_session", { id, title: name });
-    } else {
-      const current = data.value.materials.find((item) => item.id === id);
-      if (!current || current.name === name) return;
-      await invoke("save_material", { material: { ...current, name } });
-    }
-    await refresh();
-  } catch (cause) {
-    report(cause);
-  }
+function toggleFolder(id: string) {
+  if (expandedFolders.value.has(id)) expandedFolders.value.delete(id);
+  else expandedFolders.value.add(id);
+  if (expandedFoldersPersistTimer) clearTimeout(expandedFoldersPersistTimer);
+  expandedFoldersPersistTimer = setTimeout(() => {
+    data.value.settings.explorerExpanded = [...expandedFolders.value];
+    void invoke("save_settings", { settings: data.value.settings }).catch(report);
+  }, 500);
 }
 async function setTheme(theme: Theme) {
   if (data.value.settings.theme === theme) return;
@@ -630,82 +434,10 @@ function toggleSidebar() {
   sidebarOpen.value = !sidebarOpen.value;
   void persistLayoutSettings();
 }
-function handleWindowClick() {
-  if (contextMenu.value) closeContextMenu();
-}
-function handleWindowScroll() {
-  if (contextMenu.value) closeContextMenu();
-}
 function handleWindowKeydown(event: KeyboardEvent) {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "b") {
     event.preventDefault();
     toggleSidebar();
-    return;
-  }
-  if (event.key === "Escape") {
-    if (contextMenu.value) closeContextMenu();
-    if (renamingId.value) cancelRename();
-  }
-}
-async function createSession() {
-  const workspaceId =
-    sessionCreateWorkspaceId.value || selectedWorkspaceId.value;
-  if (!workspaceId || !sessionTitle.value.trim()) return;
-  try {
-    const created = await invoke<Session>("create_session", {
-      workspaceId,
-      title: sessionTitle.value.trim(),
-    });
-    sessionTitle.value = "";
-    selectedWorkspaceId.value = workspaceId;
-    selectedSessionId.value = created.id;
-    await refresh();
-  } catch (cause) {
-    report(cause);
-  }
-}
-function createQuickSession() {
-  if (!workspaces.value.length) return;
-  sessionCreateWorkspaceId.value =
-    selectedWorkspaceId.value || workspaces.value[0]!.id;
-  sessionCreateOpen.value = true;
-}
-function selectWorkspace(workspaceId: string) {
-  if (operationBusy.value) return;
-  selectedWorkspaceId.value = workspaceId;
-  if (session.value?.workspaceId !== workspaceId) {
-    selectedSessionId.value = sessions.value[0]?.id ?? "";
-  }
-  selectedMaterialId.value = materials.value[0]?.id ?? "";
-}
-function selectSession(workspaceId: string, sessionId: string) {
-  if (operationBusy.value) return;
-  selectedWorkspaceId.value = workspaceId;
-  selectedSessionId.value = sessionId;
-}
-function selectMaterial(id: string) {
-  selectedMaterialId.value = id;
-}
-async function importMaterial() {
-  if (!selectedWorkspaceId.value) return;
-  try {
-    const path = await open({
-      multiple: false,
-      title: t("materialPicker.title"),
-      filters: [
-        { name: t("materialPicker.filterName"), extensions: ["txt", "md", "docx"] },
-      ],
-    });
-    if (typeof path === "string") {
-      const item = await invoke<Material>("import_material", {
-        workspaceId: selectedWorkspaceId.value,
-        path,
-      });
-      selectedMaterialId.value = item.id;
-      await refresh();
-    }
-  } catch (cause) {
-    report(cause);
   }
 }
 async function saveMaterial() {
@@ -812,7 +544,10 @@ async function deleteMessage(messageId: string) {
   const target = session.value;
   target.messages = target.messages.filter((item) => item.id !== messageId);
   try {
-    await invoke("save_session", { session: target });
+    await invoke("save_messages", {
+      sessionId: target.id,
+      messages: target.messages,
+    });
   } catch (cause) {
     report(cause);
   }
@@ -840,7 +575,10 @@ async function commitEditMessage() {
   streaming.value = true;
   error.value = "";
   try {
-    await invoke("save_session", { session: target });
+    await invoke("save_messages", {
+      sessionId: target.id,
+      messages: target.messages,
+    });
   } catch (cause) {
     streaming.value = false;
     report(cause);
@@ -866,7 +604,10 @@ async function regenerateMessage(messageId: string) {
   streaming.value = true;
   error.value = "";
   try {
-    await invoke("save_session", { session: target });
+    await invoke("save_messages", {
+      sessionId: target.id,
+      messages: target.messages,
+    });
   } catch (cause) {
     streaming.value = false;
     report(cause);
@@ -1116,17 +857,6 @@ function resizeWithKeyboard(event: KeyboardEvent) {
   );
   void persistLayoutSettings();
 }
-watch(selectedWorkspaceId, () => {
-  if (
-    !operationBusy.value &&
-    session.value?.workspaceId !== selectedWorkspaceId.value
-  ) {
-    selectedSessionId.value = sessions.value[0]?.id ?? "";
-  }
-  if (!operationBusy.value) {
-    selectedMaterialId.value = materials.value[0]?.id ?? "";
-  }
-});
 watch(
   () => material.value?.id,
   () => {
@@ -1147,16 +877,6 @@ watch(
   { immediate: true },
 );
 watch(
-  () => data.value.workspaces.map((item) => item.id),
-  (ids, previousIds) => {
-    const seen = new Set(previousIds ?? []);
-    for (const id of ids) {
-      if (!seen.has(id)) expandedWorkspaces.value.add(id);
-    }
-  },
-  { immediate: true },
-);
-watch(
   () => session.value?.transcription,
   async () => {
     const panel = transcriptPanelRef.value?.transcriptScrollRef;
@@ -1168,7 +888,7 @@ watch(
     panel.scrollTop = panel.scrollHeight;
   },
 );
-watch(selectedSessionId, () => {
+watch(openNodeId, () => {
   revokeImportedAudio();
 });
 // Covers every trigger for (re)submitting sentences for translation: the
@@ -1182,12 +902,10 @@ watch(translationEnabled, (enabled) => {
   if (enabled) syncTranslationQueue();
 });
 watch(translationTargetLanguage, syncTranslationQueue);
-watch(selectedSessionId, syncTranslationQueue);
+watch(openNodeId, syncTranslationQueue);
 watch(operationBusy, (busy) => {
   if (!busy) return;
-  closeContextMenu();
   cancelEditMessage();
-  if (renamingId.value) cancelRename();
 });
 watch(renderedMessages, async () => {
   const panel = workbenchChatRef.value?.messagesRef;
@@ -1207,9 +925,7 @@ onMounted(() => {
       if (capability) systemAudioCapability.value = capability;
     })
     .catch(() => {});
-  window.addEventListener("click", handleWindowClick);
   window.addEventListener("keydown", handleWindowKeydown);
-  window.addEventListener("scroll", handleWindowScroll, true);
   listen<NotesStatusEvent>("notes-status", (event) => {
     const payload = event.payload;
     notesStatusBySession[payload.sessionId] = payload.status;
@@ -1247,9 +963,7 @@ onMounted(() => {
     .catch(() => {});
 });
 onUnmounted(() => {
-  window.removeEventListener("click", handleWindowClick);
   window.removeEventListener("keydown", handleWindowKeydown);
-  window.removeEventListener("scroll", handleWindowScroll, true);
   unlistenNotesStatus?.();
   unlistenTranslationStatus?.();
   recordingGeneration += 1;
@@ -1274,44 +988,15 @@ onUnmounted(() => {
         <span class="spinner"></span> {{ t("loading") }}
       </div>
       <div v-else class="desktop-shell">
-        <AppSidebar
+        <ExplorerView
           v-if="sidebarOpen"
-          v-model:search-query="searchQuery"
-          v-model:sidebar-mode="sidebarMode"
-          v-model:selected-workspace-id="selectedWorkspaceId"
-          v-model:rename-draft="renameDraft"
-          v-model:workspace-name="workspaceName"
-          :filtered-workspaces="filteredWorkspaces"
-          :normalized-search="normalizedSearch"
-          :sessions="data.sessions"
-          :selected-session-id="selectedSessionId"
-          :selected-material-id="selectedMaterialId"
-          :expanded-workspaces="expandedWorkspaces"
-          :renaming-id="renamingId"
+          :nodes="data.nodes"
+          :open-node-id="openNodeId"
+          :expanded-folders="expandedFolders"
           :operation-busy="operationBusy"
-          :filtered-materials="filteredMaterials"
-          :workspace-options="workspaceOptions"
-          :workspaces="workspaces"
-          @toggle-workspace="toggleWorkspaceExpand"
-          @context-menu="
-            openContextMenu(
-              $event.event,
-              $event.kind,
-              $event.id,
-              $event.label,
-              $event.workspaceId,
-            )
-          "
-          @select-workspace="selectWorkspace"
-          @select-session="selectSession"
-          @select-material="selectMaterial"
-          @start-rename="startRename"
-          @cancel-rename="cancelRename"
-          @commit-rename="commitRename"
-          @ask-delete="askDelete"
-          @import-material="importMaterial"
-          @create-quick-session="createQuickSession"
-          @create-workspace="createWorkspace"
+          :language="data.settings.language"
+          @toggle-folder="toggleFolder"
+          @open-node="openNode($event)"
         />
         <section
           ref="layoutRef"
@@ -1344,7 +1029,7 @@ onUnmounted(() => {
                   stroke-linecap="round"
                 /></svg
             ></FluentButton>
-            <h1>{{ session?.title || t("appTitle") }}</h1>
+            <h1>{{ (session && nodeName(openNodeId)) || t("appTitle") }}</h1>
             <div class="header-actions">
               <div class="header-switches" role="group" :aria-label="t('theme.switch')">
                 <button
@@ -1469,19 +1154,15 @@ onUnmounted(() => {
           </template>
           <section v-else class="main-workspace">
             <div v-if="material" class="material-editor-panel">
-              <h2>{{ material.name }}</h2>
+              <h2>{{ nodeName(openNodeId) }}</h2>
               <FluentTextArea
                 v-model="materialDraft"
-                :label="t('sidebar.knowledge.materialContent')"
+                :label="t('material.contentLabel')"
                 class="material-editor"
               />
               <div class="material-actions">
                 <FluentButton tone="secondary" @click="saveMaterial"
                   >{{ t("common.save") }}</FluentButton
-                ><FluentButton
-                  tone="danger"
-                  @click="askDelete('material', material.id, material.name)"
-                  >{{ t("common.delete") }}</FluentButton
                 >
               </div>
             </div>
@@ -1494,56 +1175,6 @@ onUnmounted(() => {
           </section>
         </section>
       </div>
-      <div
-        v-if="contextMenu"
-        ref="contextMenuRef"
-        class="context-menu"
-        :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
-        @click.stop
-      >
-        <button
-          v-if="contextMenu.kind === 'workspace'"
-          type="button"
-          @click="contextMenuNewSession"
-        >
-          {{ t("sidebar.createSession") }}
-        </button>
-        <button type="button" @click="contextMenuRename">{{ t("sidebar.menu.rename") }}</button>
-        <button type="button" class="danger" @click="contextMenuDelete">
-          {{ t("sidebar.menu.delete") }}
-        </button>
-      </div>
-      <FluentDialog v-model:open="sessionCreateOpen" :label="t('sessionCreate.title')">
-        <template #title><h2>{{ t("sessionCreate.title") }}</h2></template>
-        <template #default>
-          <p class="dialog-description">
-            {{ t("sessionCreate.description") }}
-          </p>
-          <FluentSelect
-            v-model="sessionCreateWorkspaceId"
-            :label="t('sidebar.knowledge.workspaceLabel')"
-            :options="workspaceOptions"
-          />
-          <FluentField
-            v-model="sessionTitle"
-            :label="t('sessionCreate.label')"
-            :placeholder="t('sessionCreate.placeholder')"
-          />
-        </template>
-        <template #footer
-          ><FluentButton tone="subtle" @click="sessionCreateOpen = false"
-            >{{ t("common.cancel") }}</FluentButton
-          ><FluentButton
-            tone="primary"
-            :disabled="!sessionTitle.trim() || !sessionCreateWorkspaceId"
-            @click="
-              createSession();
-              sessionCreateOpen = false;
-            "
-            >{{ t("sessionCreate.submit") }}</FluentButton
-          ></template
-        >
-      </FluentDialog>
       <FluentDialog v-model:open="settingsOpen" :label="t('settingsDialog.title')"
         ><template #title><h2>{{ t("settingsDialog.title") }}</h2></template>
         <template #default
@@ -1587,31 +1218,6 @@ onUnmounted(() => {
             >{{ t("common.close") }}</FluentButton
           ><FluentButton tone="primary" @click="saveSettings"
             >{{ t("settingsDialog.save") }}</FluentButton
-          ></template
-        ></FluentDialog
-      >
-      <FluentDialog
-        :open="Boolean(deleteTarget)"
-        :label="deleteCopy.title"
-        @update:open="
-          (open) => {
-            if (!open) deleteTarget = undefined;
-          }
-        "
-        ><template #title
-          ><h2>{{ deleteCopy.title }}</h2></template
-        >
-        <template #default
-          ><p>{{ deleteCopy.body }}</p></template
-        >
-        <template #footer
-          ><FluentButton tone="subtle" @click="deleteTarget = undefined"
-            >{{ t("common.cancel") }}</FluentButton
-          ><FluentButton
-            tone="danger"
-            :disabled="operationBusy"
-            @click="confirmDelete"
-            >{{ deleteCopy.confirmLabel }}</FluentButton
           ></template
         ></FluentDialog
       >

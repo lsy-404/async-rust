@@ -13,12 +13,10 @@ vi.mock("@tauri-apps/api/core", () => ({
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
 
 const state = (): AppData => ({
-  workspaces: [{ id: "w1", name: "Class A" }],
+  nodes: [{ id: "s1", parentId: null, kind: "session", name: "Lesson" }],
   sessions: [
     {
       id: "s1",
-      workspaceId: "w1",
-      title: "Lesson",
       messages: [],
       transcription: "",
       summary: "",
@@ -68,6 +66,17 @@ const stubs = {
 
 function mountApp() {
   return mount(App, { global: { stubs } });
+}
+async function openSessionNode(
+  wrapper: ReturnType<typeof mountApp>,
+  name: string,
+) {
+  const button = wrapper
+    .findAll(".tree-session")
+    .find((item) => item.text() === name);
+  if (!button) throw new Error(`Missing session node: ${name}`);
+  await button.trigger("click");
+  await flushPromises();
 }
 
 describe("tool call cards in the assistant turn", () => {
@@ -139,6 +148,7 @@ describe("tool call cards in the assistant turn", () => {
     });
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson");
     await wrapper.get("textarea").setValue("What is algebra?");
     await wrapper.get("form.composer").trigger("submit");
     await flushPromises();
@@ -206,6 +216,7 @@ describe("tool call cards in the assistant turn", () => {
     });
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson");
     await wrapper.get("textarea").setValue("Search nothing");
     await wrapper.get("form.composer").trigger("submit");
     await flushPromises();

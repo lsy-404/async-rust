@@ -6,42 +6,14 @@ export default {
     close: "关闭",
     settings: "设置",
   },
-  sidebar: {
-    tabs: {
-      sessions: "会话",
-      knowledge: "知识库",
-    },
-    search: "搜索",
-    searchPlaceholder: "搜索工作区、会话或知识库",
-    emptyWorkspaces: "创建一个工作区开始整理课堂。",
-    noSearchResults: "未找到匹配的工作区或会话",
-    toggleWorkspaceAria: "展开或折叠工作区",
-    menu: {
-      rename: "重命名",
-      delete: "删除",
-    },
-    deleteWorkspaceAria: "删除工作区 {name}",
-    deleteSessionAria: "删除会话 {name}",
-    deleteMaterialAria: "删除材料 {name}",
-    knowledge: {
-      workspaceLabel: "工作区",
-      localMaterials: "本地材料",
-      import: "导入",
-      selectWorkspaceFirst: "先选择一个工作区。",
-      emptyMaterials: "导入 TXT、Markdown 或 DOCX 材料。",
-      noSearchResults: "未找到匹配的材料",
-      materialContent: "材料内容",
-    },
-    newWorkspacePlaceholder: "新工作区",
-    createWorkspace: "新建工作区",
-    createSession: "新建会话",
+  explorer: {
+    title: "资源管理器",
+    empty: "还没有内容。",
+    expandAria: "展开文件夹",
+    collapseAria: "折叠文件夹",
   },
-  sessionCreate: {
-    title: "新建会话",
-    description: "将在下方选择的工作区中创建一个新的课堂会话。",
-    label: "会话标题",
-    placeholder: "例如：第 3 课讨论",
-    submit: "新建",
+  material: {
+    contentLabel: "材料内容",
   },
   header: {
     toggleSidebar: "切换侧栏",
@@ -171,42 +143,20 @@ export default {
   },
   workbenchEmpty: {
     title: "选择或创建一个会话",
-    body: "选择或创建一个会话以开始课堂对话，或在知识库中选择一份材料进行编辑。",
+    body: "在左侧资源管理器中选择一个会话以开始课堂对话，或选择一份材料进行编辑。",
   },
   codeBlock: {
     copy: "复制",
     copyAria: "复制代码",
-  },
-  deleteWorkspace: {
-    title: "删除工作区",
-    body: '删除工作区"{name}"会同时删除其中的全部会话与材料，且无法恢复。继续吗？',
-    confirm: "删除工作区",
-  },
-  deleteSession: {
-    title: "删除会话",
-    body: '删除会话"{name}"后，其中的对话与转写记录将无法恢复。继续吗？',
-    confirm: "删除会话",
-  },
-  deleteMaterial: {
-    title: "删除学习资料",
-    body: '删除学习资料"{name}"后无法恢复。继续吗？',
-    confirm: "删除学习资料",
   },
   language: {
     zh: "中文",
     en: "English",
     switch: "切换语言",
   },
-  deleteDialog: {
-    title: "确认删除",
-  },
   notice: {
     materialSaved: "材料已在本地保存。",
     settingsSaved: "设置已在本地保存。",
-  },
-  materialPicker: {
-    title: "选择学习材料",
-    filterName: "学习材料",
   },
   audioPicker: {
     title: "选择录音文件",

@@ -38,52 +38,27 @@ const stubs = {
   ModelConnections: { template: "<div/>" },
 };
 
+// Mixed tree: two folders, each holding a session and a folder holds a
+// material too, matching the node-tree owner decision (sessions and
+// materials live at root or in any folder, in one tree).
 const state = () => ({
-  workspaces: [
-    { id: "w1", name: "课程" },
-    { id: "w2", name: "研讨" },
+  nodes: [
+    { id: "w1", parentId: null, kind: "folder", name: "课程" },
+    { id: "w2", parentId: null, kind: "folder", name: "研讨" },
+    { id: "s1", parentId: "w1", kind: "session", name: "第一节" },
+    { id: "s2", parentId: "w1", kind: "session", name: "第二节" },
+    { id: "s3", parentId: "w2", kind: "session", name: "第三节" },
+    { id: "m1", parentId: "w1", kind: "material", name: "讲义.md" },
+    { id: "m2", parentId: "w2", kind: "material", name: "研讨记录.txt" },
   ],
   sessions: [
-    {
-      id: "s1",
-      workspaceId: "w1",
-      title: "第一节",
-      messages: [],
-      transcription: "",
-      summary: "",
-    },
-    {
-      id: "s2",
-      workspaceId: "w1",
-      title: "第二节",
-      messages: [],
-      transcription: "",
-      summary: "",
-    },
-    {
-      id: "s3",
-      workspaceId: "w2",
-      title: "第三节",
-      messages: [],
-      transcription: "",
-      summary: "",
-    },
+    { id: "s1", messages: [], transcription: "", summary: "" },
+    { id: "s2", messages: [], transcription: "", summary: "" },
+    { id: "s3", messages: [], transcription: "", summary: "" },
   ],
   materials: [
-    {
-      id: "m1",
-      workspaceId: "w1",
-      name: "讲义.md",
-      content: "内容",
-      path: "/tmp/a.md",
-    },
-    {
-      id: "m2",
-      workspaceId: "w2",
-      name: "研讨记录.txt",
-      content: "内容",
-      path: "/tmp/b.txt",
-    },
+    { id: "m1", content: "内容", path: "/tmp/a.md" },
+    { id: "m2", content: "内容", path: "/tmp/b.txt" },
   ],
   settings: {
     providerId: "openai",
@@ -96,8 +71,17 @@ const state = () => ({
   ],
 });
 
+function findByText(wrapper: ReturnType<typeof mount>, selector: string, text: string) {
+  const match = wrapper.findAll(selector).find((item) => item.text() === text);
+  if (!match) throw new Error(`Missing ${selector} with text: ${text}`);
+  return match;
+}
+async function expandFolder(wrapper: ReturnType<typeof mount>, name: string) {
+  await findByText(wrapper, ".tree-folder", name).trigger("click");
+}
+
 describe("original workbench layout", () => {
-  it("keeps session navigation, the knowledge tree and independent workbench panels", async () => {
+  it("keeps session and material navigation as independent workbench panels", async () => {
     const data = state();
     invoke.mockImplementation((command: string) => {
       if (command === "load_state")
@@ -113,34 +97,32 @@ describe("original workbench layout", () => {
     });
     const wrapper = mount(App, { global: { stubs } });
     await flushPromises();
-    const sessions = wrapper.findAll(".tree-session");
-    await sessions[2]!.trigger("click");
+    await expandFolder(wrapper, "课程");
+    await expandFolder(wrapper, "研讨");
+    await findByText(wrapper, ".tree-session", "第三节").trigger("click");
     expect(wrapper.find(".app-header h1").text()).toBe("第三节");
     expect(wrapper.find(".transcript-content").exists()).toBe(true);
     await wrapper.get('[aria-label="切换侧栏"]').trigger("click");
-    expect(wrapper.find(".app-sidebar").exists()).toBe(false);
+    expect(wrapper.find(".explorer").exists()).toBe(false);
     await wrapper.get('[aria-label="切换侧栏"]').trigger("click");
-    expect(wrapper.find(".app-sidebar").exists()).toBe(true);
-    await wrapper
-      .findAll("button")
-      .find((item) => item.text() === "知识库")!
-      .trigger("click");
-    expect(wrapper.text()).toContain("研讨记录.txt");
-    await wrapper.find(".knowledge-head select").setValue("w1");
-    await wrapper.find(".sidebar-search input").setValue("讲义");
-    expect(wrapper.text()).not.toContain("研讨记录.txt");
+    expect(wrapper.find(".explorer").exists()).toBe(true);
+
+    // Selecting a material opens it independently of the session workbench.
+    await findByText(wrapper, ".tree-material", "讲义.md").trigger("click");
     expect(wrapper.text()).toContain("讲义.md");
-    await wrapper
-      .findAll("button")
-      .find((item) => item.text() === "摘要")!
-      .trigger("click");
+    expect(wrapper.find(".material-editor").exists()).toBe(true);
+    expect(wrapper.find(".transcript-content").exists()).toBe(false);
+
+    // Reopening the session keeps the chat/summary tabs and resize handle.
+    await findByText(wrapper, ".tree-session", "第三节").trigger("click");
+    await findByText(wrapper, "button", "摘要").trigger("click");
     expect(wrapper.find(".summary-page").exists()).toBe(true);
     expect(wrapper.find(".resize-handle").attributes("aria-valuenow")).toBe(
       "62",
     );
   });
 
-  it("locks navigation after native recording starts", async () => {
+  it("locks navigation to a different session after native recording starts", async () => {
     const data = state();
     invoke.mockImplementation((command: string) => {
       if (command === "load_state")
@@ -157,45 +139,15 @@ describe("original workbench layout", () => {
     });
     const wrapper = mount(App, { global: { stubs } });
     await flushPromises();
-    await wrapper
-      .findAll("button")
-      .find((item) => item.text() === "开始录音")!
-      .trigger("click");
+    await expandFolder(wrapper, "课程");
+    await findByText(wrapper, ".tree-session", "第一节").trigger("click");
+    await findByText(wrapper, "button", "开始录音").trigger("click");
     await flushPromises();
-    expect(wrapper.find(".tree-session").attributes("disabled")).toBeDefined();
-  });
-
-  it("closes an open context menu when recording starts and refuses to reopen it while busy", async () => {
-    const data = state();
-    invoke.mockImplementation((command: string) => {
-      if (command === "load_state")
-        return Promise.resolve(structuredClone(data));
-      if (command === "stt_status")
-        return Promise.resolve({
-          ready: true,
-          modelName: "local",
-          modelPath: "",
-          sizeBytes: 0,
-        });
-      if (command === "start_recording") return Promise.resolve();
-      return Promise.resolve();
-    });
-    const wrapper = mount(App, { global: { stubs } });
-    await flushPromises();
-    const row = wrapper.find(".workspace-node .tree-row");
-    await row.trigger("contextmenu");
-    expect(wrapper.find(".context-menu").exists()).toBe(true);
-    await wrapper
-      .findAll("button")
-      .find((item) => item.text() === "开始录音")!
-      .trigger("click");
-    await flushPromises();
-    // A recording session is now writing the transcript; any menu left open
-    // over it must be closed rather than acting on a now-stale session.
-    expect(wrapper.find(".context-menu").exists()).toBe(false);
-    // A native contextmenu event bypasses a plain :disabled attribute, so the
-    // guard has to live in the handler itself.
-    await row.trigger("contextmenu");
-    expect(wrapper.find(".context-menu").exists()).toBe(false);
+    expect(
+      findByText(wrapper, ".tree-session", "第二节").attributes("disabled"),
+    ).toBeDefined();
+    // Expand/collapse stays allowed while busy.
+    await expandFolder(wrapper, "研讨");
+    expect(wrapper.find(".explorer").text()).toContain("第三节");
   });
 });

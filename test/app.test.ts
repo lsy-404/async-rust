@@ -18,15 +18,10 @@ vi.mock("@tauri-apps/api/core", () => ({
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen }));
 const state = (): AppData => ({
-  workspaces: [
-    { id: "w1", name: "Class A" },
-    { id: "w2", name: "Class B" },
-  ],
+  nodes: [{ id: "s1", parentId: null, kind: "session", name: "Lesson" }],
   sessions: [
     {
       id: "s1",
-      workspaceId: "w1",
-      title: "Lesson",
       messages: [],
       transcription: "",
       summary: "",
@@ -83,6 +78,17 @@ function buttonWithText(wrapper: ReturnType<typeof mountApp>, text: string) {
   if (!button) throw new Error(`Missing button: ${text}`);
   return button;
 }
+async function openSessionNode(
+  wrapper: ReturnType<typeof mountApp>,
+  name: string,
+) {
+  const button = wrapper
+    .findAll(".tree-session")
+    .find((item) => item.text() === name);
+  if (!button) throw new Error(`Missing session node: ${name}`);
+  await button.trigger("click");
+  await flushPromises();
+}
 
 describe("desktop workbench interactions", () => {
   let data: AppData;
@@ -118,9 +124,6 @@ describe("desktop workbench interactions", () => {
     expect(wrapper.find('select[aria-label="模型供应商"]').exists()).toBe(
       false,
     );
-    await buttonWithText(wrapper, "知识库").trigger("click");
-    expect(wrapper.text()).toContain("TXT、Markdown 或 DOCX");
-    expect(wrapper.text()).not.toContain("导入 PDF");
   });
 
   it("saves appearance settings without rewriting the OAuth provider", async () => {
@@ -132,6 +135,7 @@ describe("desktop workbench interactions", () => {
     data.settings.providerId = "workbuddy";
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson");
     expect(wrapper.find('input[aria-label="兼容 API 地址"]').exists()).toBe(
       false,
     );
@@ -146,6 +150,7 @@ describe("desktop workbench interactions", () => {
   it("refreshes the active model after native auth without dropping the header theme choice", async () => {
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson");
     await buttonWithText(wrapper, "深色").trigger("click");
     await flushPromises();
     data.settings.model = "native-model";
@@ -183,6 +188,7 @@ describe("desktop workbench interactions", () => {
     });
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson");
     await wrapper.get("textarea").setValue("Explain this");
     await wrapper.get("form.composer").trigger("submit");
     await nextTick();
@@ -216,6 +222,7 @@ describe("desktop workbench interactions", () => {
     });
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson");
     await buttonWithText(wrapper, "下载本地转写模型").trigger("click");
     await flushPromises();
     const progress = wrapper.get("progress.fluent-progress-bar");
@@ -229,6 +236,8 @@ describe("desktop workbench interactions", () => {
   });
 
   it("pins native microphone capture to the original session and unlocks after a stop error", async () => {
+    data.nodes.push({ id: "s2", parentId: null, kind: "session", name: "Lesson 2" });
+    data.sessions.push({ id: "s2", messages: [], transcription: "", summary: "" });
     const implementation = invoke.getMockImplementation()!;
     invoke.mockImplementation((command, args) =>
       command === "stop_recording"
@@ -237,6 +246,7 @@ describe("desktop workbench interactions", () => {
     );
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson");
     await buttonWithText(wrapper, "开始录音").trigger("click");
     await flushPromises();
     expect(invoke).toHaveBeenCalledWith("start_recording", {
@@ -246,20 +256,27 @@ describe("desktop workbench interactions", () => {
       language: null,
     });
     expect(
-      wrapper.findAll("button.tree-workspace")[1]?.attributes("disabled"),
+      wrapper
+        .findAll(".tree-session")
+        .find((item) => item.text() === "Lesson 2")
+        ?.attributes("disabled"),
     ).toBeDefined();
     await buttonWithText(wrapper, "停止录音").trigger("click");
     await flushPromises();
     expect(invoke).toHaveBeenCalledWith("stop_recording", { sessionId: "s1" });
     expect(wrapper.text()).toContain("native microphone failed");
     expect(
-      wrapper.findAll("button.tree-workspace")[1]?.attributes("disabled"),
+      wrapper
+        .findAll(".tree-session")
+        .find((item) => item.text() === "Lesson 2")
+        ?.attributes("disabled"),
     ).toBeUndefined();
   });
 
   it("renders native transcript updates before stop and ignores foreign or stale events", async () => {
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson");
     await buttonWithText(wrapper, "开始录音").trigger("click");
     await flushPromises();
     const start = invoke.mock.calls.find(
@@ -307,6 +324,7 @@ describe("desktop workbench interactions", () => {
   it("surfaces an asynchronous recording error and unlocks recording", async () => {
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson");
     await buttonWithText(wrapper, "开始录音").trigger("click");
     await flushPromises();
     const start = invoke.mock.calls.find(
@@ -329,6 +347,7 @@ describe("desktop workbench interactions", () => {
   it("shows the auto-notes toggle on by default and can turn it off", async () => {
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson");
     await buttonWithText(wrapper, "摘要").trigger("click");
     await nextTick();
     const toggle = wrapper.find('button[role="switch"]');
@@ -348,6 +367,7 @@ describe("desktop workbench interactions", () => {
   it("reflects background notes status pushed through the notes-status event", async () => {
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson");
     await buttonWithText(wrapper, "摘要").trigger("click");
     await nextTick();
     const handler = listen.mock.calls.find(
@@ -374,6 +394,7 @@ describe("desktop workbench interactions", () => {
   it("keeps live translation off by default and persists the toggle, target language and view mode", async () => {
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson");
     // Only the transcript panel's switch exists until the summary tab (which
     // hosts the notes switch) is opened, so this is unambiguously it.
     const toggle = wrapper.get('button[role="switch"]');
@@ -420,6 +441,7 @@ describe("desktop workbench interactions", () => {
   it("batches finalized live sentences into one queue call, holding back the still-growing last one", async () => {
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson");
     await wrapper.get('button[role="switch"]').trigger("click");
     await flushPromises();
     invoke.mockClear();
@@ -467,6 +489,7 @@ describe("desktop workbench interactions", () => {
     data.sessions[0]!.transcription = "Cached. Fresh.";
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson");
     await wrapper.get('button[role="switch"]').trigger("click");
     await flushPromises();
 
@@ -506,6 +529,7 @@ describe("desktop workbench interactions", () => {
     data.sessions[0]!.transcription = "Fresh.";
     const wrapper = mountApp();
     await flushPromises();
+    await openSessionNode(wrapper, "Lesson");
     await wrapper.get('button[role="switch"]').trigger("click");
     await flushPromises();
 
