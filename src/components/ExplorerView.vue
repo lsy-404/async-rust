@@ -96,7 +96,12 @@ function focusRow() {
   if (!targetId) return;
   rowEls.get(targetId)?.focus();
 }
-defineExpose({ focusRow });
+// Used after a move or a rename commit so the affected row is visible even
+// when it landed outside the currently scrolled viewport.
+function scrollRowIntoView(id: string) {
+  rowEls.get(id)?.scrollIntoView({ block: "nearest" });
+}
+defineExpose({ focusRow, scrollRowIntoView });
 function handleClick(node: Node) {
   emit("focus-node", node.id);
   if (node.kind === "folder") emit("toggle-folder", node.id);

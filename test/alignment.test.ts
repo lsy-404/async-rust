@@ -24,6 +24,10 @@ if (typeof URL.createObjectURL !== "function") {
 if (typeof URL.revokeObjectURL !== "function") {
   URL.revokeObjectURL = () => undefined;
 }
+// jsdom has no layout engine, so it does not implement scrollIntoView at all.
+if (typeof Element.prototype.scrollIntoView !== "function") {
+  Element.prototype.scrollIntoView = () => undefined;
+}
 
 const stubs = {
   FluentTheme: { template: "<div><slot /></div>" },
@@ -366,6 +370,18 @@ describe("explorer node actions", () => {
     expect(treeRow(wrapper, ".tree-session", "Renamed").exists()).toBe(true);
   });
 
+  it("scrolls the renamed row into view after a commit", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    const scrollSpy = vi.spyOn(Element.prototype, "scrollIntoView");
+    await treeRow(wrapper, ".tree-session", "Session One").trigger("keydown", { key: "F2" });
+    await wrapper.get(".inline-input").setValue("Renamed");
+    await wrapper.get(".inline-input").trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(scrollSpy).toHaveBeenCalledWith({ block: "nearest" });
+    scrollSpy.mockRestore();
+  });
+
   it("renames via the context menu's Rename item, Escape cancels without committing", async () => {
     const wrapper = mountApp();
     await flushPromises();
@@ -656,6 +672,19 @@ describe("explorer drag and drop", () => {
     await rowDiv(wrapper, "Nested").trigger("drop", { dataTransfer });
     await flushPromises();
     expect(invoke).toHaveBeenCalledWith("move_node", { id: "s1", parentId: "f2" });
+  });
+
+  it("scrolls the moved row into view after a successful drop", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    const scrollSpy = vi.spyOn(Element.prototype, "scrollIntoView");
+    const dataTransfer = fakeDataTransfer();
+    await rowDiv(wrapper, "Session One").trigger("dragstart", { dataTransfer });
+    await rowDiv(wrapper, "Nested").trigger("dragover", { dataTransfer });
+    await rowDiv(wrapper, "Nested").trigger("drop", { dataTransfer });
+    await flushPromises();
+    expect(scrollSpy).toHaveBeenCalledWith({ block: "nearest" });
+    scrollSpy.mockRestore();
   });
 
   it("resolves a drop onto a session row to that session's own parent", async () => {

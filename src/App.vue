@@ -561,6 +561,8 @@ async function commitRename() {
     await invoke("rename_node", { id, name });
     await refresh();
     focusedNodeId.value = id;
+    await nextTick();
+    explorerViewRef.value?.scrollRowIntoView(id);
   } catch (cause) {
     report(cause);
   }
@@ -635,6 +637,8 @@ async function handleNodeDrop(payload: { id: string; parentId: string | null }) 
       }
     }
     focusedNodeId.value = payload.id;
+    await nextTick();
+    explorerViewRef.value?.scrollRowIntoView(payload.id);
   } catch (cause) {
     report(cause);
   }
