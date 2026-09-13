@@ -74,3 +74,55 @@ export function pathLabel(nodes: Node[], id: string): string {
   if (!self) return "";
   return [...ancestorsOf(nodes, id), self].map((node) => node.name).join(" / ");
 }
+
+// Includes the node itself, matching the backend's recursive subtree query.
+export function subtreeIds(nodes: Node[], id: string): string[] {
+  const byParent = childrenByParent(nodes);
+  const out: string[] = [];
+  const walk = (nodeId: string) => {
+    out.push(nodeId);
+    for (const child of byParent.get(nodeId) ?? []) walk(child.id);
+  };
+  walk(id);
+  return out;
+}
+
+export interface SubtreeCounts {
+  folders: number;
+  sessions: number;
+  materials: number;
+}
+
+// Excludes the node itself, for the delete-confirmation copy.
+export function subtreeCounts(nodes: Node[], id: string): SubtreeCounts {
+  const byParent = childrenByParent(nodes);
+  const counts: SubtreeCounts = { folders: 0, sessions: 0, materials: 0 };
+  const walk = (nodeId: string) => {
+    for (const child of byParent.get(nodeId) ?? []) {
+      if (child.kind === "folder") counts.folders += 1;
+      else if (child.kind === "session") counts.sessions += 1;
+      else counts.materials += 1;
+      walk(child.id);
+    }
+  };
+  walk(id);
+  return counts;
+}
+
+// A folder resolves to that folder; a session or material resolves to its
+// parent; null (root focused or nothing focused) resolves to root.
+export function resolveCreateTarget(focused: Node | null): string | null {
+  if (!focused) return null;
+  if (focused.kind === "folder") return focused.id;
+  return focused.parentId;
+}
+
+// Focus target after a delete: the row that followed the deleted one in the
+// pre-delete flattened list, else the previous row, else root (null).
+export function nextFocusAfterDelete(flat: FlatRow[], id: string): string | null {
+  const index = flat.findIndex((row) => row.node.id === id);
+  if (index === -1) return null;
+  if (index + 1 < flat.length) return flat[index + 1]!.node.id;
+  if (index > 0) return flat[index - 1]!.node.id;
+  return null;
+}

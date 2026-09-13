@@ -21,6 +21,12 @@ import TranscriptPanel from "./components/TranscriptPanel.vue";
 import { i18n, setLocale } from "./locales";
 import { splitTranscriptSentences } from "./transcript-sentences";
 import {
+  flattenVisible,
+  nextFocusAfterDelete,
+  resolveCreateTarget,
+  subtreeIds,
+} from "./explorer/tree";
+import {
   FluentButton,
   FluentDialog,
   FluentNotice,
@@ -31,6 +37,7 @@ import {
 import type {
   AppData,
   CaptureMode,
+  Node,
   NotesStatus,
   NotesStatusEvent,
   RecordingSource,
@@ -164,6 +171,13 @@ const editingMessageId = ref("");
 const editDraft = ref("");
 const expandedFolders = ref(new Set<string>());
 let expandedFoldersPersistTimer: ReturnType<typeof setTimeout> | undefined;
+const focusedNodeId = ref<string | null>(null);
+const contextMenu = ref<{ x: number; y: number; nodeId: string | null }>();
+const inlineCreate = ref<{ parentId: string | null; kind: "session" | "folder" }>();
+const createDraft = ref("");
+const renamingId = ref("");
+const renameDraft = ref("");
+const deleteTarget = ref<{ nodeId: string }>();
 const themeChoices = computed<{ value: Theme; label: string }[]>(() => [
   { value: "system", label: t("theme.system") },
   { value: "light", label: t("theme.light") },
@@ -175,6 +189,9 @@ function nodeName(id: string): string {
 }
 const activeNode = computed(() =>
   data.value.nodes.find((item) => item.id === openNodeId.value),
+);
+const focusedNode = computed(
+  () => data.value.nodes.find((item) => item.id === focusedNodeId.value) ?? null,
 );
 const session = computed(() =>
   activeNode.value?.kind === "session"
@@ -402,6 +419,135 @@ function toggleFolder(id: string) {
     data.value.settings.explorerExpanded = [...expandedFolders.value];
     void invoke("save_settings", { settings: data.value.settings }).catch(report);
   }, 500);
+}
+function focusNode(id: string | null) {
+  focusedNodeId.value = id;
+}
+function openContextMenu(payload: { x: number; y: number; nodeId: string | null }) {
+  if (operationBusy.value) return;
+  focusedNodeId.value = payload.nodeId;
+  contextMenu.value = payload;
+}
+function closeContextMenu() {
+  contextMenu.value = undefined;
+}
+function startCreate(kind: "session" | "folder") {
+  if (operationBusy.value) return;
+  const parentId = resolveCreateTarget(focusedNode.value);
+  if (parentId) expandedFolders.value.add(parentId);
+  contextMenu.value = undefined;
+  createDraft.value = "";
+  inlineCreate.value = { parentId, kind };
+}
+function cancelCreate() {
+  inlineCreate.value = undefined;
+  createDraft.value = "";
+}
+async function commitCreate() {
+  const create = inlineCreate.value;
+  if (!create || operationBusy.value) return;
+  const name = createDraft.value.trim();
+  inlineCreate.value = undefined;
+  createDraft.value = "";
+  if (!name) return;
+  try {
+    const command = create.kind === "session" ? "create_session" : "create_folder";
+    const node = await invoke<Node>(command, { parentId: create.parentId, name });
+    await refresh();
+    focusedNodeId.value = node.id;
+    if (create.kind === "session") openNode(node.id);
+  } catch (cause) {
+    report(cause);
+  }
+}
+async function startImportMaterial() {
+  if (operationBusy.value) return;
+  const parentId = resolveCreateTarget(focusedNode.value);
+  contextMenu.value = undefined;
+  try {
+    const path = await open({
+      multiple: false,
+      title: t("explorer.importDialogTitle"),
+      filters: [
+        {
+          name: t("explorer.importFilterName"),
+          extensions: ["txt", "md", "markdown", "docx"],
+        },
+      ],
+    });
+    if (typeof path !== "string") return;
+    const node = await invoke<Node>("import_material", { parentId, path });
+    await refresh();
+    if (parentId) expandedFolders.value.add(parentId);
+    focusedNodeId.value = node.id;
+  } catch (cause) {
+    report(cause);
+  }
+}
+function startRename(id: string) {
+  if (operationBusy.value) return;
+  const target = data.value.nodes.find((item) => item.id === id);
+  if (!target) return;
+  contextMenu.value = undefined;
+  renamingId.value = id;
+  renameDraft.value = target.name;
+}
+function cancelRename() {
+  renamingId.value = "";
+  renameDraft.value = "";
+}
+async function commitRename() {
+  const id = renamingId.value;
+  if (!id) return;
+  const name = renameDraft.value.trim();
+  const target = data.value.nodes.find((item) => item.id === id);
+  renamingId.value = "";
+  renameDraft.value = "";
+  if (!name || !target || name === target.name || operationBusy.value) return;
+  try {
+    await invoke("rename_node", { id, name });
+    await refresh();
+    focusedNodeId.value = id;
+  } catch (cause) {
+    report(cause);
+  }
+}
+function openDeleteDialog(id: string) {
+  if (operationBusy.value) return;
+  contextMenu.value = undefined;
+  deleteTarget.value = { nodeId: id };
+}
+function cancelDelete() {
+  deleteTarget.value = undefined;
+}
+async function confirmDelete() {
+  const target = deleteTarget.value;
+  if (!target || operationBusy.value) return;
+  const id = target.nodeId;
+  const flat = flattenVisible(
+    data.value.nodes,
+    expandedFolders.value,
+    data.value.settings.language,
+  );
+  const nextFocus = nextFocusAfterDelete(flat, id);
+  const subtree = subtreeIds(data.value.nodes, id);
+  deleteTarget.value = undefined;
+  try {
+    await invoke("delete_node", { id });
+    await refresh();
+    if (openNodeId.value && subtree.includes(openNodeId.value)) openNodeId.value = "";
+    focusedNodeId.value = nextFocus;
+    let expandedChanged = false;
+    for (const removedId of subtree) {
+      if (expandedFolders.value.delete(removedId)) expandedChanged = true;
+    }
+    if (expandedChanged) {
+      data.value.settings.explorerExpanded = [...expandedFolders.value];
+      await invoke("save_settings", { settings: data.value.settings }).catch(report);
+    }
+  } catch (cause) {
+    report(cause);
+  }
 }
 async function setTheme(theme: Theme) {
   if (data.value.settings.theme === theme) return;
@@ -906,6 +1052,9 @@ watch(openNodeId, syncTranslationQueue);
 watch(operationBusy, (busy) => {
   if (!busy) return;
   cancelEditMessage();
+  closeContextMenu();
+  cancelRename();
+  cancelCreate();
 });
 watch(renderedMessages, async () => {
   const panel = workbenchChatRef.value?.messagesRef;
@@ -995,8 +1144,30 @@ onUnmounted(() => {
           :expanded-folders="expandedFolders"
           :operation-busy="operationBusy"
           :language="data.settings.language"
+          :focused-node-id="focusedNodeId"
+          :context-menu="contextMenu"
+          :inline-create="inlineCreate"
+          :create-draft="createDraft"
+          :renaming-id="renamingId"
+          :rename-draft="renameDraft"
+          :delete-target="deleteTarget"
           @toggle-folder="toggleFolder"
           @open-node="openNode($event)"
+          @focus-node="focusNode"
+          @context-menu="openContextMenu"
+          @close-context-menu="closeContextMenu"
+          @start-create="startCreate"
+          @cancel-create="cancelCreate"
+          @commit-create="commitCreate"
+          @update:create-draft="createDraft = $event"
+          @start-import="startImportMaterial"
+          @start-rename="startRename"
+          @cancel-rename="cancelRename"
+          @commit-rename="commitRename"
+          @update:rename-draft="renameDraft = $event"
+          @open-delete-dialog="openDeleteDialog"
+          @cancel-delete="cancelDelete"
+          @confirm-delete="confirmDelete"
         />
         <section
           ref="layoutRef"

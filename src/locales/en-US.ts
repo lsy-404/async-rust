@@ -11,6 +11,30 @@ export default {
     empty: "Nothing here yet.",
     expandAria: "Expand folder",
     collapseAria: "Collapse folder",
+    newSession: "New Session",
+    newFolder: "New Folder",
+    importMaterial: "Import Material…",
+    open: "Open",
+    rename: "Rename",
+    deleteAction: "Delete",
+    importDialogTitle: "Choose a material file",
+    importFilterName: "Material",
+    delete: {
+      dialogTitle: "Confirm delete",
+      folderWithContents:
+        'Delete folder "{name}"? Its {list} will be permanently deleted. This cannot be undone.',
+      folderEmpty:
+        'Delete folder "{name}"? It will be permanently deleted. This cannot be undone.',
+      session:
+        'Delete session "{name}"? Its transcript, chats and summary will be permanently deleted. This cannot be undone.',
+      material:
+        'Delete material "{name}"? It will be permanently deleted. This cannot be undone.',
+      countFolders: "{n} subfolders",
+      countSessions: "{n} sessions (with transcripts, chats and summaries)",
+      countMaterials: "{n} materials",
+      listAnd: " and ",
+      listSeparator: ", ",
+    },
   },
   material: {
     contentLabel: "Material content",

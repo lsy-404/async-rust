@@ -5,6 +5,7 @@ import App from "../src/App.vue";
 import type { AppData } from "../src/types";
 import { open } from "@tauri-apps/plugin-dialog";
 import { splitTranscriptSentences } from "../src/transcript-sentences";
+import { subtreeIds } from "../src/explorer/tree";
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({
@@ -185,6 +186,381 @@ describe("explorer tree behaviour", () => {
     const wrapper = mountApp();
     await flushPromises();
     expect(wrapper.find(".explorer-empty").text()).toBe("还没有内容。");
+  });
+});
+
+// Context menu, inline rename, inline create and delete, wired to the node
+// tree via App.vue's state (contextMenu/inlineCreate/renamingId/deleteTarget).
+describe("explorer node actions", () => {
+  function nodeActionsState(): AppData {
+    return {
+      nodes: [
+        { id: "f1", parentId: null, kind: "folder", name: "Folder A" },
+        { id: "f2", parentId: "f1", kind: "folder", name: "Nested" },
+        { id: "s1", parentId: "f1", kind: "session", name: "Session One" },
+        { id: "s2", parentId: "f2", kind: "session", name: "Session Two" },
+        { id: "m1", parentId: "f1", kind: "material", name: "Notes.md" },
+        { id: "s3", parentId: null, kind: "session", name: "Root Session" },
+      ],
+      sessions: [
+        { id: "s1", messages: [], transcription: "", summary: "" },
+        { id: "s2", messages: [], transcription: "", summary: "" },
+        { id: "s3", messages: [], transcription: "", summary: "" },
+      ],
+      materials: [{ id: "m1", content: "hello", path: "/tmp/notes.md" }],
+      settings: {
+        providerId: "openai",
+        model: "classroom-test",
+        theme: "system",
+        language: "zh",
+        // Both folders start expanded so tests never need to click a folder
+        // row (which would arm the real 500ms explorerExpanded persistence
+        // timer and leak a stray save_settings invoke into a later test).
+        explorerExpanded: ["f1", "f2"],
+      },
+      providers: [
+        {
+          id: "openai",
+          name: "OpenAI",
+          baseUrl: "http://fixture/v1",
+          models: ["classroom-test"],
+          hasKey: true,
+        },
+      ],
+    };
+  }
+
+  // Mutates `data` the same way the real backend would, so refresh() (which
+  // re-invokes load_state) observes the effect of the prior command.
+  function mockNodeOps(data: AppData) {
+    invoke.mockImplementation(async (command: string, args?: Record<string, any>) => {
+      if (command === "load_state") return structuredClone(data);
+      if (command === "stt_status")
+        return { ready: true, modelName: "fixture", modelPath: "/tmp/model", sizeBytes: 1 };
+      if (command === "create_session") {
+        const node = {
+          id: "new-session",
+          parentId: (args?.parentId as string | null) ?? null,
+          kind: "session" as const,
+          name: args?.name as string,
+        };
+        data.nodes.push(node);
+        data.sessions.push({ id: node.id, messages: [], transcription: "", summary: "" });
+        return node;
+      }
+      if (command === "create_folder") {
+        const node = {
+          id: "new-folder",
+          parentId: (args?.parentId as string | null) ?? null,
+          kind: "folder" as const,
+          name: args?.name as string,
+        };
+        data.nodes.push(node);
+        return node;
+      }
+      if (command === "import_material") {
+        const node = {
+          id: "new-material",
+          parentId: (args?.parentId as string | null) ?? null,
+          kind: "material" as const,
+          name: "picked.md",
+        };
+        data.nodes.push(node);
+        data.materials.push({ id: node.id, content: "picked", path: args?.path as string });
+        return node;
+      }
+      if (command === "rename_node") {
+        const node = data.nodes.find((item) => item.id === args?.id);
+        if (node) node.name = args?.name as string;
+        return node;
+      }
+      if (command === "delete_node") {
+        const removed = new Set(subtreeIds(data.nodes, args?.id as string));
+        data.nodes = data.nodes.filter((item) => !removed.has(item.id));
+        data.sessions = data.sessions.filter((item) => !removed.has(item.id));
+        data.materials = data.materials.filter((item) => !removed.has(item.id));
+        return undefined;
+      }
+      if (command === "save_settings") data.settings = args?.settings as AppData["settings"];
+      return undefined;
+    });
+  }
+
+  function menuItemTexts(wrapper: VueWrapper): string[] {
+    return wrapper.findAll(".context-menu button").map((item) => item.text());
+  }
+  function clickMenuItem(wrapper: VueWrapper, text: string) {
+    return buttonWithText(wrapper, text).trigger("click");
+  }
+  function treeRow(wrapper: VueWrapper, selector: string, name: string) {
+    const match = wrapper.findAll(selector).find((item) => item.text() === name);
+    if (!match) throw new Error(`Missing ${selector}: ${name}`);
+    return match;
+  }
+
+  let data: AppData;
+  beforeEach(() => {
+    data = nodeActionsState();
+    invoke.mockReset();
+    mockNodeOps(data);
+    vi.mocked(open).mockReset();
+  });
+
+  it("shows the right-click menu on the root blank area with only create actions", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await wrapper.get(".explorer-blank").trigger("contextmenu");
+    expect(menuItemTexts(wrapper)).toEqual(["新建会话", "新建文件夹", "导入材料…"]);
+  });
+
+  it("shows New/Import plus Rename and Delete on a folder, no Open", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await treeRow(wrapper, ".tree-folder", "Folder A").trigger("contextmenu");
+    expect(menuItemTexts(wrapper)).toEqual([
+      "新建会话",
+      "新建文件夹",
+      "导入材料…",
+      "重命名",
+      "删除",
+    ]);
+  });
+
+  it("shows only Open, Rename and Delete on a session or material", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await treeRow(wrapper, ".tree-session", "Session One").trigger("contextmenu");
+    expect(menuItemTexts(wrapper)).toEqual(["打开", "重命名", "删除"]);
+    await treeRow(wrapper, ".tree-material", "Notes.md").trigger("contextmenu");
+    expect(menuItemTexts(wrapper)).toEqual(["打开", "重命名", "删除"]);
+  });
+
+  it("closes the context menu on Escape and on an outside click", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await wrapper.get(".explorer-blank").trigger("contextmenu");
+    expect(wrapper.find(".context-menu").exists()).toBe(true);
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    await nextTick();
+    expect(wrapper.find(".context-menu").exists()).toBe(false);
+
+    await wrapper.get(".explorer-blank").trigger("contextmenu");
+    document.body.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    await nextTick();
+    expect(wrapper.find(".context-menu").exists()).toBe(false);
+  });
+
+  it("renames a session via F2: Enter commits the trimmed name", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await treeRow(wrapper, ".tree-session", "Session One").trigger("keydown", { key: "F2" });
+    const input = wrapper.get(".inline-input");
+    expect((input.element as HTMLInputElement).value).toBe("Session One");
+    await input.setValue("  Renamed  ");
+    await input.trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("rename_node", { id: "s1", name: "Renamed" });
+    expect(wrapper.find(".inline-input").exists()).toBe(false);
+    expect(treeRow(wrapper, ".tree-session", "Renamed").exists()).toBe(true);
+  });
+
+  it("renames via the context menu's Rename item, Escape cancels without committing", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await treeRow(wrapper, ".tree-folder", "Folder A").trigger("contextmenu");
+    await clickMenuItem(wrapper, "重命名");
+    const input = wrapper.get(".inline-input");
+    await input.trigger("keydown", { key: "Escape" });
+    expect(wrapper.find(".inline-input").exists()).toBe(false);
+    expect(invoke).not.toHaveBeenCalledWith("rename_node", expect.anything());
+  });
+
+  it("invokes nothing for a blank or unchanged rename", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await treeRow(wrapper, ".tree-folder", "Folder A").trigger("keydown", { key: "F2" });
+    await wrapper.get(".inline-input").setValue("   ");
+    await wrapper.get(".inline-input").trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(invoke).not.toHaveBeenCalledWith("rename_node", expect.anything());
+
+    await treeRow(wrapper, ".tree-folder", "Folder A").trigger("keydown", { key: "F2" });
+    await wrapper.get(".inline-input").trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(invoke).not.toHaveBeenCalledWith("rename_node", expect.anything());
+  });
+
+  it("pre-selects a material's base name, keeping the extension unselected", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await treeRow(wrapper, ".tree-material", "Notes.md").trigger("keydown", { key: "F2" });
+    await flushPromises();
+    const el = wrapper.get(".inline-input").element as HTMLInputElement;
+    expect(el.selectionStart).toBe(0);
+    expect(el.selectionEnd).toBe("Notes".length);
+  });
+
+  it("creates a session inside a folder via the context menu, resolved to that folder", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await treeRow(wrapper, ".tree-folder", "Folder A").trigger("contextmenu");
+    await clickMenuItem(wrapper, "新建会话");
+    await wrapper.get(".inline-input").setValue("New one");
+    await wrapper.get(".inline-input").trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("create_session", {
+      parentId: "f1",
+      name: "New one",
+    });
+  });
+
+  it("creates a folder at root from the blank-area menu", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await wrapper.get(".explorer-blank").trigger("contextmenu");
+    await clickMenuItem(wrapper, "新建文件夹");
+    await wrapper.get(".inline-input").setValue("New folder");
+    await wrapper.get(".inline-input").trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("create_folder", { parentId: null, name: "New folder" });
+  });
+
+  it("Escape cancels inline create; a blank blur invokes nothing", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await wrapper.get(".explorer-blank").trigger("contextmenu");
+    await clickMenuItem(wrapper, "新建会话");
+    await wrapper.get(".inline-input").trigger("keydown", { key: "Escape" });
+    expect(wrapper.find(".inline-input").exists()).toBe(false);
+
+    await wrapper.get(".explorer-blank").trigger("contextmenu");
+    await clickMenuItem(wrapper, "新建会话");
+    await wrapper.get(".inline-input").trigger("blur");
+    await flushPromises();
+    expect(invoke).not.toHaveBeenCalledWith("create_session", expect.anything());
+  });
+
+  it("imports a material via the menu; a cancelled picker creates nothing", async () => {
+    vi.mocked(open).mockResolvedValueOnce(null);
+    const wrapper = mountApp();
+    await flushPromises();
+    await wrapper.get(".explorer-blank").trigger("contextmenu");
+    await clickMenuItem(wrapper, "导入材料…");
+    await flushPromises();
+    expect(invoke).not.toHaveBeenCalledWith("import_material", expect.anything());
+
+    vi.mocked(open).mockResolvedValueOnce("/tmp/picked.md");
+    await wrapper.get(".explorer-blank").trigger("contextmenu");
+    await clickMenuItem(wrapper, "导入材料…");
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("import_material", {
+      parentId: null,
+      path: "/tmp/picked.md",
+    });
+  });
+
+  it("deletes a folder with a count-based confirmation, clearing the open node inside it", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await treeRow(wrapper, ".tree-session", "Session One").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".app-header h1").text()).toBe("Session One");
+
+    await treeRow(wrapper, ".tree-folder", "Folder A").trigger("contextmenu");
+    await clickMenuItem(wrapper, "删除");
+    expect(wrapper.find(".dialog-stub").text()).toContain(
+      "删除文件夹「Folder A」？其中的 1 个子文件夹、2 个会话（含转写、对话和摘要）和 1 份材料将被永久删除，无法撤销。",
+    );
+    await buttonWithText(wrapper, "删除").trigger("click");
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("delete_node", { id: "f1" });
+    expect(wrapper.find(".workbench-empty").exists()).toBe(true);
+    expect(wrapper.findAll(".tree-folder").length).toBe(0);
+  });
+
+  it("deletes a session and moves focus to the previous row when it was last", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await treeRow(wrapper, ".tree-session", "Root Session").trigger("contextmenu");
+    await clickMenuItem(wrapper, "删除");
+    expect(wrapper.find(".dialog-stub").text()).toContain(
+      "删除会话「Root Session」？其转写、对话和摘要将被永久删除，无法撤销。",
+    );
+    await buttonWithText(wrapper, "删除").trigger("click");
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("delete_node", { id: "s3" });
+    expect(wrapper.findAll(".tree-session").find((n) => n.text() === "Root Session")).toBeUndefined();
+  });
+
+  it("deletes a material with its own confirmation copy", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await treeRow(wrapper, ".tree-material", "Notes.md").trigger("contextmenu");
+    await clickMenuItem(wrapper, "删除");
+    expect(wrapper.find(".dialog-stub").text()).toContain(
+      "删除材料「Notes.md」？将被永久删除，无法撤销。",
+    );
+    await buttonWithText(wrapper, "删除").trigger("click");
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("delete_node", { id: "m1" });
+  });
+
+  it("cancel on the delete dialog invokes nothing", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await treeRow(wrapper, ".tree-session", "Root Session").trigger("contextmenu");
+    await clickMenuItem(wrapper, "删除");
+    await buttonWithText(wrapper, "取消").trigger("click");
+    expect(wrapper.find(".dialog-stub").exists()).toBe(false);
+    expect(invoke).not.toHaveBeenCalledWith("delete_node", expect.anything());
+  });
+
+  describe("while an operation is busy", () => {
+    async function makeBusy(wrapper: VueWrapper) {
+      await treeRow(wrapper, ".tree-session", "Root Session").trigger("click");
+      await flushPromises();
+      await buttonWithText(wrapper, "开始录音").trigger("click");
+      await flushPromises();
+    }
+
+    it("refuses to open the context menu and closes one already open", async () => {
+      const wrapper = mountApp();
+      await flushPromises();
+      await treeRow(wrapper, ".tree-session", "Root Session").trigger("contextmenu");
+      expect(wrapper.find(".context-menu").exists()).toBe(true);
+      await makeBusy(wrapper);
+      expect(wrapper.find(".context-menu").exists()).toBe(false);
+      await treeRow(wrapper, ".tree-folder", "Folder A").trigger("contextmenu");
+      expect(wrapper.find(".context-menu").exists()).toBe(false);
+    });
+
+    it("closes an open rename box without committing once recording starts", async () => {
+      const wrapper = mountApp();
+      await flushPromises();
+      await treeRow(wrapper, ".tree-folder", "Folder A").trigger("keydown", { key: "F2" });
+      expect(wrapper.find(".inline-input").exists()).toBe(true);
+      await makeBusy(wrapper);
+      expect(wrapper.find(".inline-input").exists()).toBe(false);
+      expect(invoke).not.toHaveBeenCalledWith("rename_node", expect.anything());
+    });
+
+    it("ignores F2 while busy", async () => {
+      const wrapper = mountApp();
+      await flushPromises();
+      await makeBusy(wrapper);
+      await treeRow(wrapper, ".tree-folder", "Folder A").trigger("keydown", { key: "F2" });
+      expect(wrapper.find(".inline-input").exists()).toBe(false);
+    });
+
+    it("disables the delete confirm button without closing the dialog", async () => {
+      const wrapper = mountApp();
+      await flushPromises();
+      await treeRow(wrapper, ".tree-folder", "Folder A").trigger("contextmenu");
+      await clickMenuItem(wrapper, "删除");
+      await makeBusy(wrapper);
+      expect(wrapper.find(".dialog-stub").exists()).toBe(true);
+      expect(buttonWithText(wrapper, "删除").attributes("disabled")).toBeDefined();
+    });
   });
 });
 
