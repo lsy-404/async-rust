@@ -56,6 +56,21 @@ export interface Session {
   // Gates the background notes job only; the explicit Generate/Refresh button
   // always works. Absent means true (matches the backend's own default).
   notesEnabled?: boolean;
+  // Live translation preferences; absent means off/side-by-side/UI-language.
+  translationEnabled?: boolean;
+  translationTargetLanguage?: string | null;
+  translationMode?: TranslationMode;
+}
+export type TranslationMode = "side-by-side" | "separate";
+// Pushed as the "translation-status" event once a debounced batch finishes;
+// `sentences` names every sentence that batch covered so the frontend can
+// clear their "translating" state whether or not that round succeeded.
+export interface TranslationStatusEvent {
+  sessionId: string;
+  targetLanguage: string;
+  sentences: string[];
+  translations: Record<string, string>;
+  error?: string | null;
 }
 // Pushed as the "notes-status" event while a session's background notes job
 // runs; `summary`/`summaryUpdatedAt` are only present on "idle" (finished).

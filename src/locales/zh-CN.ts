@@ -132,6 +132,15 @@ export default {
       play: "播放",
       pause: "暂停",
     },
+    translate: {
+      toggle: "翻译",
+      targetLanguage: "翻译目标语言",
+      viewMode: "翻译显示方式",
+      sideBySide: "对照",
+      separate: "分栏",
+      translating: "翻译中…",
+      needsProvider: "连接模型后可启用翻译",
+    },
   },
   stt: {
     title: "本地语音转写",

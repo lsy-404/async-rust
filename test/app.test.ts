@@ -370,4 +370,128 @@ describe("desktop workbench interactions", () => {
     expect(wrapper.text()).toContain("自动生成的课堂笔记。");
     wrapper.unmount();
   });
+
+  it("keeps live translation off by default and persists the toggle, target language and view mode", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    // Only the transcript panel's switch exists until the summary tab (which
+    // hosts the notes switch) is opened, so this is unambiguously it.
+    const toggle = wrapper.get('button[role="switch"]');
+    expect(toggle.attributes("aria-checked")).toBe("false");
+    expect(wrapper.find('select[aria-label="翻译目标语言"]').exists()).toBe(false);
+
+    await toggle.trigger("click");
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("set_translation_settings", {
+      id: "s1",
+      enabled: true,
+      targetLanguage: null,
+      mode: "side-by-side",
+    });
+    expect(toggle.attributes("aria-checked")).toBe("true");
+    // Defaults to the app's own UI language (zh in the fixture) until a
+    // target language is explicitly chosen.
+    expect(
+      (wrapper.get('select[aria-label="翻译目标语言"]').element as HTMLSelectElement).value,
+    ).toBe("zh");
+
+    await wrapper
+      .get('select[aria-label="翻译目标语言"]')
+      .setValue("en");
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("set_translation_settings", {
+      id: "s1",
+      enabled: true,
+      targetLanguage: "en",
+      mode: "side-by-side",
+    });
+
+    await wrapper.get('[aria-label="翻译显示方式"] button:last-child').trigger("click");
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("set_translation_settings", {
+      id: "s1",
+      enabled: true,
+      targetLanguage: "en",
+      mode: "separate",
+    });
+    wrapper.unmount();
+  });
+
+  it("batches finalized live sentences into one queue call, holding back the still-growing last one", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await wrapper.get('button[role="switch"]').trigger("click");
+    await flushPromises();
+    invoke.mockClear();
+
+    await buttonWithText(wrapper, "开始录音").trigger("click");
+    await flushPromises();
+    const start = invoke.mock.calls.find(
+      ([command]) => command === "start_recording",
+    )!;
+    invoke.mockClear();
+    start[1].onEvent.onmessage({
+      type: "transcript",
+      sessionId: "s1",
+      text: "First sentence. Second sentence. Still growing",
+    });
+    await flushPromises();
+
+    const queued = invoke.mock.calls.filter(
+      ([command]) => command === "queue_sentence_translations",
+    );
+    expect(queued).toHaveLength(1);
+    expect(queued[0]![1]).toEqual({
+      sessionId: "s1",
+      targetLanguage: "zh",
+      sentences: ["First sentence.", "Second sentence."],
+    });
+    wrapper.unmount();
+  });
+
+  it("shows a cache hit immediately and clears the translating state from the translation-status event", async () => {
+    invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "load_state") return structuredClone(data);
+      if (command === "stt_status")
+        return { ready: true, modelName: "fixture", modelPath: "/tmp/model", sizeBytes: 1 };
+      if (command === "queue_sentence_translations") {
+        const sentences = args?.sentences as string[];
+        // "Cached." is already cached server-side and comes back as an
+        // immediate hit; "Fresh." is not, and stays pending for the event.
+        const hits: Record<string, string> = {};
+        if (sentences.includes("Cached.")) hits["Cached."] = "缓存翻译。";
+        return hits;
+      }
+      return undefined;
+    });
+    data.sessions[0]!.transcription = "Cached. Fresh.";
+    const wrapper = mountApp();
+    await flushPromises();
+    await wrapper.get('button[role="switch"]').trigger("click");
+    await flushPromises();
+
+    // The cache hit for "Cached." renders immediately, from the queue call's
+    // own return value - no need to wait for any event.
+    expect(wrapper.text()).toContain("缓存翻译。");
+    // "Fresh." has no cache hit, so it must show the translating state until
+    // the translation-status event resolves it.
+    expect(wrapper.text()).toContain("翻译中");
+
+    const handler = listen.mock.calls.find(
+      ([name]) => name === "translation-status",
+    )![1];
+    handler({
+      payload: {
+        sessionId: "s1",
+        targetLanguage: "zh",
+        sentences: ["Fresh."],
+        translations: { "Fresh.": "全新翻译。" },
+        error: null,
+      },
+    });
+    await nextTick();
+    expect(wrapper.text()).toContain("全新翻译。");
+    expect(wrapper.text()).not.toContain("翻译中");
+    wrapper.unmount();
+  });
 });

@@ -134,6 +134,15 @@ export default {
       play: "Play",
       pause: "Pause",
     },
+    translate: {
+      toggle: "Translate",
+      targetLanguage: "Translate to",
+      viewMode: "Translation view",
+      sideBySide: "Side by side",
+      separate: "Split",
+      translating: "Translating…",
+      needsProvider: "Connect a model to enable translation",
+    },
   },
   stt: {
     title: "Local speech transcription",

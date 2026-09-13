@@ -40,7 +40,11 @@ fn seed_notes_fixture(state: &AppState, server_uri: &str) {
     .unwrap();
 }
 fn sse_answer(text: &str) -> String {
-    format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\ndata: [DONE]\n\n")
+    // JSON-encode the content so a multi-line batch translation reply (with
+    // real newlines between numbered lines) round-trips correctly instead of
+    // producing invalid JSON via naive string interpolation.
+    let content = serde_json::to_string(text).unwrap();
+    format!("data: {{\"choices\":[{{\"delta\":{{\"content\":{content}}}}}]}}\n\ndata: [DONE]\n\n")
 }
 
 #[test]
@@ -253,6 +257,9 @@ fn created_at_round_trips_through_save_session_edits() {
         summary_updated_at: None,
         transcription_words: None,
         notes_enabled: true,
+        translation_enabled: false,
+        translation_target_language: None,
+        translation_mode: "side-by-side".into(),
     };
     save_session_with(first, &state).unwrap();
     let loaded = load_data(&state).unwrap();
@@ -595,5 +602,359 @@ fn set_notes_enabled_persists_the_flag_and_stops_a_running_job_when_disabled() {
     assert!(!enabled);
 
     let err = set_notes_enabled_impl(&state, "missing", true).unwrap_err();
+    assert_eq!(err, "找不到会话。");
+}
+
+#[test]
+fn parse_numbered_translations_matches_lines_back_to_source_sentences_by_index() {
+    let sentences = vec!["Hello.".to_string(), "How are you?".to_string()];
+    let parsed = parse_numbered_translations("1: 你好。\n2: 你好吗？", &sentences);
+    assert_eq!(parsed.get("Hello.").map(String::as_str), Some("你好。"));
+    assert_eq!(
+        parsed.get("How are you?").map(String::as_str),
+        Some("你好吗？")
+    );
+
+    // A garbled or missing line for one sentence just leaves that one out,
+    // instead of failing the whole batch.
+    let partial = parse_numbered_translations("1: 你好。\nnot a numbered line", &sentences);
+    assert_eq!(partial.len(), 1);
+    assert!(partial.contains_key("Hello."));
+
+    // Out-of-range indices are ignored rather than panicking.
+    let out_of_range = parse_numbered_translations("3: 无效", &sentences);
+    assert!(out_of_range.is_empty());
+}
+
+#[tokio::test]
+async fn translation_batches_several_sentences_into_one_request_and_persists_the_cache() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("state.sqlite3");
+    let state = AppState::open(db_path.clone()).unwrap();
+    seed_notes_fixture(&state, &server.uri());
+
+    let bodies: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = bodies.clone();
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            seen.lock().unwrap().push(body);
+            ResponseTemplate::new(200).set_body_raw(
+                sse_answer("1: 你好。\n2: 今天天气很好。\n3: 再见。"),
+                "text/event-stream",
+            )
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let sentences = vec![
+        "Hello.".to_string(),
+        "The weather is nice today.".to_string(),
+        "Goodbye.".to_string(),
+    ];
+    // Three sentences finalising together must collapse into exactly one
+    // request, not three - enqueue seeds the pending batch for all of them...
+    let (hits, should_schedule) = enqueue_translations(&state, "s", "zh", &sentences).unwrap();
+    assert!(hits.is_empty());
+    assert!(should_schedule);
+    // ...and run_translation_batch is the debounce flush's own body, called
+    // directly here instead of waiting out the real timer.
+    let events: Arc<std::sync::Mutex<Vec<TranslationBatchResult>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let collected = events.clone();
+    run_translation_batch(&state, "s", "zh", &move |result| {
+        collected.lock().unwrap().push(result)
+    })
+    .await;
+
+    assert_eq!(
+        bodies.lock().unwrap().len(),
+        1,
+        "expected one batched request"
+    );
+    let content = bodies.lock().unwrap()[0]["messages"][1]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(content.contains("1: Hello."));
+    assert!(content.contains("2: The weather is nice today."));
+    assert!(content.contains("3: Goodbye."));
+
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].translations.len(), 3);
+    assert_eq!(
+        events[0].translations.get("Hello.").map(String::as_str),
+        Some("你好。")
+    );
+    assert!(events[0].error.is_none());
+
+    // Persisted to the cache table, keyed by content + language, not session.
+    let cached: String = state
+        .db()
+        .unwrap()
+        .query_row(
+            "SELECT translation FROM sentence_translations WHERE source_text='Goodbye.' AND target_language='zh'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cached, "再见。");
+
+    // Cache hits survive a reload of the whole app state.
+    drop(state);
+    let reopened = AppState::open(db_path).unwrap();
+    let (hits, should_schedule) = enqueue_translations(&reopened, "s", "zh", &sentences).unwrap();
+    assert_eq!(hits.len(), 3);
+    assert!(
+        !should_schedule,
+        "an all-cache-hit request must not queue a request"
+    );
+}
+
+#[tokio::test]
+async fn cache_hit_never_retranslates_and_alignment_survives_transcript_growth() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::open(dir.path().join("state.sqlite3")).unwrap();
+    seed_notes_fixture(&state, &server.uri());
+
+    let bodies: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = bodies.clone();
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            seen.lock().unwrap().push(body);
+            ResponseTemplate::new(200).set_body_raw(sse_answer("1: 新句子。"), "text/event-stream")
+        })
+        .mount(&server)
+        .await;
+
+    // Round one: a single sentence, as if the transcript had just reached its
+    // first sentence boundary.
+    let first_round = vec!["Sentence A.".to_string()];
+    enqueue_translations(&state, "s", "zh", &first_round).unwrap();
+    run_translation_batch(&state, "s", "zh", &|_| {}).await;
+    assert_eq!(bodies.lock().unwrap().len(), 1);
+
+    // The transcript grows and re-segments: sentence A's text is unchanged
+    // (so it must hit cache, by content, regardless of its position) and a
+    // brand new sentence B appears alongside it.
+    let regrown = vec!["Sentence A.".to_string(), "New sentence.".to_string()];
+    let (hits, should_schedule) = enqueue_translations(&state, "s", "zh", &regrown).unwrap();
+    assert_eq!(
+        hits.len(),
+        1,
+        "the unchanged sentence must be an instant cache hit"
+    );
+    assert_eq!(hits.get("Sentence A."), Some(&"新句子。".to_string()));
+    assert!(
+        should_schedule,
+        "the new sentence must still queue a request"
+    );
+
+    run_translation_batch(&state, "s", "zh", &|_| {}).await;
+    // Sentence A must never be sent again - only the genuinely new sentence.
+    assert_eq!(bodies.lock().unwrap().len(), 2);
+    let second_request_content = bodies.lock().unwrap()[1]["messages"][1]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(!second_request_content.contains("Sentence A."));
+    assert!(second_request_content.contains("New sentence."));
+}
+
+#[tokio::test]
+async fn translation_runs_concurrently_with_chat_and_notes_without_rejection() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::open(dir.path().join("state.sqlite3")).unwrap();
+    seed_notes_fixture(&state, &server.uri());
+
+    // A background notes job holds its own slot, and a translation batch is
+    // in flight holding its own slot too (neither is chat's `cancellations`
+    // map), so chat for the same session must complete unblocked by either.
+    let _notes_token = notes_generation_token(&state, "s").unwrap();
+    let _translation_token = reserve_token(
+        &state.translation_cancellations,
+        &translation_key("s", "zh"),
+        "busy",
+    )
+    .unwrap();
+
+    // One responder for the whole test, distinguishing the chat turn from a
+    // translation batch by its prompt content, since both share the same
+    // wiremock endpoint.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(|req: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            let is_translation = body["messages"].as_array().unwrap().iter().any(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("Translate each numbered sentence"))
+            });
+            let text = if is_translation {
+                "1: 你好。"
+            } else {
+                "answer"
+            };
+            ResponseTemplate::new(200).set_body_raw(sse_answer(text), "text/event-stream")
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let channel = Channel::<StreamEvent>::new(|_| Ok(()));
+    chat_impl(&state, "s", "hello", channel).await.unwrap();
+
+    let message_count: i64 = state
+        .db()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id='s'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        message_count, 2,
+        "chat must complete normally, unblocked by notes or translation holding their own slots"
+    );
+
+    // Translation itself must also not be blocked by chat's (now-released) or
+    // notes' slot: a fresh batch for a different language on the same session
+    // goes through fine, since it reserves its own translation_key.
+    drop(_notes_token);
+    enqueue_translations(&state, "s", "en", &["Hello.".to_string()]).unwrap();
+    run_translation_batch(&state, "s", "en", &|_| {}).await;
+    let cached: String = state
+        .db()
+        .unwrap()
+        .query_row(
+            "SELECT translation FROM sentence_translations WHERE source_text='Hello.' AND target_language='en'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cached, "你好。");
+}
+
+#[test]
+fn stop_translation_for_session_cancels_only_that_sessions_keys() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
+    state
+        .db()
+        .unwrap()
+        .execute("INSERT INTO workspaces VALUES('w','Class')", [])
+        .unwrap();
+    state
+        .db()
+        .unwrap()
+        .execute(
+            "INSERT INTO sessions(id,workspace_id,title) VALUES('s','w','Lesson'),('other','w','Other')",
+            [],
+        )
+        .unwrap();
+
+    let token_zh = reserve_token(
+        &state.translation_cancellations,
+        &translation_key("s", "zh"),
+        "busy",
+    )
+    .unwrap();
+    let token_en = reserve_token(
+        &state.translation_cancellations,
+        &translation_key("s", "en"),
+        "busy",
+    )
+    .unwrap();
+    let other_token = reserve_token(
+        &state.translation_cancellations,
+        &translation_key("other", "zh"),
+        "busy",
+    )
+    .unwrap();
+    state.translations.lock().unwrap().insert(
+        translation_key("s", "zh"),
+        TranslationTracker {
+            pending: vec!["x".into()],
+            scheduled: true,
+        },
+    );
+
+    stop_translation_for_session(&state, "s");
+
+    assert!(token_zh.is_cancelled());
+    assert!(token_en.is_cancelled());
+    assert!(
+        !other_token.is_cancelled(),
+        "must not cancel another session's job"
+    );
+    assert!(state
+        .translations
+        .lock()
+        .unwrap()
+        .get(&translation_key("s", "zh"))
+        .is_none());
+}
+
+#[test]
+fn set_translation_settings_persists_fields_and_stops_a_running_job_when_disabled() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
+    state
+        .db()
+        .unwrap()
+        .execute("INSERT INTO workspaces VALUES('w','Class')", [])
+        .unwrap();
+    state
+        .db()
+        .unwrap()
+        .execute(
+            "INSERT INTO sessions(id,workspace_id,title) VALUES('s','w','Lesson')",
+            [],
+        )
+        .unwrap();
+    let token = reserve_token(
+        &state.translation_cancellations,
+        &translation_key("s", "ja"),
+        "busy",
+    )
+    .unwrap();
+
+    set_translation_settings_impl(&state, "s", true, Some("ja"), "separate").unwrap();
+    let (enabled, target, mode): (bool, Option<String>, String) = state
+        .db()
+        .unwrap()
+        .query_row(
+            "SELECT translation_enabled,translation_target_language,translation_mode FROM sessions WHERE id='s'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert!(enabled);
+    assert_eq!(target.as_deref(), Some("ja"));
+    assert_eq!(mode, "separate");
+    assert!(
+        !token.is_cancelled(),
+        "enabling must not cancel an in-flight job"
+    );
+
+    set_translation_settings_impl(&state, "s", false, Some("ja"), "separate").unwrap();
+    assert!(
+        token.is_cancelled(),
+        "disabling must stop a running translation job"
+    );
+
+    let err = set_translation_settings_impl(&state, "s", true, None, "bogus").unwrap_err();
+    assert_eq!(err, "无效的显示方式。");
+
+    let err =
+        set_translation_settings_impl(&state, "missing", true, None, "side-by-side").unwrap_err();
     assert_eq!(err, "找不到会话。");
 }

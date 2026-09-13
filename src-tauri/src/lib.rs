@@ -32,6 +32,12 @@ const CONTEXT_LIMIT: usize = 48_000;
 // overlap from before that point so context isn't lost at the boundary.
 const NOTES_THRESHOLD_CHARS: usize = 800;
 const NOTES_OVERLAP_CHARS: usize = 200;
+// Live translation batching rule: several sentences that finish while recording
+// often land within milliseconds of each other (a VAD flush, a long pause);
+// this is how long a session+language's pending queue waits, once non-empty,
+// before one request is sent for everything that accumulated - never one
+// request per sentence.
+const TRANSLATION_DEBOUNCE_MS: u64 = 1200;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -80,9 +86,20 @@ pub struct Session {
     // button always works regardless of this flag.
     #[serde(default = "default_true")]
     pub notes_enabled: bool,
+    // All three below gate/scope the background live-translation job only;
+    // absent target_language means "follow the app's UI language".
+    #[serde(default)]
+    pub translation_enabled: bool,
+    #[serde(default)]
+    pub translation_target_language: Option<String>,
+    #[serde(default = "default_translation_mode")]
+    pub translation_mode: String,
 }
 fn default_true() -> bool {
     true
+}
+fn default_translation_mode() -> String {
+    "side-by-side".into()
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -197,6 +214,11 @@ pub struct AppState {
     // reserve the same slot chat needs and block the user from chatting.
     notes_cancellations: Mutex<HashMap<String, CancellationToken>>,
     notes: Mutex<HashMap<String, NotesTracker>>,
+    // A third, independent map again: translation writes its own cache table
+    // rather than the `summary` column notes/chat share, so it never needs to
+    // defer to either of them and must never share a cancellation slot with them.
+    translation_cancellations: Mutex<HashMap<String, CancellationToken>>,
+    translations: Mutex<HashMap<String, TranslationTracker>>,
 }
 
 #[derive(Default)]
@@ -209,6 +231,18 @@ struct NotesTracker {
     // the session); picked up as one more round once that clears, so jobs
     // never stack for the same session.
     pending: bool,
+}
+// Keyed by `translation_key(session_id, target_language)`: one batch queue per
+// session+language pair, so switching languages mid-recording starts a fresh
+// queue instead of mixing pending sentences meant for two different languages.
+#[derive(Default)]
+struct TranslationTracker {
+    // Source sentence texts awaiting translation, insertion order, deduped.
+    pending: Vec<String>,
+    // True from the moment a debounce flush is scheduled until that flush's
+    // loop finds the pending queue empty; guards against spawning a second
+    // debounce timer while one is already outstanding or running.
+    scheduled: bool,
 }
 
 impl AppState {
@@ -229,6 +263,8 @@ impl AppState {
             cancellations: Mutex::new(HashMap::new()),
             notes_cancellations: Mutex::new(HashMap::new()),
             notes: Mutex::new(HashMap::new()),
+            translation_cancellations: Mutex::new(HashMap::new()),
+            translations: Mutex::new(HashMap::new()),
         };
         state.db().map(|_| state)
     }
@@ -261,7 +297,8 @@ fn open_database(path: &Path) -> Result<Connection, String> {
       CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, role TEXT NOT NULL, content TEXT NOT NULL, position INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS materials(id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE, name TEXT NOT NULL, content TEXT NOT NULL, path TEXT);
       CREATE TABLE IF NOT EXISTS providers(id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, models_json TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS settings(singleton INTEGER PRIMARY KEY CHECK(singleton=1), json TEXT NOT NULL);") .map_err(|e| e.to_string())?;
+      CREATE TABLE IF NOT EXISTS settings(singleton INTEGER PRIMARY KEY CHECK(singleton=1), json TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS sentence_translations(source_text TEXT NOT NULL, target_language TEXT NOT NULL, translation TEXT NOT NULL, PRIMARY KEY(source_text, target_language));") .map_err(|e| e.to_string())?;
     // Additive migrations for columns that postdate a user's existing database;
     // guarded so they only ever run once and never touch existing rows.
     ensure_column(&db, "sessions", "summary_updated_at", "TEXT")?;
@@ -271,6 +308,19 @@ fn open_database(path: &Path) -> Result<Connection, String> {
         "sessions",
         "notes_enabled",
         "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_column(
+        &db,
+        "sessions",
+        "translation_enabled",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(&db, "sessions", "translation_target_language", "TEXT")?;
+    ensure_column(
+        &db,
+        "sessions",
+        "translation_mode",
+        "TEXT NOT NULL DEFAULT 'side-by-side'",
     )?;
     ensure_column(&db, "messages", "created_at", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(&db, "messages", "tool_calls", "TEXT")?;
@@ -348,7 +398,7 @@ fn load_data(state: &AppState) -> Result<AppData, String> {
     let mut sessions = Vec::new();
     let mut statement = db
         .prepare(
-            "SELECT id,workspace_id,title,transcription,summary,summary_updated_at,transcription_words,notes_enabled FROM sessions ORDER BY rowid",
+            "SELECT id,workspace_id,title,transcription,summary,summary_updated_at,transcription_words,notes_enabled,translation_enabled,translation_target_language,translation_mode FROM sessions ORDER BY rowid",
         )
         .map_err(|e| e.to_string())?;
     let rows = statement
@@ -362,6 +412,9 @@ fn load_data(state: &AppState) -> Result<AppData, String> {
                 r.get::<_, Option<String>>(5)?,
                 r.get::<_, Option<String>>(6)?,
                 r.get::<_, bool>(7)?,
+                r.get::<_, bool>(8)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, String>(10)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -375,6 +428,9 @@ fn load_data(state: &AppState) -> Result<AppData, String> {
             summary_updated_at,
             transcription_words,
             notes_enabled,
+            translation_enabled,
+            translation_target_language,
+            translation_mode,
         ) = row.map_err(|e| e.to_string())?;
         let transcription_words = transcription_words
             .map(|raw| serde_json::from_str(&raw).map_err(|e| e.to_string()))
@@ -420,6 +476,9 @@ fn load_data(state: &AppState) -> Result<AppData, String> {
             summary_updated_at,
             transcription_words,
             notes_enabled,
+            translation_enabled,
+            translation_target_language,
+            translation_mode,
         });
     }
     let materials = db
@@ -544,6 +603,9 @@ fn create_session(
         summary_updated_at: None,
         transcription_words: None,
         notes_enabled: true,
+        translation_enabled: false,
+        translation_target_language: None,
+        translation_mode: default_translation_mode(),
     };
     state
         .db()?
@@ -600,9 +662,45 @@ fn set_notes_enabled(
 ) -> Result<(), String> {
     set_notes_enabled_impl(&state, &id, enabled)
 }
+fn set_translation_settings_impl(
+    state: &AppState,
+    id: &str,
+    enabled: bool,
+    target_language: Option<&str>,
+    mode: &str,
+) -> Result<(), String> {
+    if !matches!(mode, "side-by-side" | "separate") {
+        return Err("无效的显示方式。".into());
+    }
+    let updated = state
+        .db()?
+        .execute(
+            "UPDATE sessions SET translation_enabled=?,translation_target_language=?,translation_mode=? WHERE id=?",
+            params![enabled, target_language, mode, id],
+        )
+        .map_err(|e| e.to_string())?;
+    if updated == 0 {
+        return Err("找不到会话。".into());
+    }
+    if !enabled {
+        stop_translation_for_session(state, id);
+    }
+    Ok(())
+}
+#[tauri::command]
+fn set_translation_settings(
+    id: String,
+    enabled: bool,
+    target_language: Option<String>,
+    mode: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    set_translation_settings_impl(&state, &id, enabled, target_language.as_deref(), &mode)
+}
 #[tauri::command]
 fn delete_session(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     stop_notes_for_session(&state, &id);
+    stop_translation_for_session(&state, &id);
     state
         .db()?
         .execute("DELETE FROM sessions WHERE id=?", [id])
@@ -618,13 +716,16 @@ fn save_session_with(session: Session, state: &AppState) -> Result<(), String> {
     let tx = db.transaction().map_err(|e| e.to_string())?;
     let updated = tx
         .execute(
-            "UPDATE sessions SET title=?,transcription=?,summary=?,summary_updated_at=?,notes_enabled=? WHERE id=?",
+            "UPDATE sessions SET title=?,transcription=?,summary=?,summary_updated_at=?,notes_enabled=?,translation_enabled=?,translation_target_language=?,translation_mode=? WHERE id=?",
             params![
                 session.title,
                 session.transcription,
                 session.summary,
                 session.summary_updated_at,
                 session.notes_enabled,
+                session.translation_enabled,
+                session.translation_target_language,
+                session.translation_mode,
                 session.id
             ],
         )
@@ -862,6 +963,27 @@ fn stop_notes_for_session(state: &AppState, session_id: &str) {
     if let Ok(mut tokens) = state.notes_cancellations.lock() {
         if let Some(token) = tokens.remove(session_id) {
             token.cancel();
+        }
+    }
+}
+// One session can have pending/in-flight translation jobs for several target
+// languages at once (each keyed by translation_key), so this sweeps every key
+// carrying this session's prefix rather than a single exact key.
+fn stop_translation_for_session(state: &AppState, session_id: &str) {
+    let prefix = format!("{session_id}\u{0}");
+    if let Ok(mut jobs) = state.translations.lock() {
+        jobs.retain(|key, _| !key.starts_with(&prefix));
+    }
+    if let Ok(mut tokens) = state.translation_cancellations.lock() {
+        let keys: Vec<String> = tokens
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(token) = tokens.remove(&key) {
+                token.cancel();
+            }
         }
     }
 }
@@ -1201,6 +1323,229 @@ fn emit_notes_event(app: &tauri::AppHandle, session_id: &str, event: NotesEvent)
     let _ = app.emit("notes-status", payload);
 }
 
+// One pending/cancellation queue per session+language pair, so switching the
+// target language mid-recording starts a fresh queue rather than mixing
+// sentences meant for two different languages.
+fn translation_key(session_id: &str, target_language: &str) -> String {
+    format!("{session_id}\u{0}{target_language}")
+}
+/// Looks up each sentence in the persisted cache; anything not found is added
+/// to that session+language's pending batch (deduped) for the debounce flush
+/// to pick up. Returns the immediate cache hits (the caller can show these
+/// right away) and whether a new flush needs to be scheduled.
+fn enqueue_translations(
+    state: &AppState,
+    session_id: &str,
+    target_language: &str,
+    sentences: &[String],
+) -> Result<(HashMap<String, String>, bool), String> {
+    let db = state.db()?;
+    let mut hits = HashMap::new();
+    let mut misses = Vec::new();
+    for sentence in sentences {
+        let text = sentence.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let cached: Option<String> = db
+            .query_row(
+                "SELECT translation FROM sentence_translations WHERE source_text=? AND target_language=?",
+                params![text, target_language],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        match cached {
+            Some(translation) => {
+                hits.insert(text.to_string(), translation);
+            }
+            None => misses.push(text.to_string()),
+        }
+    }
+    if misses.is_empty() {
+        return Ok((hits, false));
+    }
+    let key = translation_key(session_id, target_language);
+    let mut jobs = state.translations.lock().map_err(|_| "翻译状态不可用。")?;
+    let entry = jobs.entry(key).or_default();
+    for text in misses {
+        if !entry.pending.iter().any(|existing| existing == &text) {
+            entry.pending.push(text);
+        }
+    }
+    let should_schedule = !entry.scheduled;
+    entry.scheduled = true;
+    Ok((hits, should_schedule))
+}
+/// Parses a "N: translation" line-per-sentence reply back into a
+/// source-sentence -> translation map. A line the model garbles or omits is
+/// simply left out (that sentence stays uncached and gets retried whenever it
+/// is next requested) rather than failing the whole batch.
+fn parse_numbered_translations(answer: &str, sentences: &[String]) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for line in answer.lines() {
+        let line = line.trim();
+        let Some((num, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Ok(index) = num.trim().parse::<usize>() else {
+            continue;
+        };
+        if index == 0 || index > sentences.len() {
+            continue;
+        }
+        let translation = rest.trim();
+        if translation.is_empty() {
+            continue;
+        }
+        out.insert(sentences[index - 1].clone(), translation.to_string());
+    }
+    out
+}
+/// One HTTP round for a batch of sentences: builds a numbered prompt, calls
+/// the user's configured model through the same streamed_completion path chat
+/// and notes use (a no-op channel discards the deltas; only the final text
+/// matters here), parses the reply and upserts every sentence it could match
+/// into the persisted cache.
+async fn translate_batch_impl(
+    state: &AppState,
+    session_id: &str,
+    target_language: &str,
+    sentences: &[String],
+) -> Result<HashMap<String, String>, String> {
+    let key = translation_key(session_id, target_language);
+    let token = reserve_token(
+        &state.translation_cancellations,
+        &key,
+        "该语言的翻译任务正在进行。",
+    )?;
+    let mut user_content = format!(
+        "Translate each numbered sentence into the language identified by ISO 639-1 code \"{target_language}\". Reply with exactly one line per sentence in the form \"N: translation\", preserving the original numbering and order, and nothing else.\n\n"
+    );
+    for (index, sentence) in sentences.iter().enumerate() {
+        user_content.push_str(&format!("{}: {}\n", index + 1, sentence));
+    }
+    let messages = vec![
+        json!({"role":"system","content":"You translate sentences from a live classroom transcript. Reply only with the numbered translations in the exact requested format, with no extra commentary."}),
+        json!({"role":"user","content":user_content}),
+    ];
+    let channel = Channel::<StreamEvent>::new(|_| Ok(()));
+    let result = streamed_completion(state, session_id, messages, None, channel, token).await;
+    state
+        .translation_cancellations
+        .lock()
+        .map_err(|_| "翻译状态不可用。")?
+        .remove(&key);
+    let (answer, _) = result?;
+    let parsed = parse_numbered_translations(&answer, sentences);
+    let db = state.db()?;
+    for (source, translation) in &parsed {
+        db.execute(
+            "INSERT INTO sentence_translations(source_text,target_language,translation) VALUES(?,?,?) ON CONFLICT(source_text,target_language) DO UPDATE SET translation=excluded.translation",
+            params![source, target_language, translation],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(parsed)
+}
+/// Result of one batch translation round, for the caller to turn into a
+/// "translation-status" event.
+struct TranslationBatchResult {
+    sentences: Vec<String>,
+    translations: HashMap<String, String>,
+    error: Option<String>,
+}
+/// Drives the debounced batch queue for one session+language pair: drains
+/// whatever is pending, sends one request for it, and loops immediately
+/// (rather than waiting a further debounce) if more sentences queued while
+/// that request was in flight - mirroring the notes job's own rerun loop, just
+/// triggered by a timer instead of a character threshold. Exits (clearing
+/// `scheduled`) once the pending queue is actually empty.
+async fn run_translation_batch(
+    state: &AppState,
+    session_id: &str,
+    target_language: &str,
+    on_event: &(impl Fn(TranslationBatchResult) + Send + Sync),
+) {
+    let key = translation_key(session_id, target_language);
+    loop {
+        let batch = {
+            let Ok(mut jobs) = state.translations.lock() else {
+                return;
+            };
+            let Some(entry) = jobs.get_mut(&key) else {
+                return;
+            };
+            if entry.pending.is_empty() {
+                jobs.remove(&key);
+                return;
+            }
+            std::mem::take(&mut entry.pending)
+        };
+        let result = translate_batch_impl(state, session_id, target_language, &batch).await;
+        match result {
+            Ok(translations) => on_event(TranslationBatchResult {
+                sentences: batch,
+                translations,
+                error: None,
+            }),
+            Err(error) => on_event(TranslationBatchResult {
+                sentences: batch,
+                translations: HashMap::new(),
+                error: Some(error),
+            }),
+        }
+    }
+}
+/// Turns one batch result into a "translation-status" event the frontend
+/// listens for, matching the sentences it asked about so it can clear their
+/// "translating" state regardless of whether that round succeeded.
+fn emit_translation_event(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    target_language: &str,
+    result: TranslationBatchResult,
+) {
+    let payload = json!({
+        "sessionId": session_id,
+        "targetLanguage": target_language,
+        "sentences": result.sentences,
+        "translations": result.translations,
+        "error": result.error,
+    });
+    let _ = app.emit("translation-status", payload);
+}
+#[tauri::command]
+async fn queue_sentence_translations(
+    app: tauri::AppHandle,
+    session_id: String,
+    target_language: String,
+    sentences: Vec<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<HashMap<String, String>, String> {
+    let target_language = target_language.trim().to_string();
+    if target_language.is_empty() {
+        return Err("目标语言不能为空。".into());
+    }
+    let (hits, should_schedule) =
+        enqueue_translations(&state, &session_id, &target_language, &sentences)?;
+    if should_schedule {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(TRANSLATION_DEBOUNCE_MS)).await;
+            let state = app.state::<AppState>();
+            let emit_app = app.clone();
+            let emit_session_id = session_id.clone();
+            let emit_target_language = target_language.clone();
+            run_translation_batch(&state, &session_id, &target_language, &move |result| {
+                emit_translation_event(&emit_app, &emit_session_id, &emit_target_language, result)
+            })
+            .await;
+        });
+    }
+    Ok(hits)
+}
+
 #[tauri::command]
 async fn stt_status(state: tauri::State<'_, AppState>) -> Result<stt::SttStatus, String> {
     state.stt.status().await
@@ -1464,9 +1809,10 @@ async fn stop_recording(
 ) -> Result<String, String> {
     let path = state.recording.stop(&session_id).await?;
     // Recording has stopped, so no more transcript will arrive to fold in;
-    // cancel any in-flight or pending background notes job for this session
-    // rather than let it write a note after the fact.
+    // cancel any in-flight or pending background notes/translation job for
+    // this session rather than let it write results after the fact.
     stop_notes_for_session(&state, &session_id);
+    stop_translation_for_session(&state, &session_id);
     tokio::fs::remove_file(&path)
         .await
         .map_err(|_| "转写完成，但无法清理临时录音。")?;
@@ -1486,6 +1832,7 @@ async fn cancel_recording(
 ) -> Result<(), String> {
     if let Some(session_id) = &session_id {
         stop_notes_for_session(&state, session_id);
+        stop_translation_for_session(&state, session_id);
     }
     state.recording.cancel().await
 }
@@ -1517,6 +1864,8 @@ pub fn run() {
             create_session,
             rename_session,
             set_notes_enabled,
+            set_translation_settings,
+            queue_sentence_translations,
             delete_session,
             save_session,
             import_material,

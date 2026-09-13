@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { i18n } from "../locales";
-import { FluentButton, FluentSelect, FluentSlider } from "@platform-kit/fluent/vue";
+import { FluentButton, FluentSelect, FluentSlider, FluentSwitch } from "@platform-kit/fluent/vue";
 import type { FluentSelectOption } from "@platform-kit/fluent/vue";
-import type { CaptureMode, SystemAudioCapability } from "../types";
+import type { CaptureMode, SystemAudioCapability, TranslationMode } from "../types";
 import { WHISPER_LANGUAGES } from "../whisper-languages";
 import { splitTranscriptSentences } from "../transcript-sentences";
 
@@ -25,6 +25,15 @@ const props = defineProps<{
   language: string;
   recordingLevel: number;
   audioUrl: string | undefined;
+  translationEnabled: boolean;
+  translationTargetLanguage: string;
+  translationMode: TranslationMode;
+  // Whether a language model is configured to actually run a translation
+  // request right now (distinct from the toggle itself being on).
+  translatorReady: boolean;
+  // Keyed by the exact source sentence text, not by index.
+  sentenceTranslations: Record<string, string>;
+  translatingSentences: Set<string>;
 }>();
 const emit = defineEmits<{
   "upload-audio": [];
@@ -32,6 +41,9 @@ const emit = defineEmits<{
   "toggle-recording": [];
   "update:captureMode": [mode: CaptureMode];
   "update:language": [code: string];
+  "update:translationEnabled": [enabled: boolean];
+  "update:translationTargetLanguage": [code: string];
+  "update:translationMode": [mode: TranslationMode];
 }>();
 
 const transcriptScrollRef = ref<HTMLElement>();
@@ -45,6 +57,16 @@ const languageOptions = computed<FluentSelectOption[]>(() => [
   { value: "", label: t("transcript.language.auto") },
   ...WHISPER_LANGUAGES.map((entry) => ({ value: entry.code, label: entry.name })),
 ]);
+// Reuses the same language table the transcription language picker already
+// uses, rather than introducing a separate cloud-translation language list.
+const translationLanguageOptions = computed<FluentSelectOption[]>(() =>
+  WHISPER_LANGUAGES.map((entry) => ({ value: entry.code, label: entry.name })),
+);
+const translationTargetLanguageLabel = computed(
+  () =>
+    WHISPER_LANGUAGES.find((entry) => entry.code === props.translationTargetLanguage)?.name ??
+    props.translationTargetLanguage,
+);
 
 const systemUnavailableLabel = computed(() => {
   switch (props.systemAudioCapability.reason) {
@@ -168,11 +190,86 @@ function formatTime(seconds: number): string {
         @update:model-value="(value) => emit('update:language', value as string)"
       />
     </header>
-    <div ref="transcriptScrollRef" class="transcript-content">
+    <div class="transcript-translate-row">
+      <FluentSwitch
+        :model-value="translationEnabled"
+        :label="t('transcript.translate.toggle')"
+        @update:model-value="(value) => emit('update:translationEnabled', value as boolean)"
+      />
+      <template v-if="translationEnabled">
+        <FluentSelect
+          class="language-select"
+          :model-value="translationTargetLanguage"
+          :label="t('transcript.translate.targetLanguage')"
+          :options="translationLanguageOptions"
+          @update:model-value="
+            (value) => emit('update:translationTargetLanguage', value as string)
+          "
+        />
+        <div class="header-switches" role="group" :aria-label="t('transcript.translate.viewMode')">
+          <button
+            type="button"
+            :class="{ active: translationMode === 'side-by-side' }"
+            @click="emit('update:translationMode', 'side-by-side')"
+          >
+            {{ t("transcript.translate.sideBySide") }}
+          </button>
+          <button
+            type="button"
+            :class="{ active: translationMode === 'separate' }"
+            @click="emit('update:translationMode', 'separate')"
+          >
+            {{ t("transcript.translate.separate") }}
+          </button>
+        </div>
+        <span v-if="!translatorReady" class="transcript-translate-status">{{
+          t("transcript.translate.needsProvider")
+        }}</span>
+      </template>
+    </div>
+    <div
+      ref="transcriptScrollRef"
+      class="transcript-content"
+      :class="{ 'transcript-content-split': translationEnabled && translationMode === 'separate' }"
+    >
       <template v-if="sentences.length">
-        <p v-for="(sentence, index) in sentences" :key="index" class="transcript-sentence">
-          {{ sentence }}
-        </p>
+        <div class="transcript-source-column">
+          <div v-for="(sentence, index) in sentences" :key="index" class="transcript-sentence-block">
+            <p class="transcript-sentence">{{ sentence }}</p>
+            <p
+              v-if="translationEnabled && translationMode === 'side-by-side' && sentenceTranslations[sentence]"
+              class="transcript-translation"
+            >
+              {{ sentenceTranslations[sentence] }}
+            </p>
+            <p
+              v-else-if="
+                translationEnabled &&
+                translationMode === 'side-by-side' &&
+                translatingSentences.has(sentence)
+              "
+              class="transcript-translation transcript-translating"
+            >
+              {{ t("transcript.translate.translating") }}
+            </p>
+          </div>
+        </div>
+        <div
+          v-if="translationEnabled && translationMode === 'separate'"
+          class="transcript-translation-column"
+        >
+          <h3 class="transcript-translation-heading">{{ translationTargetLanguageLabel }}</h3>
+          <p v-for="(sentence, index) in sentences" :key="index" class="transcript-translation-line">
+            <template v-if="sentenceTranslations[sentence]">{{
+              sentenceTranslations[sentence]
+            }}</template>
+            <template v-else-if="translatingSentences.has(sentence)"
+              ><span class="transcript-translating">{{
+                t("transcript.translate.translating")
+              }}</span></template
+            >
+          </p>
+        </div>
       </template>
       <div v-else class="empty transcript-empty">
         <svg

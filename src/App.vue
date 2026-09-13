@@ -19,6 +19,7 @@ import AppSidebar from "./components/AppSidebar.vue";
 import WorkbenchChat from "./components/WorkbenchChat.vue";
 import TranscriptPanel from "./components/TranscriptPanel.vue";
 import { i18n, setLocale } from "./locales";
+import { splitTranscriptSentences } from "./transcript-sentences";
 import {
   FluentButton,
   FluentDialog,
@@ -44,6 +45,8 @@ import type {
   RecordingEvent,
   Theme,
   ToolCall,
+  TranslationMode,
+  TranslationStatusEvent,
   Workspace,
 } from "./types";
 import { cancelStream, streamCommand } from "./workbench-commands";
@@ -101,6 +104,18 @@ const summaryStream = ref("");
 // means no background round has reported in for that session yet.
 const notesStatusBySession = reactive<Record<string, NotesStatus>>({});
 let unlistenNotesStatus: UnlistenFn | undefined;
+// Translation cache/in-flight tracking is global (not per session), keyed by
+// `${targetLanguage} ${sourceSentenceText}` so a lookup depends only on
+// a sentence's own content plus the language, never its position - a growing
+// or re-segmenting transcript can never make a translation land on the wrong
+// sentence.
+const TRANSLATION_KEY_SEP = " ";
+function translationKey(targetLanguage: string, sentence: string): string {
+  return `${targetLanguage}${TRANSLATION_KEY_SEP}${sentence}`;
+}
+const sentenceTranslations = reactive<Record<string, string>>({});
+const translatingKeys = reactive<Set<string>>(new Set());
+let unlistenTranslationStatus: UnlistenFn | undefined;
 const transcriptionLoading = ref(false);
 const stt = ref<SttStatus>({
   ready: false,
@@ -250,6 +265,105 @@ const notesStatus = computed<NotesStatus>(() => {
   if (!providerConnected.value) return "needs-provider";
   return notesStatusBySession[session.value?.id ?? ""] ?? "idle";
 });
+const translationEnabled = computed(() => session.value?.translationEnabled ?? false);
+const translationMode = computed<TranslationMode>(
+  () => session.value?.translationMode ?? "side-by-side",
+);
+// Defaults to the app's own UI language until the user picks a specific
+// target language for this session.
+const translationTargetLanguage = computed(
+  () => session.value?.translationTargetLanguage || data.value.settings.language,
+);
+const currentSentenceTranslations = computed<Record<string, string>>(() => {
+  const prefix = `${translationTargetLanguage.value}${TRANSLATION_KEY_SEP}`;
+  const out: Record<string, string> = {};
+  for (const key of Object.keys(sentenceTranslations)) {
+    if (key.startsWith(prefix)) out[key.slice(prefix.length)] = sentenceTranslations[key]!;
+  }
+  return out;
+});
+const currentTranslatingSentences = computed<Set<string>>(() => {
+  const prefix = `${translationTargetLanguage.value}${TRANSLATION_KEY_SEP}`;
+  const out = new Set<string>();
+  for (const key of translatingKeys) {
+    if (key.startsWith(prefix)) out.add(key.slice(prefix.length));
+  }
+  return out;
+});
+async function setTranslationSettings(
+  partial: Partial<{
+    enabled: boolean;
+    targetLanguage: string | null;
+    mode: TranslationMode;
+  }>,
+) {
+  if (!session.value) return;
+  const target = session.value;
+  const previous = {
+    enabled: target.translationEnabled ?? false,
+    targetLanguage: target.translationTargetLanguage ?? null,
+    mode: target.translationMode ?? "side-by-side",
+  };
+  const next = { ...previous, ...partial };
+  target.translationEnabled = next.enabled;
+  target.translationTargetLanguage = next.targetLanguage;
+  target.translationMode = next.mode;
+  try {
+    await invoke("set_translation_settings", {
+      id: target.id,
+      enabled: next.enabled,
+      targetLanguage: next.targetLanguage,
+      mode: next.mode,
+    });
+    if (next.enabled) syncTranslationQueue();
+  } catch (cause) {
+    target.translationEnabled = previous.enabled;
+    target.translationTargetLanguage = previous.targetLanguage;
+    target.translationMode = previous.mode;
+    report(cause);
+  }
+}
+// Submits every finalized sentence that isn't already cached or already
+// in flight for the current session's target language. Never sends a
+// per-sentence request: the backend itself coalesces whatever this adds up
+// into pending into one short-debounced batch, so calling this often (e.g.
+// on every transcript tick) is cheap and safe.
+function syncTranslationQueue() {
+  const target = session.value;
+  if (!target || !translationEnabled.value || !providerConnected.value) return;
+  const allSentences = splitTranscriptSentences(target.transcription ?? "");
+  if (!allSentences.length) return;
+  // While this session is the one actively recording, the last split
+  // "sentence" may just be a still-growing fragment without terminal
+  // punctuation yet - translating it now would be thrown away as soon as
+  // more words arrive, so it's left for the next tick (or for the moment
+  // recording stops, when it becomes final).
+  const isLiveForThisSession = recording.value && recordingSessionId.value === target.id;
+  const finalized = isLiveForThisSession ? allSentences.slice(0, -1) : allSentences;
+  const lang = translationTargetLanguage.value;
+  const need = finalized.filter((sentence) => {
+    const key = translationKey(lang, sentence);
+    return !(key in sentenceTranslations) && !translatingKeys.has(key);
+  });
+  if (!need.length) return;
+  for (const sentence of need) translatingKeys.add(translationKey(lang, sentence));
+  const sessionId = target.id;
+  invoke<Record<string, string>>("queue_sentence_translations", {
+    sessionId,
+    targetLanguage: lang,
+    sentences: need,
+  })
+    .then((hits) => {
+      for (const [sentence, translation] of Object.entries(hits)) {
+        sentenceTranslations[translationKey(lang, sentence)] = translation;
+        translatingKeys.delete(translationKey(lang, sentence));
+      }
+    })
+    .catch((cause) => {
+      for (const sentence of need) translatingKeys.delete(translationKey(lang, sentence));
+      report(cause);
+    });
+}
 async function toggleNotesEnabled(enabled: boolean) {
   if (!session.value) return;
   const target = session.value;
@@ -1041,6 +1155,18 @@ watch(
 watch(selectedSessionId, () => {
   revokeImportedAudio();
 });
+// Covers every trigger for (re)submitting sentences for translation: the
+// transcript growing (live recording, an upload, or stop_recording's final
+// refresh), the toggle turning on, the target language changing (a language
+// switch never needs active invalidation - the cache is already partitioned
+// by language, so this just requests whatever isn't cached under the new
+// one), and switching to a different session entirely.
+watch(() => session.value?.transcription, syncTranslationQueue);
+watch(translationEnabled, (enabled) => {
+  if (enabled) syncTranslationQueue();
+});
+watch(translationTargetLanguage, syncTranslationQueue);
+watch(selectedSessionId, syncTranslationQueue);
 watch(operationBusy, (busy) => {
   if (!busy) return;
   closeContextMenu();
@@ -1084,12 +1210,26 @@ onMounted(() => {
       unlistenNotesStatus = unlisten;
     })
     .catch(() => {});
+  listen<TranslationStatusEvent>("translation-status", (event) => {
+    const payload = event.payload;
+    for (const sentence of payload.sentences) {
+      translatingKeys.delete(translationKey(payload.targetLanguage, sentence));
+    }
+    for (const [sentence, translation] of Object.entries(payload.translations)) {
+      sentenceTranslations[translationKey(payload.targetLanguage, sentence)] = translation;
+    }
+  })
+    .then((unlisten) => {
+      unlistenTranslationStatus = unlisten;
+    })
+    .catch(() => {});
 });
 onUnmounted(() => {
   window.removeEventListener("click", handleWindowClick);
   window.removeEventListener("keydown", handleWindowKeydown);
   window.removeEventListener("scroll", handleWindowScroll, true);
   unlistenNotesStatus?.();
+  unlistenTranslationStatus?.();
   recordingGeneration += 1;
   if (recording.value || recordingStarting.value)
     void invoke("cancel_recording", { sessionId: recordingSessionId.value }).catch(
@@ -1286,11 +1426,22 @@ onUnmounted(() => {
               :language="transcriptionLanguage"
               :recording-level="recordingLevel"
               :audio-url="importedAudioUrl"
+              :translation-enabled="translationEnabled"
+              :translation-target-language="translationTargetLanguage"
+              :translation-mode="translationMode"
+              :translator-ready="providerConnected"
+              :sentence-translations="currentSentenceTranslations"
+              :translating-sentences="currentTranslatingSentences"
               @upload-audio="uploadAudio"
               @cancel="cancel"
               @toggle-recording="toggleRecording"
               @update:capture-mode="captureMode = $event"
               @update:language="transcriptionLanguage = $event"
+              @update:translation-enabled="(value) => setTranslationSettings({ enabled: value })"
+              @update:translation-target-language="
+                (value) => setTranslationSettings({ targetLanguage: value })
+              "
+              @update:translation-mode="(value) => setTranslationSettings({ mode: value })"
             />
           </template>
           <section v-else class="main-workspace">
