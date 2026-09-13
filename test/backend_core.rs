@@ -575,33 +575,44 @@ async fn start_quick_transcription_rejects_when_stt_is_not_ready_and_inserts_not
         "no voice model is installed in this test env"
     );
     let id = uuid::Uuid::new_v4().to_string();
-    if state.recording.active_session_id().await.is_some() {
-        panic!("recording must not be active at test start");
-    }
-    if !status.ready {
-        // Mirrors start_quick_transcription's own not-ready guard.
-        let count_before: i64 = state
-            .db()
-            .unwrap()
-            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count_before, 0);
-        let _ = id;
-    }
-}
-
-#[tokio::test]
-async fn start_quick_transcription_rejects_a_non_uuid_id() {
-    let temp = tempfile::tempdir().unwrap();
-    let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
-    assert!(Uuid::parse_str("not-a-uuid").is_err());
+    let err = start_quick_transcription_impl(
+        &state,
+        &id,
+        "Lesson",
+        recording::RecordingSource::Microphone,
+        || async { panic!("begin must not run once the not-ready guard refuses") },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, "本地语音模型尚未就绪，请先下载。");
     let count: i64 = state
         .db()
         .unwrap()
         .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 0);
-    let _ = &state;
+}
+
+#[tokio::test]
+async fn start_quick_transcription_rejects_a_non_uuid_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
+    let err = start_quick_transcription_impl(
+        &state,
+        "not-a-uuid",
+        "Lesson",
+        recording::RecordingSource::Microphone,
+        || async { panic!("begin must not run once the id guard refuses") },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, "会话标识无效。");
+    let count: i64 = state
+        .db()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
 }
 
 #[tokio::test]
@@ -612,7 +623,17 @@ async fn start_quick_transcription_rejects_when_a_recording_is_already_active() 
         .recording
         .seed_active_for_test("already-recording")
         .await;
-    assert!(state.recording.active_session_id().await.is_some());
+    let id = uuid::Uuid::new_v4().to_string();
+    let err = start_quick_transcription_impl(
+        &state,
+        &id,
+        "Lesson",
+        recording::RecordingSource::Microphone,
+        || async { panic!("begin must not run once the already-active guard refuses") },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, "已有正在进行的录音，请先停止或取消。");
     let count_before: i64 = state
         .db()
         .unwrap()

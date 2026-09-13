@@ -2268,21 +2268,25 @@ where
         }
     }
 }
-#[tauri::command]
-#[allow(clippy::too_many_arguments)]
-async fn start_quick_transcription(
-    app: tauri::AppHandle,
-    id: String,
-    name: String,
+/// The guard body shared by `start_quick_transcription` and its tests: every
+/// check runs, in order, before `create_then_start` inserts anything, so a
+/// test can seed the exact state each guard reacts to and assert on the
+/// returned `Err` plus the resulting node count.
+async fn start_quick_transcription_impl<F, Fut>(
+    state: &AppState,
+    id: &str,
+    name: &str,
     source: recording::RecordingSource,
-    language: Option<String>,
-    on_event: Channel<RecordingEvent>,
-    state: tauri::State<'_, AppState>,
-) -> Result<Node, String> {
-    if Uuid::parse_str(&id).is_err() {
+    begin: F,
+) -> Result<Node, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    if Uuid::parse_str(id).is_err() {
         return Err("会话标识无效。".into());
     }
-    let name = normalize_name(&name)?;
+    let name = normalize_name(name)?;
     if matches!(source, recording::RecordingSource::SystemAudio)
         && !recording::system_audio_capability().available
     {
@@ -2294,7 +2298,20 @@ async fn start_quick_transcription(
     if !state.stt.status().await?.ready {
         return Err("本地语音模型尚未就绪，请先下载。".into());
     }
-    create_then_start(&state, &id, &name, || {
+    create_then_start(state, id, &name, begin).await
+}
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn start_quick_transcription(
+    app: tauri::AppHandle,
+    id: String,
+    name: String,
+    source: recording::RecordingSource,
+    language: Option<String>,
+    on_event: Channel<RecordingEvent>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Node, String> {
+    start_quick_transcription_impl(&state, &id, &name, source, || {
         begin_recording(app, &state, &id, source, language, on_event)
     })
     .await
