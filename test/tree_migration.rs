@@ -798,3 +798,125 @@ fn rehearse_real_database_copy() {
         expected
     );
 }
+
+/// Deeper rehearsal than test 12: runs the real entry point twice, in place,
+/// on a writable copy of the real database, and proves the second run is a
+/// byte-for-byte no-op. Run with
+/// `ASYNC_REHEARSAL_DB=<writable copy path> cargo test rehearse_real_database_is_lossless_and_idempotent -- --ignored`.
+#[test]
+#[ignore = "mutates a writable copy of the real database path from ASYNC_REHEARSAL_DB; run manually before merge"]
+fn rehearse_real_database_is_lossless_and_idempotent() {
+    let path_str = std::env::var("ASYNC_REHEARSAL_DB")
+        .expect("set ASYNC_REHEARSAL_DB to a writable copy of the real database");
+    let path = Path::new(&path_str);
+
+    let (expected, pre_hash) = {
+        let conn = Connection::open(path).unwrap();
+        (read_counts(&conn).unwrap(), dump_hash_pre(&conn))
+    };
+    let sha_before = file_sha256(path);
+
+    let report1 =
+        initialize_database(path).expect("first migration must succeed on the real shape");
+    let counts1 = report1
+        .migrated
+        .expect("the real file is a legacy database");
+    assert_eq!(counts1, expected);
+
+    let db = open_connection(path).unwrap();
+    assert_eq!(
+        sha256_hex(dump_post(&db).as_bytes()),
+        pre_hash,
+        "migrated content must match the pre-migration dump exactly"
+    );
+    let version: i64 = db
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+    let integrity: String = db
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+    let fk_violations: i64 = db
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(fk_violations, 0);
+    drop(db);
+
+    let backup = report1.backup.expect("a backup must have been recorded");
+    assert!(backup.exists(), "backup file must exist on disk");
+    let backup_conn =
+        Connection::open_with_flags(&backup, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let backup_ok: String = backup_conn
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(backup_ok, "ok");
+    assert_eq!(
+        dump_hash_pre(&backup_conn),
+        pre_hash,
+        "backup must hold the exact pre-migration content"
+    );
+    drop(backup_conn);
+
+    let backups_dir = backup.parent().unwrap().to_path_buf();
+    let count_after_first = std::fs::read_dir(&backups_dir).unwrap().count();
+    let sha_after_first = file_sha256(path);
+
+    let report2 = initialize_database(path).expect("second run must succeed");
+    assert!(
+        report2.migrated.is_none(),
+        "a second run must not re-migrate"
+    );
+    let count_after_second = std::fs::read_dir(&backups_dir).unwrap().count();
+    assert_eq!(count_after_first, count_after_second, "no second backup");
+    let sha_after_second = file_sha256(path);
+    assert_eq!(
+        sha_after_first, sha_after_second,
+        "a second run must be a byte-for-byte no-op"
+    );
+
+    eprintln!(
+        "rehearsal ok: sha256 before migration {sha_before}, after first run {sha_after_first}, after second run {sha_after_second}"
+    );
+}
+
+/// Proves the migration refuses a session whose workspace_id points nowhere,
+/// leaving the file byte-identical. Run with
+/// `ASYNC_REHEARSAL_ORPHAN_DB=<writable copy path> cargo test rehearse_real_database_rejects_orphan_session -- --ignored`.
+#[test]
+#[ignore = "mutates a writable copy of the real database path from ASYNC_REHEARSAL_ORPHAN_DB; run manually before merge"]
+fn rehearse_real_database_rejects_orphan_session() {
+    let path_str = std::env::var("ASYNC_REHEARSAL_ORPHAN_DB")
+        .expect("set ASYNC_REHEARSAL_ORPHAN_DB to a writable copy of the real database");
+    let path = Path::new(&path_str);
+
+    {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute(
+            "INSERT INTO sessions(id,workspace_id,title) VALUES(?,?,?)",
+            params![
+                "rehearsal-orphan-session",
+                "rehearsal-no-such-workspace",
+                "Orphan"
+            ],
+        )
+        .unwrap();
+    }
+    let sha_before = file_sha256(path);
+
+    let err = initialize_database(path).expect_err("an orphan session must abort the migration");
+    assert!(
+        err.message.contains("无法迁移"),
+        "unexpected error message: {}",
+        err.message
+    );
+
+    let sha_after = file_sha256(path);
+    assert_eq!(
+        sha_before, sha_after,
+        "an aborted migration must leave the file byte-identical"
+    );
+}
