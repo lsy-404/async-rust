@@ -838,21 +838,29 @@ async fn busy_session_ids(state: &AppState) -> Result<HashSet<String>, String> {
     Ok(busy)
 }
 async fn delete_node_impl(state: &AppState, id: &str) -> Result<(), String> {
-    let subtree = subtree_ids(&state.db()?, id)?;
+    // Gathered before BEGIN (it only reads in-memory manager state), but the
+    // subtree snapshot and the DELETE below share one IMMEDIATE transaction
+    // so nothing can be re-parented into (or out of) the subtree between the
+    // busy check and the delete.
+    let busy = busy_session_ids(state).await?;
+    let mut db = state.db()?;
+    let tx = db
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let subtree = subtree_ids(&tx, id)?;
     if subtree.is_empty() {
         return Err("找不到项目。".into());
     }
-    let busy = busy_session_ids(state).await?;
     if subtree.iter().any(|nid| busy.contains(nid)) {
         return Err("该项目中有会话正在录音或生成，请先停止。".into());
     }
-    let deleted = state
-        .db()?
+    let deleted = tx
         .execute("DELETE FROM nodes WHERE id=?1", [id])
         .map_err(|e| e.to_string())?;
     if deleted == 0 {
         return Err("找不到项目。".into());
     }
+    tx.commit().map_err(|e| e.to_string())?;
     stop_notes_for_session(state, id);
     stop_translation_for_session(state, id);
     Ok(())

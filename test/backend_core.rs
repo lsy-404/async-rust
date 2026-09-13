@@ -284,10 +284,39 @@ async fn delete_node_guard_refuses_a_subtree_with_an_active_recording_or_generat
     let other_subtree = subtree_ids(&state.db().unwrap(), "other").unwrap();
     assert!(!other_subtree.iter().any(|id| busy.contains(id)));
 
-    // A generation (chat/summary/transcription) cancellation token also counts as busy.
+    // The guard actually refuses the delete, not just the id-set check above.
+    let err = delete_node_impl(&state, "course").await.unwrap_err();
+    assert_eq!(err, "该项目中有会话正在录音或生成，请先停止。");
+    let db = state.db().unwrap();
+    let course_survives: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE id IN ('course','recording-session')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(course_survives, 2);
+    drop(db);
+
+    // A generation (chat/summary/transcription) cancellation token also counts
+    // as busy, and also actually blocks the delete (checked before deleting
+    // "other", which shares no id with "s2"'s generation token here).
     let _token = generation_token(&state, "s2").unwrap();
-    let busy = busy_session_ids(&state).await.unwrap();
-    assert!(busy.contains("s2"));
+    let err = delete_node_impl(&state, "other").await.unwrap_err();
+    assert_eq!(err, "该项目中有会话正在录音或生成，请先停止。");
+    state.cancellations.lock().unwrap().remove("s2");
+
+    // With the generation finished, an unrelated subtree is actually deletable.
+    delete_node_impl(&state, "other").await.unwrap();
+    let db = state.db().unwrap();
+    let other_gone: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE id IN ('other','s2')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(other_gone, 0);
 }
 
 #[test]
