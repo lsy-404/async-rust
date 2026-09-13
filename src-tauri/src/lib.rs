@@ -687,7 +687,9 @@ fn create_node(
 ) -> Result<Node, String> {
     let name = normalize_name(name)?;
     let mut db = state.db()?;
-    let tx = db.transaction().map_err(|e| e.to_string())?;
+    let tx = db
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
     if let Some(parent) = parent_id {
         let is_folder: Option<bool> = tx
             .query_row(
@@ -769,7 +771,9 @@ fn rename_node(
 }
 fn move_node_impl(state: &AppState, id: &str, parent_id: Option<&str>) -> Result<Node, String> {
     let mut db = state.db()?;
-    let tx = db.transaction().map_err(|e| e.to_string())?;
+    let tx = db
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
     let current_parent: Option<Option<String>> = tx
         .query_row("SELECT parent_id FROM nodes WHERE id=?1", [id], |r| {
             r.get(0)
@@ -877,7 +881,9 @@ fn save_messages_impl(
     messages: &[Message],
 ) -> Result<(), String> {
     let mut db = state.db()?;
-    let tx = db.transaction().map_err(|e| e.to_string())?;
+    let tx = db
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
     let exists: bool = tx
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)",
@@ -2225,7 +2231,9 @@ where
 {
     {
         let mut db = state.db()?;
-        let tx = db.transaction().map_err(|e| e.to_string())?;
+        let tx = db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
         tx.execute(
             "INSERT INTO nodes(id,parent_id,parent_kind,kind,name) VALUES(?1,NULL,NULL,'session',?2)",
             params![id, name],

@@ -1508,3 +1508,87 @@ async fn translation_error_backs_off_instead_of_retrying_immediately() {
         "retry took {gap:?} - far longer than the expected ~1.2s backoff, something else is gating it"
     );
 }
+
+// Holds a raw RESERVED lock on the state database for `hold_for`, then
+// releases it. Used to prove a read-then-write command retries via
+// `busy_timeout` (BEGIN IMMEDIATE) instead of failing instantly with
+// "database is locked" (what a plain BEGIN DEFERRED does on the journal_mode
+// this database uses, once it tries to upgrade SHARED to RESERVED).
+fn hold_reserved_lock_in_background(
+    db_path: std::path::PathBuf,
+    hold_for: Duration,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let raw = rusqlite::Connection::open(db_path).unwrap();
+        raw.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        std::thread::sleep(hold_for);
+        raw.execute_batch("COMMIT;").unwrap();
+    })
+}
+
+#[test]
+fn create_session_waits_out_a_reserved_lock_instead_of_failing_instantly() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("state.sqlite3");
+    let state = AppState::open(db_path.clone()).unwrap();
+    // A parent is required to reproduce the defect: create_node's transaction
+    // reads (is the parent a folder?) before it writes, so it hits the
+    // SHARED-to-RESERVED upgrade path a plain BEGIN DEFERRED cannot retry
+    // out of. With no parent, the INSERT is the transaction's first
+    // statement and even DEFERRED acquires RESERVED directly (with a retry).
+    seed_folder(&state, "f1", "Folder one");
+
+    let hold = Duration::from_millis(300);
+    let holder = hold_reserved_lock_in_background(db_path, hold);
+    // Give the background thread a moment to actually acquire the lock
+    // before this thread starts its own transaction.
+    std::thread::sleep(Duration::from_millis(50));
+
+    let started = std::time::Instant::now();
+    let node = create_node(
+        &state,
+        Some("f1"),
+        "New Session",
+        NodeKind::Session,
+        |tx, id| {
+            tx.execute("INSERT INTO sessions(id) VALUES(?1)", [id])
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        },
+    )
+    .unwrap();
+    let elapsed = started.elapsed();
+    holder.join().unwrap();
+
+    assert_eq!(node.name, "New Session");
+    assert!(
+        elapsed >= Duration::from_millis(200),
+        "create_node returned after only {elapsed:?} - a BEGIN DEFERRED transaction fails \
+         instantly on a reserved-lock conflict instead of waiting out busy_timeout like this"
+    );
+}
+
+#[test]
+fn move_node_waits_out_a_reserved_lock_instead_of_failing_instantly() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("state.sqlite3");
+    let state = AppState::open(db_path.clone()).unwrap();
+    seed_folder(&state, "f1", "Folder one");
+    seed_session(&state, None, "s1", "Lesson");
+
+    let hold = Duration::from_millis(300);
+    let holder = hold_reserved_lock_in_background(db_path, hold);
+    std::thread::sleep(Duration::from_millis(50));
+
+    let started = std::time::Instant::now();
+    let node = move_node_impl(&state, "s1", Some("f1")).unwrap();
+    let elapsed = started.elapsed();
+    holder.join().unwrap();
+
+    assert_eq!(node.parent_id.as_deref(), Some("f1"));
+    assert!(
+        elapsed >= Duration::from_millis(200),
+        "move_node_impl returned after only {elapsed:?} - a BEGIN DEFERRED transaction fails \
+         instantly on a reserved-lock conflict instead of waiting out busy_timeout like this"
+    );
+}
