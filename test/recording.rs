@@ -260,6 +260,249 @@ fn gate_for_passes_available_capabilities_and_explains_unavailable_ones() {
     assert!(platform_error.contains("平台"));
 }
 
+// Fraction of non-whitespace, non-punctuation characters that are CJK Unified
+// Ideographs; used to tell real Chinese text apart from romanisation/English.
+fn cjk_character_ratio(text: &str) -> f32 {
+    let mut total = 0usize;
+    let mut cjk = 0usize;
+    for ch in text.chars() {
+        if ch.is_whitespace() || ch.is_ascii_punctuation() || "，。！？、；：".contains(ch) {
+            continue;
+        }
+        total += 1;
+        if ('\u{4E00}'..='\u{9FFF}').contains(&ch) {
+            cjk += 1;
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        cjk as f32 / total as f32
+    }
+}
+
+fn read_i16_wav(path: &Path) -> (u32, Vec<i16>) {
+    let mut reader = hound::WavReader::open(path).unwrap();
+    let rate = reader.spec().sample_rate;
+    let samples = reader.samples::<i16>().map(Result::unwrap).collect();
+    (rate, samples)
+}
+
+// Exercises the exact bounded-queue -> VAD -> incremental-transcription
+// pipeline `start_recording` wires up (see `recording_worker` /
+// `transcription_worker`), but feeds it real `say`-generated speech resampled
+// to a realistic capture rate instead of a live microphone, so it can run
+// against an installed local model without hardware.
+#[test]
+#[ignore = "Set ASYNC_STT_MODEL_ROOT and ASYNC_STT_LONG_WAV to run the live incremental pipeline against real `say`-generated speech on an installed local model"]
+fn actual_live_pipeline_streams_growing_snapshots_and_flushes_tail_for_long_clip() {
+    let model_root = PathBuf::from(std::env::var("ASYNC_STT_MODEL_ROOT").unwrap());
+    let source = PathBuf::from(std::env::var("ASYNC_STT_LONG_WAV").unwrap());
+    let (native_rate, native_samples) = read_i16_wav(&source);
+    // Resample up to a realistic microphone capture rate so this also exercises
+    // the same streaming resampler path RecordingManager feeds LiveTranscriber through.
+    let capture_rate = 48_000u32;
+    let as_f32: Vec<f32> = native_samples
+        .iter()
+        .map(|sample| *sample as f32 / 32768.0)
+        .collect();
+    let resampler =
+        sherpa_onnx::LinearResampler::create(native_rate as i32, capture_rate as i32).unwrap();
+    let captured_f32 = resampler.resample(&as_f32, true);
+    let captured: Vec<i16> = captured_f32
+        .iter()
+        .map(|sample| (sample.clamp(-1.0, 1.0) * 32767.0) as i16)
+        .collect();
+
+    let mut live = SttManager::new(model_root)
+        .live_transcriber(capture_rate, Some("en".into()))
+        .unwrap();
+    let mut snapshots: Vec<String> = Vec::new();
+    let mut cumulative = String::new();
+    let mut first_segment_at_chunk = None;
+    let chunk_duration = Duration::from_secs_f32(CHUNK_FRAMES as f32 / capture_rate as f32);
+    let started = std::time::Instant::now();
+    let total_chunks = captured.len().div_ceil(CHUNK_FRAMES);
+    for (index, chunk) in captured.chunks(CHUNK_FRAMES).enumerate() {
+        for segment in live.accept_i16(chunk).unwrap() {
+            if !cumulative.is_empty() {
+                cumulative.push(' ');
+            }
+            cumulative.push_str(&segment);
+            snapshots.push(cumulative.clone());
+            first_segment_at_chunk.get_or_insert(index);
+        }
+        // Match the CPAL handoff cadence a real microphone stream would produce.
+        thread::sleep(chunk_duration);
+    }
+    let before_finish = snapshots.len();
+    assert!(
+        before_finish > 0,
+        "no transcript snapshot arrived before the stream ended"
+    );
+    let first = first_segment_at_chunk.unwrap();
+    assert!(
+        first < total_chunks * 9 / 10,
+        "first snapshot arrived too late to prove real incremental streaming: chunk {first} of {total_chunks}"
+    );
+    for segment in live.finish().unwrap() {
+        if !cumulative.is_empty() {
+            cumulative.push(' ');
+        }
+        cumulative.push_str(&segment);
+        snapshots.push(cumulative.clone());
+    }
+    let elapsed = started.elapsed();
+    eprintln!(
+        "live long-clip {capture_rate} Hz: snapshots_before_finish={before_finish}, \
+         total_snapshots={}, elapsed={:.2}s, final=\"{cumulative}\"",
+        snapshots.len(),
+        elapsed.as_secs_f32(),
+    );
+    assert!(
+        snapshots.len() >= 3,
+        "expected multiple VAD segments across the ~50s clip, got {}",
+        snapshots.len()
+    );
+    // Monotonically growing: each cumulative snapshot must never shrink or
+    // lose content the previous snapshot already reported.
+    for pair in snapshots.windows(2) {
+        assert!(
+            pair[1].len() >= pair[0].len() && pair[1].starts_with(pair[0].as_str()),
+            "snapshot regressed: {:?} -> {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+    let final_text = cumulative.to_lowercase();
+    assert!(
+        final_text.contains("brown fox") || final_text.contains("lazy dog"),
+        "missing early-sentence content: {final_text}"
+    );
+    // The closing sentence only ever completes via `finish()`'s VAD flush; the
+    // capture loop stops mid-utterance, so it can only appear in the tail flush.
+    assert!(
+        final_text.contains("thank you") || final_text.contains("listening"),
+        "final snapshot is missing the flushed tail segment: {final_text}"
+    );
+}
+
+#[test]
+#[ignore = "Set ASYNC_STT_MODEL_ROOT and ASYNC_STT_ZH_WAV to run the live incremental pipeline against real `say`-generated Mandarin speech on an installed local model"]
+fn actual_live_pipeline_recognizes_mandarin_and_flushes_tail() {
+    let model_root = PathBuf::from(std::env::var("ASYNC_STT_MODEL_ROOT").unwrap());
+    let source = PathBuf::from(std::env::var("ASYNC_STT_ZH_WAV").unwrap());
+    let (rate, samples) = read_i16_wav(&source);
+    let mut live = SttManager::new(model_root)
+        .live_transcriber(rate, Some("zh".into()))
+        .unwrap();
+    let mut cumulative = String::new();
+    let mut segment_count = 0usize;
+    let chunk_duration = Duration::from_secs_f32(CHUNK_FRAMES as f32 / rate as f32);
+    for chunk in samples.chunks(CHUNK_FRAMES) {
+        for segment in live.accept_i16(chunk).unwrap() {
+            cumulative.push_str(&segment);
+            segment_count += 1;
+        }
+        thread::sleep(chunk_duration);
+    }
+    for segment in live.finish().unwrap() {
+        cumulative.push_str(&segment);
+        segment_count += 1;
+    }
+    eprintln!("live mandarin transcript ({segment_count} segments): {cumulative}");
+    assert!(segment_count > 0, "no mandarin segments were produced");
+    let ratio = cjk_character_ratio(&cumulative);
+    assert!(
+        ratio > 0.5,
+        "live mandarin output is not mostly Chinese characters (ratio={ratio}): {cumulative}"
+    );
+    assert!(
+        cumulative.contains("天气") || cumulative.contains("谢谢") || cumulative.contains("测试"),
+        "live mandarin output is missing expected content: {cumulative}"
+    );
+    // The live and one-shot paths must never disagree on script: assert Simplified
+    // explicitly, and fail loudly if a Traditional form leaks through instead
+    // (this is exactly the bug the stt.rs normalisation point exists to prevent).
+    assert!(
+        !cumulative.contains('氣') && !cumulative.contains('謝') && !cumulative.contains('認'),
+        "live mandarin output contains Traditional Chinese characters, script normalisation regressed: {cumulative}"
+    );
+}
+
+// Mirrors the real cancel path: `ActiveRecording::finish(Control::Cancel)`
+// takes `callback_gate` and flips `canceled` before the writer thread ever
+// stops feeding the transcript queue, then the queue is closed with no final
+// flush. This drives `transcription_worker` (the same function
+// `recording_worker` spawns) and the same `guarded_callback` wrapper, so a
+// real cancellation race runs against the real model.
+#[test]
+#[ignore = "Set ASYNC_STT_MODEL_ROOT and ASYNC_STT_LONG_WAV to run the live pipeline's cancellation path against an installed local model"]
+fn actual_live_pipeline_cancel_mid_stream_stops_cleanly_and_persists_nothing() {
+    let model_root = PathBuf::from(std::env::var("ASYNC_STT_MODEL_ROOT").unwrap());
+    let source = PathBuf::from(std::env::var("ASYNC_STT_LONG_WAV").unwrap());
+    let (rate, samples) = read_i16_wav(&source);
+    let mut live = SttManager::new(model_root)
+        .live_transcriber(rate, Some("en".into()))
+        .unwrap();
+    let (sender, receiver) = mpsc::sync_channel::<Vec<i16>>(QUEUE_CHUNKS);
+    let persisted = Arc::new(StdMutex::new(Vec::<String>::new()));
+    let destination = persisted.clone();
+    let canceled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gate = Arc::new(StdMutex::new(()));
+    let callback = guarded_callback(
+        canceled.clone(),
+        gate.clone(),
+        Arc::new(move |text| {
+            destination.lock().unwrap().push(text);
+            Ok(())
+        }),
+    );
+    let worker_canceled = canceled.clone();
+    let worker = thread::spawn(move || {
+        transcription_worker(&mut live, receiver, callback, worker_canceled)
+    });
+
+    let chunk_duration = Duration::from_secs_f32(CHUNK_FRAMES as f32 / rate as f32);
+    // Cut off once a real segment has actually been persisted, rather than at a
+    // fixed chunk count: a fixed cutoff is flaky, since it races the model's own
+    // (machine-dependent) decode speed instead of the condition the test cares
+    // about.
+    for chunk in samples.chunks(CHUNK_FRAMES) {
+        if !persisted.lock().unwrap().is_empty() {
+            break;
+        }
+        if sender.send(chunk.to_vec()).is_err() {
+            break;
+        }
+        thread::sleep(chunk_duration);
+    }
+    // Same sequencing as `ActiveRecording::finish(Control::Cancel)`: gate,
+    // flip the flag, THEN stop feeding audio (no final flush chunk).
+    {
+        let _guard = gate.lock().unwrap();
+        canceled.store(true, Ordering::Release);
+    }
+    drop(sender);
+    worker
+        .join()
+        .expect("transcription worker panicked")
+        .expect("transcription worker returned an error instead of stopping cleanly");
+
+    let received = persisted.lock().unwrap().clone();
+    eprintln!("segments persisted before cancellation: {received:?}");
+    assert!(
+        !received.is_empty(),
+        "expected at least one real segment to have been persisted before cancellation, but the \
+         feed loop ran out of audio without the worker ever persisting one"
+    );
+    let joined = received.join(" ").to_lowercase();
+    assert!(
+        !joined.contains("thank you") && !joined.contains("final sentence"),
+        "content from well past the cancellation point leaked into what was persisted: {joined}"
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn system_audio_capability_reason_is_present_exactly_when_unavailable() {

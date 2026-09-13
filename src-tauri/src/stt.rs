@@ -3,11 +3,12 @@ use std::{
     fs::{self, File},
     io::{Cursor, Read, Write},
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
 use bzip2::read::BzDecoder;
+use ferrous_opencc::{config::BuiltinConfig, OpenCC};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -103,6 +104,7 @@ pub struct LiveTranscriber {
     vad: VoiceActivityDetector,
     resampler: Option<LinearResampler>,
     carry: Vec<f32>,
+    language: String,
 }
 
 struct DownloadGuard<'a>(&'a Mutex<Option<CancellationToken>>);
@@ -126,6 +128,60 @@ fn normalize_language(language: Option<String>) -> String {
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .unwrap_or_default()
+}
+
+// Whisper's "zh" token does not choose between Simplified and Traditional, so
+// identical speech can decode either way depending on decoding context; the
+// built-in OpenCC dictionary is embedded at compile time, so this never touches
+// the network or the filesystem.
+fn simplified_converter() -> &'static OpenCC {
+    static CONVERTER: OnceLock<OpenCC> = OnceLock::new();
+    CONVERTER.get_or_init(|| {
+        OpenCC::from_config(BuiltinConfig::T2s).expect("built-in t2s config is embedded")
+    })
+}
+
+// Fraction of non-whitespace, non-punctuation characters that are CJK Unified
+// Ideographs; used to recognise auto-detected Chinese output by its script.
+fn cjk_ratio(text: &str) -> f32 {
+    let mut total = 0usize;
+    let mut cjk = 0usize;
+    for ch in text.chars() {
+        if ch.is_whitespace() || ch.is_ascii_punctuation() || "，。！？、；：".contains(ch) {
+            continue;
+        }
+        total += 1;
+        if ('\u{4E00}'..='\u{9FFF}').contains(&ch) {
+            cjk += 1;
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        cjk as f32 / total as f32
+    }
+}
+
+// Hiragana/Katakana only occur in Japanese; their presence rules out treating
+// auto-detected CJK output as Chinese, since a Traditional-to-Simplified table
+// would corrupt Japanese kanji.
+fn contains_kana(text: &str) -> bool {
+    text.chars().any(|ch| ('\u{3040}'..='\u{30FF}').contains(&ch))
+}
+
+fn should_normalize_chinese_script(text: &str, requested_language: &str) -> bool {
+    !contains_kana(text)
+        && (requested_language == "zh" || (requested_language.is_empty() && cjk_ratio(text) > 0.5))
+}
+
+// Single point where recognised segment text leaves this module on both the
+// one-shot and the live path, so the two can never disagree on script again.
+fn normalize_chinese_script(text: &str, requested_language: &str) -> String {
+    if should_normalize_chinese_script(text, requested_language) {
+        simplified_converter().convert(text)
+    } else {
+        text.to_owned()
+    }
 }
 
 fn check_canceled(cancel: &CancellationToken) -> Result<(), String> {
@@ -365,13 +421,14 @@ impl LiveTranscriber {
         if !(8_000..=192_000).contains(&source_rate) {
             return Err("麦克风采样率不受支持。".into());
         }
+        let language_code = normalize_language(language);
         let path = |name: &str| root.join(name).to_string_lossy().into_owned();
         let config = OfflineRecognizerConfig {
             model_config: OfflineModelConfig {
                 whisper: OfflineWhisperModelConfig {
                     encoder: Some(path(EXPECTED_FILES[0])),
                     decoder: Some(path(EXPECTED_FILES[1])),
-                    language: Some(normalize_language(language)),
+                    language: Some(language_code.clone()),
                     task: Some("transcribe".into()),
                     tail_paddings: -1,
                     // The bundled Whisper export has no cross-attention output, so token
@@ -421,6 +478,7 @@ impl LiveTranscriber {
             vad,
             resampler,
             carry: Vec::new(),
+            language: language_code,
         })
     }
 
@@ -474,7 +532,7 @@ impl LiveTranscriber {
             let result = stream.get_result().ok_or("本地识别引擎没有返回结果。")?;
             let text = result.text.trim();
             if !text.is_empty() {
-                output.push(text.to_owned());
+                output.push(normalize_chinese_script(text, &self.language));
             }
             self.vad.pop();
         }
@@ -720,13 +778,14 @@ fn recognize(
     cancel: &CancellationToken,
 ) -> Result<Transcription, String> {
     check_canceled(cancel)?;
+    let language_code = normalize_language(language);
     let path = |name: &str| root.join(name).to_string_lossy().into_owned();
     let config = OfflineRecognizerConfig {
         model_config: OfflineModelConfig {
             whisper: OfflineWhisperModelConfig {
                 encoder: Some(path(EXPECTED_FILES[0])),
                 decoder: Some(path(EXPECTED_FILES[1])),
-                language: Some(normalize_language(language)),
+                language: Some(language_code.clone()),
                 task: Some("transcribe".into()),
                 tail_paddings: -1,
                 enable_token_timestamps: true,
@@ -773,8 +832,17 @@ fn recognize(
             let result = stream.get_result().ok_or("本地识别引擎没有返回结果。")?;
             let transcript = result.text.trim();
             if !transcript.is_empty() {
-                text.push(transcript.to_owned());
-                words.extend(segment_words(&result, offset));
+                let normalize = should_normalize_chinese_script(transcript, &language_code);
+                let mut word_list = segment_words(&result, offset);
+                if normalize {
+                    for word in &mut word_list {
+                        word.word = simplified_converter().convert(&word.word);
+                    }
+                    text.push(simplified_converter().convert(transcript));
+                } else {
+                    text.push(transcript.to_owned());
+                }
+                words.extend(word_list);
             }
             vad.pop();
         }
