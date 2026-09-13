@@ -319,6 +319,44 @@ async fn delete_node_guard_refuses_a_subtree_with_an_active_recording_or_generat
     assert_eq!(other_gone, 0);
 }
 
+#[tokio::test]
+async fn delete_node_stops_notes_and_translation_jobs_for_every_session_in_the_subtree() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
+    seed_folder(&state, "course", "Course");
+    seed_session(&state, Some("course"), "s1", "Lesson one");
+    seed_session(&state, Some("course"), "s2", "Lesson two");
+
+    // Simulate an in-flight notes job and translation job for each session in
+    // the subtree, keyed the same way stop_notes_for_session /
+    // stop_translation_for_session look them up.
+    for sid in ["s1", "s2"] {
+        state
+            .notes_cancellations
+            .lock()
+            .unwrap()
+            .insert(sid.to_string(), CancellationToken::new());
+        state
+            .translation_cancellations
+            .lock()
+            .unwrap()
+            .insert(format!("{sid}\u{0}zh"), CancellationToken::new());
+    }
+
+    delete_node_impl(&state, "course").await.unwrap();
+
+    let notes_left = state.notes_cancellations.lock().unwrap().len();
+    let translation_left = state.translation_cancellations.lock().unwrap().len();
+    assert_eq!(
+        notes_left, 0,
+        "deleting the folder must stop every session's notes job, not just the folder id"
+    );
+    assert_eq!(
+        translation_left, 0,
+        "deleting the folder must stop every session's translation job, not just the folder id"
+    );
+}
+
 #[test]
 fn rename_node_trims_rejects_blank_and_unknown_ids_allows_duplicates() {
     let temp = tempfile::tempdir().unwrap();

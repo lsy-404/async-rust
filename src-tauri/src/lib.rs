@@ -861,8 +861,10 @@ async fn delete_node_impl(state: &AppState, id: &str) -> Result<(), String> {
         return Err("找不到项目。".into());
     }
     tx.commit().map_err(|e| e.to_string())?;
-    stop_notes_for_session(state, id);
-    stop_translation_for_session(state, id);
+    for nid in &subtree {
+        stop_notes_for_session(state, nid);
+        stop_translation_for_session(state, nid);
+    }
     Ok(())
 }
 #[tauri::command]
