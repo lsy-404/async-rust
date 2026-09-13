@@ -182,6 +182,8 @@ const createDraft = ref("");
 const renamingId = ref("");
 const renameDraft = ref("");
 const deleteTarget = ref<{ nodeId: string }>();
+const dragNodeId = ref<string>();
+const dropParent = ref<string | null>();
 const activeView = ref<"explorer" | "search">("explorer");
 const explorerViewRef = ref<InstanceType<typeof ExplorerView>>();
 const searchViewRef = ref<InstanceType<typeof SearchView>>();
@@ -422,14 +424,19 @@ function openNode(id: string, options: { force?: boolean } = {}) {
   if (operationBusy.value && !options.force && id !== openNodeId.value) return;
   openNodeId.value = id;
 }
-function toggleFolder(id: string) {
-  if (expandedFolders.value.has(id)) expandedFolders.value.delete(id);
-  else expandedFolders.value.add(id);
+// Debounced 500ms, shared by every explorerExpanded mutation (manual toggle
+// and drag-hover auto-expand alike).
+function schedulePersistExpandedFolders() {
   if (expandedFoldersPersistTimer) clearTimeout(expandedFoldersPersistTimer);
   expandedFoldersPersistTimer = setTimeout(() => {
     data.value.settings.explorerExpanded = [...expandedFolders.value];
     void invoke("save_settings", { settings: data.value.settings }).catch(report);
   }, 500);
+}
+function toggleFolder(id: string) {
+  if (expandedFolders.value.has(id)) expandedFolders.value.delete(id);
+  else expandedFolders.value.add(id);
+  schedulePersistExpandedFolders();
 }
 function focusNode(id: string | null) {
   focusedNodeId.value = id;
@@ -556,6 +563,43 @@ async function confirmDelete() {
       data.value.settings.explorerExpanded = [...expandedFolders.value];
       await invoke("save_settings", { settings: data.value.settings }).catch(report);
     }
+  } catch (cause) {
+    report(cause);
+  }
+}
+function handleDragStart(id: string) {
+  dragNodeId.value = id;
+  dropParent.value = undefined;
+}
+function handleDragOver(parentId: string | null) {
+  dropParent.value = parentId;
+}
+function handleDragLeave() {
+  dropParent.value = undefined;
+}
+function handleDragEnd() {
+  dragNodeId.value = undefined;
+  dropParent.value = undefined;
+}
+// A folder hovered 700ms during a drag auto-expands, same as a manual
+// toggle, but never collapses one already open.
+function autoExpandFolder(id: string) {
+  if (expandedFolders.value.has(id)) return;
+  expandedFolders.value.add(id);
+  schedulePersistExpandedFolders();
+}
+async function handleNodeDrop(payload: { id: string; parentId: string | null }) {
+  if (operationBusy.value) return;
+  try {
+    await invoke("move_node", { id: payload.id, parentId: payload.parentId });
+    await refresh();
+    if (payload.parentId) {
+      expandedFolders.value.add(payload.parentId);
+      for (const ancestor of ancestorsOf(data.value.nodes, payload.parentId)) {
+        expandedFolders.value.add(ancestor.id);
+      }
+    }
+    focusedNodeId.value = payload.id;
   } catch (cause) {
     report(cause);
   }
@@ -1130,6 +1174,7 @@ watch(operationBusy, (busy) => {
   closeContextMenu();
   cancelRename();
   cancelCreate();
+  handleDragEnd();
 });
 watch(searchQuery, (query) => {
   if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
@@ -1234,6 +1279,8 @@ onUnmounted(() => {
           :renaming-id="renamingId"
           :rename-draft="renameDraft"
           :delete-target="deleteTarget"
+          :drag-node-id="dragNodeId"
+          :drop-parent="dropParent"
           @toggle-folder="toggleFolder"
           @open-node="openNode($event)"
           @focus-node="focusNode"
@@ -1251,6 +1298,12 @@ onUnmounted(() => {
           @open-delete-dialog="openDeleteDialog"
           @cancel-delete="cancelDelete"
           @confirm-delete="confirmDelete"
+          @drag-start="handleDragStart"
+          @drag-over="handleDragOver"
+          @drag-leave="handleDragLeave"
+          @drag-end="handleDragEnd"
+          @drop="handleNodeDrop"
+          @auto-expand-folder="autoExpandFolder"
         />
         <SearchView
           v-if="sidebarOpen && activeView === 'search'"

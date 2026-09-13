@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Node } from "../src/types";
 import {
   flattenVisible,
+  isValidMoveTarget,
   nextFocusAfterDelete,
   resolveCreateTarget,
   subtreeCounts,
@@ -47,6 +48,26 @@ describe("resolveCreateTarget", () => {
   it("resolves a root session/material's parent, and null focus, to root", () => {
     expect(resolveCreateTarget(nodes[5]!)).toBeNull();
     expect(resolveCreateTarget(null)).toBeNull();
+  });
+});
+
+describe("isValidMoveTarget", () => {
+  it("refuses dropping a folder into itself", () => {
+    expect(isValidMoveTarget(nodes, "f1", "f1")).toBe(false);
+  });
+  it("refuses dropping a folder into its own descendant", () => {
+    expect(isValidMoveTarget(nodes, "f1", "f2")).toBe(false);
+  });
+  it("refuses a no-op drop onto the current parent", () => {
+    expect(isValidMoveTarget(nodes, "s1", "f1")).toBe(false);
+    expect(isValidMoveTarget(nodes, "s3", null)).toBe(false);
+  });
+  it("allows dropping into an unrelated folder or to root", () => {
+    expect(isValidMoveTarget(nodes, "s1", "f2")).toBe(true);
+    expect(isValidMoveTarget(nodes, "f2", null)).toBe(true);
+  });
+  it("refuses an unknown dragged id", () => {
+    expect(isValidMoveTarget(nodes, "missing", "f1")).toBe(false);
   });
 });
 

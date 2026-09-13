@@ -3,7 +3,7 @@ import { computed, nextTick, onBeforeUnmount, watch } from "vue";
 import { FluentButton, FluentDialog } from "@platform-kit/fluent/vue";
 import { i18n } from "../locales";
 import type { Node } from "../types";
-import { flattenVisible, pathLabel, subtreeCounts } from "../explorer/tree";
+import { flattenVisible, isValidMoveTarget, pathLabel, subtreeCounts, subtreeIds } from "../explorer/tree";
 
 const { t } = i18n.global;
 
@@ -20,6 +20,8 @@ const props = defineProps<{
   renamingId: string;
   renameDraft: string;
   deleteTarget: { nodeId: string } | undefined;
+  dragNodeId: string | undefined;
+  dropParent: string | null | undefined;
 }>();
 const emit = defineEmits<{
   "toggle-folder": [id: string];
@@ -39,6 +41,12 @@ const emit = defineEmits<{
   "open-delete-dialog": [id: string];
   "cancel-delete": [];
   "confirm-delete": [];
+  "drag-start": [id: string];
+  "drag-over": [parentId: string | null];
+  "drag-leave": [];
+  "drag-end": [];
+  drop: [payload: { id: string; parentId: string | null }];
+  "auto-expand-folder": [id: string];
 }>();
 
 type DisplayRow =
@@ -104,6 +112,108 @@ function handleBlankClick() {
 function handleF2(node: Node) {
   emit("start-rename", node.id);
 }
+
+// Native HTML5 drag and drop (requires dragDropEnabled: false in
+// tauri.conf.json, so the webview never swallows these as OS file drops).
+const dragMime = "application/x-async-node";
+// A folder row targets itself; a session/material row targets its own
+// parent (VS Code semantics: dropping "on" an item means alongside it).
+function targetParentFor(node: Node): string | null {
+  return node.kind === "folder" ? node.id : node.parentId;
+}
+
+let autoExpandTimer: ReturnType<typeof setTimeout> | undefined;
+let autoExpandFolderId: string | null = null;
+function clearAutoExpand() {
+  if (autoExpandTimer) clearTimeout(autoExpandTimer);
+  autoExpandTimer = undefined;
+  autoExpandFolderId = null;
+}
+
+function handleDragStart(event: DragEvent, node: Node) {
+  if (props.operationBusy || props.renamingId === node.id) {
+    event.preventDefault();
+    return;
+  }
+  event.dataTransfer?.setData(dragMime, node.id);
+  if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+  emit("drag-start", node.id);
+}
+
+// Shared by every drop target (folder rows, session/material rows, the
+// blank root area): accepts only our own drag payload and a valid move,
+// preventDefault only then (so the browser shows a no-drop cursor
+// otherwise), and auto-expands a collapsed folder hovered 700ms.
+function applyDragOver(event: DragEvent, parentId: string | null, folderId: string | null) {
+  const types = event.dataTransfer?.types;
+  if (!types || !Array.from(types).includes(dragMime)) return;
+  const dragId = props.dragNodeId;
+  if (!dragId || !isValidMoveTarget(props.nodes, dragId, parentId)) {
+    clearAutoExpand();
+    return;
+  }
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+  emit("drag-over", parentId);
+  if (folderId && !props.expandedFolders.has(folderId)) {
+    if (autoExpandFolderId !== folderId) {
+      clearAutoExpand();
+      autoExpandFolderId = folderId;
+      autoExpandTimer = setTimeout(() => {
+        emit("auto-expand-folder", folderId);
+        clearAutoExpand();
+      }, 700);
+    }
+  } else {
+    clearAutoExpand();
+  }
+}
+function handleDragOver(event: DragEvent, node: Node) {
+  applyDragOver(event, targetParentFor(node), node.kind === "folder" ? node.id : null);
+}
+function handleDragOverRoot(event: DragEvent) {
+  applyDragOver(event, null, null);
+}
+
+function finishDrop(event: DragEvent, parentId: string | null) {
+  event.preventDefault();
+  clearAutoExpand();
+  const types = event.dataTransfer?.types;
+  const ownPayload = Boolean(types && Array.from(types).includes(dragMime));
+  const dragId = props.dragNodeId;
+  if (
+    ownPayload &&
+    dragId &&
+    !props.operationBusy &&
+    isValidMoveTarget(props.nodes, dragId, parentId)
+  ) {
+    emit("drop", { id: dragId, parentId });
+  }
+  emit("drag-end");
+}
+function handleDrop(event: DragEvent, node: Node) {
+  finishDrop(event, targetParentFor(node));
+}
+function handleDropRoot(event: DragEvent) {
+  finishDrop(event, null);
+}
+function handleDragEnd() {
+  clearAutoExpand();
+  emit("drag-end");
+}
+// Clears the drop-target highlight only when the pointer actually leaves the
+// tree (not when it moves from one row to another inside it).
+function handleTreeDragLeave(event: DragEvent) {
+  const related = event.relatedTarget as globalThis.Node | null;
+  const container = event.currentTarget as HTMLElement;
+  if (related && container.contains(related)) return;
+  clearAutoExpand();
+  emit("drag-leave");
+}
+const dropDescendantIds = computed(() => {
+  if (typeof props.dropParent !== "string") return new Set<string>();
+  return new Set(subtreeIds(props.nodes, props.dropParent));
+});
 
 const contextNode = computed(() =>
   props.contextMenu?.nodeId
@@ -241,6 +351,7 @@ const deleteMessage = computed(() => {
     role="tree"
     :aria-label="t('explorer.title')"
     @contextmenu.prevent="handleContextMenu($event, null)"
+    @dragleave="handleTreeDragLeave"
   >
     <p v-if="!rows.length && !inlineCreate" class="explorer-empty">
       {{ t("explorer.empty") }}
@@ -268,9 +379,16 @@ const deleteMessage = computed(() => {
         :class="{
           'context-target': contextMenu?.nodeId === row.node.id,
           focused: focusedNodeId === row.node.id,
+          'drop-target': dropParent === row.node.id,
+          'drop-descendant': dropParent !== row.node.id && dropDescendantIds.has(row.node.id),
         }"
         :style="{ paddingLeft: `${8 + row.depth * 12}px` }"
+        :draggable="!operationBusy && renamingId !== row.node.id"
         @contextmenu.prevent.stop="handleContextMenu($event, row.node.id)"
+        @dragstart="handleDragStart($event, row.node)"
+        @dragover="handleDragOver($event, row.node)"
+        @drop="handleDrop($event, row.node)"
+        @dragend="handleDragEnd"
       >
         <button
           v-if="row.node.kind === 'folder'"
@@ -312,7 +430,13 @@ const deleteMessage = computed(() => {
         </button>
       </div>
     </template>
-    <div class="explorer-blank" @click="handleBlankClick"></div>
+    <div
+      class="explorer-blank"
+      :class="{ 'drop-target': dropParent === null }"
+      @click="handleBlankClick"
+      @dragover="handleDragOverRoot"
+      @drop="handleDropRoot"
+    ></div>
     <div
       v-if="contextMenu"
       class="context-menu"
@@ -408,6 +532,18 @@ const deleteMessage = computed(() => {
 .tree-row.focused {
   outline: 1px solid var(--fluent-accent);
   outline-offset: -1px;
+}
+.tree-row.drop-target {
+  outline: 1px solid var(--fluent-accent);
+  outline-offset: -1px;
+}
+.tree-row.drop-descendant {
+  background: color-mix(in srgb, var(--fluent-accent) 8%, transparent);
+}
+.explorer-blank.drop-target {
+  outline: 1px solid var(--fluent-accent);
+  outline-offset: -1px;
+  background: color-mix(in srgb, var(--fluent-accent) 12%, transparent);
 }
 .tree-toggle,
 .tree-toggle-spacer {

@@ -109,6 +109,23 @@ export function subtreeCounts(nodes: Node[], id: string): SubtreeCounts {
   return counts;
 }
 
+// False when the target parent is the dragged node itself, one of its
+// descendants (a cycle, also rejected server-side by the nodes_no_cycle
+// trigger) or its current parent (a no-op move).
+export function isValidMoveTarget(
+  nodes: Node[],
+  dragId: string,
+  targetParentId: string | null,
+): boolean {
+  const dragNode = nodes.find((node) => node.id === dragId);
+  if (!dragNode) return false;
+  if (targetParentId === dragNode.parentId) return false;
+  if (targetParentId !== null && subtreeIds(nodes, dragId).includes(targetParentId)) {
+    return false;
+  }
+  return true;
+}
+
 // A folder resolves to that folder; a session or material resolves to its
 // parent; null (root focused or nothing focused) resolves to root.
 export function resolveCreateTarget(focused: Node | null): string | null {

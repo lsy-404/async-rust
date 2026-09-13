@@ -564,6 +564,164 @@ describe("explorer node actions", () => {
   });
 });
 
+// Native HTML5 drag and drop, wired through App.vue's dragNodeId/dropParent
+// state to ExplorerView's drag handlers and the move_node command.
+describe("explorer drag and drop", () => {
+  function dragDropState(): AppData {
+    return {
+      nodes: [
+        { id: "f1", parentId: null, kind: "folder", name: "Folder A" },
+        { id: "f2", parentId: "f1", kind: "folder", name: "Nested" },
+        { id: "s1", parentId: "f1", kind: "session", name: "Session One" },
+        { id: "s3", parentId: null, kind: "session", name: "Root Session" },
+      ],
+      sessions: [
+        { id: "s1", messages: [], transcription: "", summary: "" },
+        { id: "s3", messages: [], transcription: "", summary: "" },
+      ],
+      materials: [],
+      settings: {
+        providerId: "openai",
+        model: "classroom-test",
+        theme: "system",
+        language: "zh",
+        // Both folders start expanded so drop targets are on screen without
+        // needing a real click (which would arm the 500ms persistence timer).
+        explorerExpanded: ["f1", "f2"],
+      },
+      providers: [
+        {
+          id: "openai",
+          name: "OpenAI",
+          baseUrl: "http://fixture/v1",
+          models: ["classroom-test"],
+          hasKey: true,
+        },
+      ],
+    };
+  }
+
+  function mockDragDrop(data: AppData) {
+    invoke.mockImplementation(async (command: string, args?: Record<string, any>) => {
+      if (command === "load_state") return structuredClone(data);
+      if (command === "stt_status")
+        return { ready: true, modelName: "fixture", modelPath: "/tmp/model", sizeBytes: 1 };
+      if (command === "move_node") {
+        const node = data.nodes.find((item) => item.id === args?.id);
+        if (node) node.parentId = (args?.parentId as string | null) ?? null;
+        return node;
+      }
+      if (command === "save_settings") data.settings = args?.settings as AppData["settings"];
+      return undefined;
+    });
+  }
+
+  function fakeDataTransfer(types: string[] = ["application/x-async-node"]) {
+    return {
+      types,
+      effectAllowed: "",
+      dropEffect: "",
+      setData: vi.fn(),
+      getData: vi.fn(() => ""),
+    };
+  }
+  function treeRow(wrapper: VueWrapper, selector: string, name: string) {
+    const match = wrapper.findAll(selector).find((item) => item.text() === name);
+    if (!match) throw new Error(`Missing ${selector}: ${name}`);
+    return match;
+  }
+  // The draggable/dragstart/dragover/drop listeners live on the row div, one
+  // level up from the .tree-node button treeRow() finds.
+  function rowDiv(wrapper: VueWrapper, name: string) {
+    const match = wrapper.findAll(".tree-row").find((item) => item.text().includes(name));
+    if (!match) throw new Error(`Missing row: ${name}`);
+    return match;
+  }
+
+  let data: AppData;
+  beforeEach(() => {
+    data = dragDropState();
+    invoke.mockReset();
+    mockDragDrop(data);
+  });
+
+  it("moves a node into another folder on drop", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    const dataTransfer = fakeDataTransfer();
+    await rowDiv(wrapper, "Session One").trigger("dragstart", { dataTransfer });
+    await rowDiv(wrapper, "Nested").trigger("dragover", { dataTransfer });
+    await rowDiv(wrapper, "Nested").trigger("drop", { dataTransfer });
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("move_node", { id: "s1", parentId: "f2" });
+  });
+
+  it("resolves a drop onto a session row to that session's own parent", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    const dataTransfer = fakeDataTransfer();
+    // Root Session's parent is root (null), so dropping "on" it moves into root.
+    await rowDiv(wrapper, "Session One").trigger("dragstart", { dataTransfer });
+    await rowDiv(wrapper, "Root Session").trigger("dragover", { dataTransfer });
+    await rowDiv(wrapper, "Root Session").trigger("drop", { dataTransfer });
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("move_node", { id: "s1", parentId: null });
+  });
+
+  it("refuses dropping a folder onto itself or its own descendant", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    const dataTransfer = fakeDataTransfer();
+    await rowDiv(wrapper, "Folder A").trigger("dragstart", { dataTransfer });
+    await rowDiv(wrapper, "Folder A").trigger("dragover", { dataTransfer });
+    await rowDiv(wrapper, "Folder A").trigger("drop", { dataTransfer });
+    await rowDiv(wrapper, "Nested").trigger("dragover", { dataTransfer });
+    await rowDiv(wrapper, "Nested").trigger("drop", { dataTransfer });
+    await flushPromises();
+    expect(invoke).not.toHaveBeenCalledWith("move_node", expect.anything());
+  });
+
+  it("moves a node to root by dropping on the blank area", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    const dataTransfer = fakeDataTransfer();
+    await rowDiv(wrapper, "Session One").trigger("dragstart", { dataTransfer });
+    await wrapper.get(".explorer-blank").trigger("dragover", { dataTransfer });
+    await wrapper.get(".explorer-blank").trigger("drop", { dataTransfer });
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("move_node", { id: "s1", parentId: null });
+  });
+
+  it("ignores a dragover/drop carrying a foreign MIME type", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    const validTransfer = fakeDataTransfer();
+    await rowDiv(wrapper, "Session One").trigger("dragstart", { dataTransfer: validTransfer });
+    const foreignTransfer = fakeDataTransfer(["text/uri-list"]);
+    await rowDiv(wrapper, "Nested").trigger("dragover", { dataTransfer: foreignTransfer });
+    await rowDiv(wrapper, "Nested").trigger("drop", { dataTransfer: foreignTransfer });
+    await flushPromises();
+    expect(invoke).not.toHaveBeenCalledWith("move_node", expect.anything());
+  });
+
+  it("refuses to drag or drop while an operation is busy", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await treeRow(wrapper, ".tree-session", "Root Session").trigger("click");
+    await flushPromises();
+    await buttonWithText(wrapper, "开始录音").trigger("click");
+    await flushPromises();
+    expect(rowDiv(wrapper, "Session One").attributes("draggable")).toBe("false");
+
+    const dataTransfer = fakeDataTransfer();
+    await rowDiv(wrapper, "Session One").trigger("dragstart", { dataTransfer });
+    await rowDiv(wrapper, "Nested").trigger("dragover", { dataTransfer });
+    await rowDiv(wrapper, "Nested").trigger("drop", { dataTransfer });
+    await flushPromises();
+    expect(invoke).not.toHaveBeenCalledWith("move_node", expect.anything());
+  });
+});
+
 describe("header controls", () => {
   let data: AppData;
   beforeEach(() => {
