@@ -73,6 +73,22 @@ const rows = computed<DisplayRow[]>(() => {
 function rowTitle(id: string): string {
   return pathLabel(props.nodes, id);
 }
+
+// Function refs (not string refs, which Vue collects into arrays inside a
+// v-for) so the activity bar's Explorer shortcut can focus a specific row.
+const rowEls = new Map<string, HTMLElement>();
+function setRowRef(id: string, el: unknown) {
+  if (el) rowEls.set(id, el as HTMLElement);
+  else rowEls.delete(id);
+}
+// Focuses the currently open or focused row, else the first row - used by
+// the activity bar's Cmd/Ctrl+Shift+E shortcut.
+function focusRow() {
+  const targetId = props.focusedNodeId ?? (props.openNodeId || undefined) ?? flatRows.value[0]?.node.id;
+  if (!targetId) return;
+  rowEls.get(targetId)?.focus();
+}
+defineExpose({ focusRow });
 function handleClick(node: Node) {
   emit("focus-node", node.id);
   if (node.kind === "folder") emit("toggle-folder", node.id);
@@ -281,6 +297,7 @@ const deleteMessage = computed(() => {
         />
         <button
           v-else
+          :ref="(el) => setRowRef(row.node.id, el)"
           type="button"
           class="tree-node"
           :class="[`tree-${row.node.kind}`, { active: row.node.id === openNodeId }]"

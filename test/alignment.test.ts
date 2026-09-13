@@ -1422,3 +1422,416 @@ describe("transcript gap fixes: capture mode, language, level meter, playback", 
     expect(wrapper.find(".playback-bar").exists()).toBe(false);
   });
 });
+
+describe("activity bar", () => {
+  let data: AppData;
+  let attached: VueWrapper | undefined;
+  beforeEach(() => {
+    data = baseState();
+    invoke.mockReset();
+    mockInvoke(data);
+  });
+  afterEach(() => {
+    attached?.unmount();
+    attached = undefined;
+  });
+  // Focus assertions need the wrapper attached to document.body - jsdom only
+  // tracks document.activeElement for elements actually in the document.
+  function mountAttached() {
+    attached = mount(App, { global: { stubs }, attachTo: document.body });
+    return attached;
+  }
+
+  function activityButton(wrapper: VueWrapper, label: string) {
+    const button = wrapper.find(`.activity-bar [aria-label="${label}"]`);
+    if (!button.exists()) throw new Error(`Missing activity bar button: ${label}`);
+    return button;
+  }
+
+  it("starts on Explorer and switches to Search by clicking its icon, opening the panel if closed", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    expect(wrapper.find('[role="tree"]').exists()).toBe(true);
+    expect(wrapper.find(".search-view").exists()).toBe(false);
+    expect(activityButton(wrapper, "资源管理器").attributes("aria-pressed")).toBe("true");
+    expect(activityButton(wrapper, "搜索").attributes("aria-pressed")).toBe("false");
+
+    await activityButton(wrapper, "搜索").trigger("click");
+    expect(wrapper.find(".search-view").exists()).toBe(true);
+    expect(wrapper.find('[role="tree"]').exists()).toBe(false);
+    expect(activityButton(wrapper, "搜索").attributes("aria-pressed")).toBe("true");
+    expect(activityButton(wrapper, "资源管理器").attributes("aria-pressed")).toBe("false");
+  });
+
+  it("clicking the active view's icon collapses the panel; clicking it again reopens the same view", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await activityButton(wrapper, "资源管理器").trigger("click");
+    expect(wrapper.find('[role="tree"]').exists()).toBe(false);
+    expect(wrapper.find(".search-view").exists()).toBe(false);
+
+    await activityButton(wrapper, "资源管理器").trigger("click");
+    expect(wrapper.find('[role="tree"]').exists()).toBe(true);
+  });
+
+  it("Ctrl+Shift+F opens Search and focuses the query input; Ctrl+Shift+E returns to Explorer and focuses a row", async () => {
+    const wrapper = mountAttached();
+    await flushPromises();
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "F", ctrlKey: true, shiftKey: true, bubbles: true }),
+    );
+    await flushPromises();
+    expect(wrapper.find(".search-view").exists()).toBe(true);
+    expect(document.activeElement?.tagName).toBe("INPUT");
+
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "E", ctrlKey: true, shiftKey: true, bubbles: true }),
+    );
+    await flushPromises();
+    expect(wrapper.find('[role="tree"]').exists()).toBe(true);
+    expect(document.activeElement?.classList.contains("tree-node")).toBe(true);
+  });
+
+  it("ignores the view shortcuts while an IME composition is in progress", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "F",
+        ctrlKey: true,
+        shiftKey: true,
+        isComposing: true,
+        bubbles: true,
+      }),
+    );
+    await flushPromises();
+    expect(wrapper.find(".search-view").exists()).toBe(false);
+  });
+
+  it("keeps Ctrl+B toggling the sidebar for whichever view is active", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await activityButton(wrapper, "搜索").trigger("click");
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "b", ctrlKey: true, bubbles: true }));
+    await flushPromises();
+    expect(wrapper.find(".search-view").exists()).toBe(false);
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "b", ctrlKey: true, bubbles: true }));
+    await flushPromises();
+    expect(wrapper.find(".search-view").exists()).toBe(true);
+  });
+});
+
+describe("search view", () => {
+  function searchState(): AppData {
+    return {
+      nodes: [
+        { id: "f1", parentId: null, kind: "folder", name: "Folder A" },
+        { id: "s1", parentId: "f1", kind: "session", name: "Deep Session" },
+        { id: "s2", parentId: null, kind: "session", name: "Root Session" },
+        { id: "m1", parentId: "f1", kind: "material", name: "Notes.md" },
+      ],
+      sessions: [
+        { id: "s1", messages: [], transcription: "", summary: "" },
+        { id: "s2", messages: [], transcription: "", summary: "" },
+      ],
+      materials: [{ id: "m1", content: "hello", path: "/tmp/notes.md" }],
+      settings: {
+        providerId: "openai",
+        model: "classroom-test",
+        theme: "system",
+        language: "zh",
+      },
+      providers: [
+        {
+          id: "openai",
+          name: "OpenAI",
+          baseUrl: "http://fixture/v1",
+          models: ["classroom-test"],
+          hasKey: true,
+        },
+      ],
+    };
+  }
+
+  function mockSearch(
+    state: AppData,
+    impl: (query: string) => { hits: unknown[]; truncated: boolean },
+  ) {
+    invoke.mockImplementation(async (command: string, args?: Record<string, any>) => {
+      if (command === "load_state") return structuredClone(state);
+      if (command === "stt_status")
+        return { ready: true, modelName: "fixture", modelPath: "/tmp/model", sizeBytes: 1 };
+      if (command === "search_library") return impl(args?.query as string);
+      return undefined;
+    });
+  }
+
+  async function openSearchView(wrapper: VueWrapper) {
+    await wrapper.get('.activity-bar [aria-label="搜索"]').trigger("click");
+  }
+  function queryInput(wrapper: VueWrapper) {
+    return wrapper.get(".search-field-wrap input");
+  }
+
+  let data: AppData;
+  let attached: VueWrapper | undefined;
+  beforeEach(() => {
+    data = searchState();
+    invoke.mockReset();
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    attached?.unmount();
+    attached = undefined;
+  });
+  // Focus assertions need the wrapper attached to document.body - jsdom only
+  // tracks document.activeElement for elements actually in the document.
+  function mountAttached() {
+    attached = mount(App, { global: { stubs }, attachTo: document.body });
+    return attached;
+  }
+
+  it("only issues one debounced search_library call while typing rapidly", async () => {
+    let calls = 0;
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "load_state") return structuredClone(data);
+      if (command === "stt_status")
+        return { ready: true, modelName: "fixture", modelPath: "/tmp/model", sizeBytes: 1 };
+      if (command === "search_library") {
+        calls += 1;
+        return { hits: [], truncated: false };
+      }
+      return undefined;
+    });
+    const wrapper = mountApp();
+    await flushPromises();
+    await openSearchView(wrapper);
+    const input = queryInput(wrapper);
+    await input.setValue("a");
+    await vi.advanceTimersByTimeAsync(120);
+    await input.setValue("ab");
+    await vi.advanceTimersByTimeAsync(120);
+    await input.setValue("abc");
+    await vi.advanceTimersByTimeAsync(200);
+    await flushPromises();
+    expect(calls).toBe(1);
+    expect(invoke).toHaveBeenCalledWith("search_library", { query: "abc" });
+  });
+
+  it("ignores a stale response that resolves after a newer query was already issued", async () => {
+    let resolveFirst!: (value: { hits: unknown[]; truncated: boolean }) => void;
+    let resolveSecond!: (value: { hits: unknown[]; truncated: boolean }) => void;
+    invoke.mockImplementation(async (command: string, args?: Record<string, any>) => {
+      if (command === "load_state") return structuredClone(data);
+      if (command === "stt_status")
+        return { ready: true, modelName: "fixture", modelPath: "/tmp/model", sizeBytes: 1 };
+      if (command === "search_library") {
+        if (args?.query === "first") return new Promise((resolve) => (resolveFirst = resolve));
+        return new Promise((resolve) => (resolveSecond = resolve));
+      }
+      return undefined;
+    });
+    const wrapper = mountApp();
+    await flushPromises();
+    await openSearchView(wrapper);
+    const input = queryInput(wrapper);
+    await input.setValue("first");
+    await vi.advanceTimersByTimeAsync(200);
+    await flushPromises();
+    await input.setValue("second");
+    await vi.advanceTimersByTimeAsync(200);
+    await flushPromises();
+
+    resolveSecond({
+      hits: [
+        {
+          nodeId: "s2",
+          kind: "session",
+          field: "name",
+          piece: { before: "", matched: "Root Session", after: "" },
+        },
+      ],
+      truncated: false,
+    });
+    await flushPromises();
+    resolveFirst({
+      hits: [
+        {
+          nodeId: "s1",
+          kind: "session",
+          field: "name",
+          piece: { before: "", matched: "Deep Session", after: "" },
+        },
+      ],
+      truncated: false,
+    });
+    await flushPromises();
+    expect(wrapper.text()).toContain("Root Session");
+    expect(wrapper.text()).not.toContain("Deep Session");
+  });
+
+  it("groups hits by node with muted parent paths, and always renders content as text, never HTML", async () => {
+    mockSearch(data, () => ({
+      hits: [
+        {
+          nodeId: "s1",
+          kind: "session",
+          field: "name",
+          piece: { before: "Deep ", matched: "Session", after: "" },
+        },
+        {
+          nodeId: "s1",
+          kind: "session",
+          field: "transcription",
+          piece: { before: "a ", matched: "<img src=x onerror=1>", after: " today" },
+        },
+        {
+          nodeId: "s2",
+          kind: "session",
+          field: "name",
+          piece: { before: "Root ", matched: "Session", after: "" },
+        },
+      ],
+      truncated: false,
+    }));
+    const wrapper = mountApp();
+    await flushPromises();
+    await openSearchView(wrapper);
+    await queryInput(wrapper).setValue("session");
+    await vi.advanceTimersByTimeAsync(200);
+    await flushPromises();
+
+    const groups = wrapper.findAll(".search-group");
+    expect(groups.length).toBe(2);
+    expect(groups[0]!.find(".search-group-name").text()).toBe("Deep Session");
+    expect(groups[0]!.find(".search-group-path").text()).toBe("Folder A");
+    expect(groups[1]!.find(".search-group-name").text()).toBe("Root Session");
+    expect(groups[1]!.find(".search-group-path").exists()).toBe(false);
+    expect(groups[0]!.findAll(".search-hit")[1]!.find(".search-field-label").text()).toBe("转写");
+    expect(wrapper.find(".search-piece img").exists()).toBe(false);
+    expect(wrapper.text()).toContain("<img src=x onerror=1>");
+  });
+
+  it("opens a result and reveals it in the Explorer without leaving Search", async () => {
+    mockSearch(data, () => ({
+      hits: [
+        {
+          nodeId: "s1",
+          kind: "session",
+          field: "name",
+          piece: { before: "", matched: "Deep Session", after: "" },
+        },
+      ],
+      truncated: false,
+    }));
+    const wrapper = mountApp();
+    await flushPromises();
+    await openSearchView(wrapper);
+    await queryInput(wrapper).setValue("Deep");
+    await vi.advanceTimersByTimeAsync(200);
+    await flushPromises();
+    await wrapper.get(".search-hit").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".app-header h1").text()).toBe("Deep Session");
+    expect(wrapper.find(".search-view").exists()).toBe(true);
+
+    await wrapper.get('.activity-bar [aria-label="资源管理器"]').trigger("click");
+    expect(
+      wrapper.findAll(".tree-session").some((row) => row.text() === "Deep Session"),
+    ).toBe(true);
+    expect(wrapper.get(".tree-row.focused").text()).toBe("Deep Session");
+  });
+
+  it("blocks activating a result while an operation is busy", async () => {
+    mockSearch(data, () => ({
+      hits: [
+        {
+          nodeId: "s1",
+          kind: "session",
+          field: "name",
+          piece: { before: "", matched: "Deep Session", after: "" },
+        },
+      ],
+      truncated: false,
+    }));
+    const wrapper = mountApp();
+    await flushPromises();
+    await openSessionNode(wrapper, "Root Session");
+    await buttonWithText(wrapper, "开始录音").trigger("click");
+    await flushPromises();
+    await openSearchView(wrapper);
+    await queryInput(wrapper).setValue("Deep");
+    await vi.advanceTimersByTimeAsync(200);
+    await flushPromises();
+
+    expect(wrapper.get(".search-hit").attributes("disabled")).toBeDefined();
+    await wrapper.get(".search-hit").trigger("click");
+    await flushPromises();
+
+    await wrapper.get('.activity-bar [aria-label="资源管理器"]').trigger("click");
+    expect(wrapper.find(".app-header h1").text()).toBe("Root Session");
+  });
+
+  it("shows the empty prompt before typing and a no-results message after a query with no hits", async () => {
+    mockSearch(data, () => ({ hits: [], truncated: false }));
+    const wrapper = mountApp();
+    await flushPromises();
+    await openSearchView(wrapper);
+    expect(wrapper.get(".search-empty").text()).toBe("输入以搜索名称、转写、摘要、材料和对话");
+
+    await queryInput(wrapper).setValue("nothing");
+    await vi.advanceTimersByTimeAsync(200);
+    await flushPromises();
+    expect(wrapper.get(".search-empty").text()).toBe("未找到「nothing」的结果");
+  });
+
+  it("shows the truncated footer when results are capped", async () => {
+    mockSearch(data, () => ({
+      hits: [
+        {
+          nodeId: "s2",
+          kind: "session",
+          field: "name",
+          piece: { before: "", matched: "Root Session", after: "" },
+        },
+      ],
+      truncated: true,
+    }));
+    const wrapper = mountApp();
+    await flushPromises();
+    await openSearchView(wrapper);
+    await queryInput(wrapper).setValue("session");
+    await vi.advanceTimersByTimeAsync(200);
+    await flushPromises();
+    expect(wrapper.get(".search-truncated").text()).toBe("结果过多，请细化搜索");
+  });
+
+  it("ArrowDown from the query focuses the first result, and Escape clears the query", async () => {
+    mockSearch(data, () => ({
+      hits: [
+        {
+          nodeId: "s2",
+          kind: "session",
+          field: "name",
+          piece: { before: "", matched: "Root Session", after: "" },
+        },
+      ],
+      truncated: false,
+    }));
+    const wrapper = mountAttached();
+    await flushPromises();
+    await openSearchView(wrapper);
+    const input = queryInput(wrapper);
+    await input.setValue("session");
+    await vi.advanceTimersByTimeAsync(200);
+    await flushPromises();
+    await input.trigger("keydown", { key: "ArrowDown" });
+    await flushPromises();
+    expect(document.activeElement?.classList.contains("search-hit")).toBe(true);
+
+    await input.trigger("keydown", { key: "Escape" });
+    await flushPromises();
+    expect((input.element as HTMLInputElement).value).toBe("");
+  });
+});

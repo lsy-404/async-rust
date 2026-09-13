@@ -6,6 +6,27 @@ export default {
     close: "关闭",
     settings: "设置",
   },
+  activity: {
+    title: "活动栏",
+    explorer: "资源管理器",
+    explorerTitle: "资源管理器 (Ctrl/Cmd+Shift+E)",
+    search: "搜索",
+    searchTitle: "搜索 (Ctrl/Cmd+Shift+F)",
+  },
+  search: {
+    title: "搜索",
+    placeholder: "搜索名称、转写、摘要、材料和对话",
+    emptyPrompt: "输入以搜索名称、转写、摘要、材料和对话",
+    noResults: "未找到「{q}」的结果",
+    truncated: "结果过多，请细化搜索",
+    field: {
+      name: "名称",
+      transcription: "转写",
+      summary: "摘要",
+      content: "材料",
+      message: "对话",
+    },
+  },
   explorer: {
     title: "资源管理器",
     empty: "还没有内容。",

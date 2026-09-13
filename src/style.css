@@ -69,6 +69,40 @@ textarea {
 .session-tabs button:hover:not(.active) {
   background: color-mix(in srgb, var(--fluent-muted) 10%, transparent);
 }
+.activity-bar {
+  width: 44px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 6px 0;
+  border-right: 1px solid var(--fluent-border);
+  background: var(--fluent-surface);
+}
+.activity-btn {
+  width: 32px;
+  height: 32px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-left: 2px solid transparent;
+  border-radius: 4px;
+  background: none;
+  color: inherit;
+  opacity: 0.6;
+  cursor: pointer;
+}
+.activity-btn:hover {
+  opacity: 0.85;
+  background: color-mix(in srgb, var(--fluent-muted) 10%, transparent);
+}
+.activity-btn.active {
+  opacity: 1;
+  border-left-color: var(--fluent-accent);
+}
 .explorer {
   width: 264px;
   flex: none;

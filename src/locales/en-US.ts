@@ -6,6 +6,27 @@ export default {
     close: "Close",
     settings: "Settings",
   },
+  activity: {
+    title: "Activity bar",
+    explorer: "Explorer",
+    explorerTitle: "Explorer (Ctrl/Cmd+Shift+E)",
+    search: "Search",
+    searchTitle: "Search (Ctrl/Cmd+Shift+F)",
+  },
+  search: {
+    title: "Search",
+    placeholder: "Search names, transcripts, summaries, materials and chats",
+    emptyPrompt: "Type to search names, transcripts, summaries, materials and chats",
+    noResults: 'No results for "{q}"',
+    truncated: "Too many results; refine the search",
+    field: {
+      name: "Name",
+      transcription: "Transcript",
+      summary: "Summary",
+      content: "Material",
+      message: "Chat",
+    },
+  },
   explorer: {
     title: "Explorer",
     empty: "Nothing here yet.",

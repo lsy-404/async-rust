@@ -15,12 +15,15 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import ModelConnections from "./components/ModelConnections.vue";
+import ActivityBar from "./components/ActivityBar.vue";
 import ExplorerView from "./components/ExplorerView.vue";
+import SearchView from "./components/SearchView.vue";
 import WorkbenchChat from "./components/WorkbenchChat.vue";
 import TranscriptPanel from "./components/TranscriptPanel.vue";
 import { i18n, setLocale } from "./locales";
 import { splitTranscriptSentences } from "./transcript-sentences";
 import {
+  ancestorsOf,
   flattenVisible,
   nextFocusAfterDelete,
   resolveCreateTarget,
@@ -41,6 +44,7 @@ import type {
   NotesStatus,
   NotesStatusEvent,
   RecordingSource,
+  SearchResults,
   Session,
   Settings,
   StreamEvent,
@@ -178,6 +182,13 @@ const createDraft = ref("");
 const renamingId = ref("");
 const renameDraft = ref("");
 const deleteTarget = ref<{ nodeId: string }>();
+const activeView = ref<"explorer" | "search">("explorer");
+const explorerViewRef = ref<InstanceType<typeof ExplorerView>>();
+const searchViewRef = ref<InstanceType<typeof SearchView>>();
+const searchQuery = ref("");
+const searchResults = ref<SearchResults>();
+let searchDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+let searchToken = 0;
 const themeChoices = computed<{ value: Theme; label: string }[]>(() => [
   { value: "system", label: t("theme.system") },
   { value: "light", label: t("theme.light") },
@@ -580,11 +591,75 @@ function toggleSidebar() {
   sidebarOpen.value = !sidebarOpen.value;
   void persistLayoutSettings();
 }
+// Opens the given view, opening the side panel if it was closed (used by the
+// keyboard shortcuts, which always open rather than toggle).
+function openView(view: "explorer" | "search") {
+  activeView.value = view;
+  if (!sidebarOpen.value) toggleSidebar();
+}
+// VS Code behaviour: clicking the inactive icon switches to it (opening the
+// panel if needed); clicking the already-active one toggles the panel.
+function selectActivityView(view: "explorer" | "search") {
+  if (activeView.value === view) {
+    toggleSidebar();
+    return;
+  }
+  openView(view);
+}
+async function focusExplorerRow() {
+  await nextTick();
+  explorerViewRef.value?.focusRow();
+}
+async function focusSearchInput() {
+  await nextTick();
+  searchViewRef.value?.focusQuery();
+}
 function handleWindowKeydown(event: KeyboardEvent) {
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "b") {
+  if (event.isComposing || event.keyCode === 229) return;
+  if (!event.ctrlKey && !event.metaKey) return;
+  const key = event.key.toLowerCase();
+  if (key === "b") {
     event.preventDefault();
     toggleSidebar();
+    return;
   }
+  if (!event.shiftKey) return;
+  if (key === "e") {
+    event.preventDefault();
+    openView("explorer");
+    void focusExplorerRow();
+    return;
+  }
+  if (key === "f") {
+    event.preventDefault();
+    openView("search");
+    void focusSearchInput();
+  }
+}
+function runSearch(query: string) {
+  const trimmed = query.trim();
+  const token = ++searchToken;
+  if (!trimmed) {
+    searchResults.value = undefined;
+    return;
+  }
+  invoke<SearchResults>("search_library", { query: trimmed })
+    .then((results) => {
+      if (token === searchToken) searchResults.value = results;
+    })
+    .catch((cause) => {
+      if (token === searchToken) report(cause);
+    });
+}
+// Opens a search hit's node and reveals it in the explorer tree (expanding
+// every ancestor folder and focusing the row), without switching away from
+// the search view - matching VS Code's own search-result behaviour.
+function openFromSearch(id: string) {
+  openNode(id);
+  for (const ancestor of ancestorsOf(data.value.nodes, id)) {
+    expandedFolders.value.add(ancestor.id);
+  }
+  focusedNodeId.value = id;
 }
 async function saveMaterial() {
   if (material.value)
@@ -1056,6 +1131,10 @@ watch(operationBusy, (busy) => {
   cancelRename();
   cancelCreate();
 });
+watch(searchQuery, (query) => {
+  if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = setTimeout(() => runSearch(query), 200);
+});
 watch(renderedMessages, async () => {
   const panel = workbenchChatRef.value?.messagesRef;
   if (!panel) return;
@@ -1113,6 +1192,8 @@ onMounted(() => {
 });
 onUnmounted(() => {
   window.removeEventListener("keydown", handleWindowKeydown);
+  if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+  if (expandedFoldersPersistTimer) clearTimeout(expandedFoldersPersistTimer);
   unlistenNotesStatus?.();
   unlistenTranslationStatus?.();
   recordingGeneration += 1;
@@ -1137,8 +1218,10 @@ onUnmounted(() => {
         <span class="spinner"></span> {{ t("loading") }}
       </div>
       <div v-else class="desktop-shell">
+        <ActivityBar :active-view="activeView" @select="selectActivityView" />
         <ExplorerView
-          v-if="sidebarOpen"
+          v-if="sidebarOpen && activeView === 'explorer'"
+          ref="explorerViewRef"
           :nodes="data.nodes"
           :open-node-id="openNodeId"
           :expanded-folders="expandedFolders"
@@ -1168,6 +1251,16 @@ onUnmounted(() => {
           @open-delete-dialog="openDeleteDialog"
           @cancel-delete="cancelDelete"
           @confirm-delete="confirmDelete"
+        />
+        <SearchView
+          v-if="sidebarOpen && activeView === 'search'"
+          ref="searchViewRef"
+          :nodes="data.nodes"
+          :query="searchQuery"
+          :results="searchResults"
+          :operation-busy="operationBusy"
+          @update:query="searchQuery = $event"
+          @open-node="openFromSearch"
         />
         <section
           ref="layoutRef"
