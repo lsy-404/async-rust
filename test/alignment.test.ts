@@ -1181,6 +1181,19 @@ describe("material editor draft", () => {
         .value,
     ).toBe("other content");
   });
+
+  it("saves a material with the id/content payload the backend command expects", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await wrapper.get(".tree-material").trigger("click");
+    await wrapper.get(".material-editor textarea").setValue("edited content");
+    await buttonWithText(wrapper, "保存").trigger("click");
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("save_material", {
+      id: "mat1",
+      content: "edited content",
+    });
+  });
 });
 
 describe("settings dialog theme control", () => {

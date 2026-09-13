@@ -744,7 +744,8 @@ async function saveMaterial() {
   if (material.value)
     try {
       await invoke("save_material", {
-        material: { ...material.value, content: materialDraft.value },
+        id: material.value.id,
+        content: materialDraft.value,
       });
       notice.value = t("notice.materialSaved");
       await refresh();
