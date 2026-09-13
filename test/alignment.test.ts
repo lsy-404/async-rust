@@ -707,6 +707,182 @@ describe("explorer node actions", () => {
       expect(buttonWithText(wrapper, "删除").attributes("disabled")).toBeDefined();
     });
   });
+
+  describe("tree keyboard navigation and WAI-ARIA semantics", () => {
+    // Flattened order for this fixture (folders first, then name-sorted,
+    // depth-first): Folder A, Nested, Session Two, Notes.md, Session One,
+    // Root Session.
+    function rowButton(wrapper: VueWrapper, name: string) {
+      const match = wrapper.findAll(".tree-node").find((item) => item.text() === name);
+      if (!match) throw new Error(`Missing row button: ${name}`);
+      return match;
+    }
+
+    it("exposes role=treeitem with aria-level/setsize/posinset/selected", async () => {
+      const wrapper = mountApp();
+      await flushPromises();
+      const folderA = rowButton(wrapper, "Folder A");
+      expect(folderA.attributes("role")).toBe("treeitem");
+      expect(folderA.attributes("aria-level")).toBe("1");
+      expect(folderA.attributes("aria-setsize")).toBe("2"); // root: Folder A, Root Session
+      expect(folderA.attributes("aria-posinset")).toBe("1");
+      expect(folderA.attributes("aria-expanded")).toBe("true");
+      expect(folderA.attributes("aria-selected")).toBe("false");
+
+      const nested = rowButton(wrapper, "Nested");
+      expect(nested.attributes("aria-level")).toBe("2");
+      expect(nested.attributes("aria-setsize")).toBe("3"); // Folder A's children: Nested, Notes.md, Session One
+      expect(nested.attributes("aria-posinset")).toBe("1");
+
+      // A material row, not a folder, so this click only focuses it rather
+      // than also toggling (and arming a real persistence timer for) a folder.
+      await rowButton(wrapper, "Notes.md").trigger("click");
+      await flushPromises();
+      expect(rowButton(wrapper, "Notes.md").attributes("aria-selected")).toBe("true");
+      expect(rowButton(wrapper, "Folder A").attributes("aria-selected")).toBe("false");
+    });
+
+    it("has a roving tabindex: only the focused row (else the first row) is a tab stop", async () => {
+      const wrapper = mountApp();
+      await flushPromises();
+      expect(rowButton(wrapper, "Folder A").attributes("tabindex")).toBe("0");
+      expect(rowButton(wrapper, "Notes.md").attributes("tabindex")).toBe("-1");
+
+      // A material/session row, not a folder, so this click only focuses it
+      // rather than also toggling (and arming a real persistence timer for)
+      // a folder.
+      await rowButton(wrapper, "Notes.md").trigger("click");
+      await flushPromises();
+      expect(rowButton(wrapper, "Folder A").attributes("tabindex")).toBe("-1");
+      expect(rowButton(wrapper, "Notes.md").attributes("tabindex")).toBe("0");
+    });
+
+    // These check real DOM focus movement (not just the focusedNodeId prop
+    // App.vue tracks), so the wrapper must be attached to a live document -
+    // jsdom never updates document.activeElement for a detached element.
+    function mountAttached() {
+      return mount(App, { global: { stubs }, attachTo: document.body });
+    }
+
+    it("moves focus with ArrowDown/ArrowUp/Home/End", async () => {
+      const wrapper = mountAttached();
+      try {
+        await flushPromises();
+        // Nothing is focused yet, so the first ArrowDown selects the first
+        // row itself rather than skipping past it.
+        await rowButton(wrapper, "Folder A").trigger("keydown", { key: "ArrowDown" });
+        await flushPromises();
+        expect(document.activeElement).toBe(rowButton(wrapper, "Folder A").element);
+
+        await rowButton(wrapper, "Folder A").trigger("keydown", { key: "ArrowDown" });
+        await flushPromises();
+        expect(document.activeElement).toBe(rowButton(wrapper, "Nested").element);
+
+        await rowButton(wrapper, "Nested").trigger("keydown", { key: "ArrowDown" });
+        await flushPromises();
+        expect(document.activeElement).toBe(rowButton(wrapper, "Session Two").element);
+
+        await rowButton(wrapper, "Session Two").trigger("keydown", { key: "ArrowUp" });
+        await flushPromises();
+        expect(document.activeElement).toBe(rowButton(wrapper, "Nested").element);
+
+        await rowButton(wrapper, "Nested").trigger("keydown", { key: "End" });
+        await flushPromises();
+        expect(document.activeElement).toBe(rowButton(wrapper, "Root Session").element);
+
+        await rowButton(wrapper, "Root Session").trigger("keydown", { key: "Home" });
+        await flushPromises();
+        expect(document.activeElement).toBe(rowButton(wrapper, "Folder A").element);
+      } finally {
+        wrapper.unmount();
+      }
+    });
+
+    it("ArrowLeft collapses an expanded folder without moving focus, ArrowRight re-expands it then moves to its first child", async () => {
+      // Fake timers so the 500ms explorerExpanded persistence debounce this
+      // collapse/expand triggers never fires for real into a later test.
+      vi.useFakeTimers();
+      const wrapper = mountAttached();
+      try {
+        await flushPromises();
+        // Two ArrowDowns from nothing focused reach Nested: Folder A, then Nested.
+        await rowButton(wrapper, "Folder A").trigger("keydown", { key: "ArrowDown" });
+        await rowButton(wrapper, "Folder A").trigger("keydown", { key: "ArrowDown" });
+        await flushPromises();
+        expect(document.activeElement).toBe(rowButton(wrapper, "Nested").element);
+
+        await rowButton(wrapper, "Nested").trigger("keydown", { key: "ArrowLeft" });
+        await flushPromises();
+        expect(
+          wrapper.findAll(".tree-node").some((item) => item.text() === "Session Two"),
+        ).toBe(false);
+        expect(document.activeElement).toBe(rowButton(wrapper, "Nested").element);
+
+        await rowButton(wrapper, "Nested").trigger("keydown", { key: "ArrowRight" });
+        await flushPromises();
+        expect(rowButton(wrapper, "Session Two").exists()).toBe(true);
+        expect(document.activeElement).toBe(rowButton(wrapper, "Nested").element);
+
+        await rowButton(wrapper, "Nested").trigger("keydown", { key: "ArrowRight" });
+        await flushPromises();
+        expect(document.activeElement).toBe(rowButton(wrapper, "Session Two").element);
+      } finally {
+        wrapper.unmount();
+        vi.useRealTimers();
+      }
+    });
+
+    it("ArrowLeft on a non-folder row moves focus to its parent", async () => {
+      const wrapper = mountAttached();
+      try {
+        await flushPromises();
+        // Three ArrowDowns from nothing focused reach Session Two.
+        await rowButton(wrapper, "Folder A").trigger("keydown", { key: "ArrowDown" });
+        await rowButton(wrapper, "Folder A").trigger("keydown", { key: "ArrowDown" });
+        await rowButton(wrapper, "Nested").trigger("keydown", { key: "ArrowDown" });
+        await flushPromises();
+        expect(document.activeElement).toBe(rowButton(wrapper, "Session Two").element);
+
+        await rowButton(wrapper, "Session Two").trigger("keydown", { key: "ArrowLeft" });
+        await flushPromises();
+        expect(document.activeElement).toBe(rowButton(wrapper, "Nested").element);
+      } finally {
+        wrapper.unmount();
+      }
+    });
+
+    it("Delete opens the delete dialog for the focused row", async () => {
+      const wrapper = mountApp();
+      await flushPromises();
+      await rowButton(wrapper, "Session One").trigger("click");
+      await rowButton(wrapper, "Session One").trigger("keydown", { key: "Delete" });
+      await flushPromises();
+      expect(wrapper.find(".dialog-stub").exists()).toBe(true);
+      expect(wrapper.find(".dialog-stub").text()).toContain("Session One");
+    });
+
+    it("Cmd+Backspace also opens the delete dialog for the focused row", async () => {
+      const wrapper = mountApp();
+      await flushPromises();
+      await rowButton(wrapper, "Session One").trigger("click");
+      await rowButton(wrapper, "Session One").trigger("keydown", {
+        key: "Backspace",
+        metaKey: true,
+      });
+      await flushPromises();
+      expect(wrapper.find(".dialog-stub").exists()).toBe(true);
+    });
+
+    it("Shift+F10 opens the context menu for the focused row", async () => {
+      const wrapper = mountApp();
+      await flushPromises();
+      await rowButton(wrapper, "Session One").trigger("click");
+      await rowButton(wrapper, "Session One").trigger("keydown", { key: "F10", shiftKey: true });
+      await flushPromises();
+      expect(wrapper.find(".context-menu").exists()).toBe(true);
+      expect(menuItemTexts(wrapper)).toEqual(["打开", "移动到…", "重命名", "删除"]);
+    });
+  });
 });
 
 // Native HTML5 drag and drop, wired through App.vue's dragNodeId/dropParent

@@ -52,7 +52,7 @@ const emit = defineEmits<{
 }>();
 
 type DisplayRow =
-  | { type: "node"; node: Node; depth: number }
+  | { type: "node"; node: Node; depth: number; posInSet: number; setSize: number }
   | { type: "create"; parentId: string | null; depth: number };
 
 const flatRows = computed(() =>
@@ -64,6 +64,8 @@ const rows = computed<DisplayRow[]>(() => {
     type: "node",
     node: row.node,
     depth: row.depth,
+    posInSet: row.posInSet,
+    setSize: row.setSize,
   }));
   const create = props.inlineCreate;
   if (!create) return nodeRows;
@@ -118,6 +120,82 @@ function handleBlankClick() {
 }
 function handleF2(node: Node) {
   emit("start-rename", node.id);
+}
+
+// Roving tabindex: exactly one row is a tab stop at a time - the focused row,
+// or (nothing focused yet) the first row, so Tab always lands somewhere useful.
+function isTabStop(id: string): boolean {
+  if (props.focusedNodeId !== null) return props.focusedNodeId === id;
+  return flatRows.value[0]?.node.id === id;
+}
+function focusAndEmit(id: string) {
+  emit("focus-node", id);
+  rowEls.get(id)?.focus();
+}
+// ArrowUp/Down/Home/End/Left/Right, Delete/Cmd+Backspace and Shift+F10/
+// ContextMenu on the tree, per the WAI-ARIA tree pattern. Ignored while the
+// event didn't originate on a row button (e.g. the rename/create input, which
+// needs its own arrow-key/Home/End text-editing behaviour untouched).
+function handleTreeKeydown(event: KeyboardEvent) {
+  if (!(event.target as HTMLElement).classList.contains("tree-node")) return;
+  const flat = flatRows.value;
+  const index = flat.findIndex((row) => row.node.id === props.focusedNodeId);
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    const next = flat[index + 1] ?? flat[0];
+    if (next) focusAndEmit(next.node.id);
+  } else if (event.key === "ArrowUp") {
+    event.preventDefault();
+    const prev = index > 0 ? flat[index - 1] : undefined;
+    if (prev) focusAndEmit(prev.node.id);
+  } else if (event.key === "Home") {
+    event.preventDefault();
+    if (flat[0]) focusAndEmit(flat[0].node.id);
+  } else if (event.key === "End") {
+    event.preventDefault();
+    const last = flat[flat.length - 1];
+    if (last) focusAndEmit(last.node.id);
+  } else if (event.key === "ArrowRight") {
+    event.preventDefault();
+    const row = flat[index];
+    if (!row) return;
+    if (row.node.kind === "folder") {
+      if (!props.expandedFolders.has(row.node.id)) {
+        emit("toggle-folder", row.node.id);
+      } else if (flat[index + 1]?.node.parentId === row.node.id) {
+        focusAndEmit(flat[index + 1]!.node.id);
+      }
+    }
+  } else if (event.key === "ArrowLeft") {
+    event.preventDefault();
+    const row = flat[index];
+    if (!row) return;
+    if (row.node.kind === "folder" && props.expandedFolders.has(row.node.id)) {
+      emit("toggle-folder", row.node.id);
+    } else if (row.node.parentId !== null) {
+      focusAndEmit(row.node.parentId);
+    }
+  } else if (event.key === "Delete" || (event.key === "Backspace" && event.metaKey)) {
+    if (props.focusedNodeId) {
+      event.preventDefault();
+      emit("open-delete-dialog", props.focusedNodeId);
+    }
+  } else if (event.key === "F10" && event.shiftKey) {
+    event.preventDefault();
+    openContextMenuAtFocusedRow();
+  } else if (event.key === "ContextMenu") {
+    event.preventDefault();
+    openContextMenuAtFocusedRow();
+  }
+}
+function openContextMenuAtFocusedRow() {
+  const id = props.focusedNodeId;
+  const rect = (id ? rowEls.get(id) : undefined)?.getBoundingClientRect();
+  emit("context-menu", {
+    x: rect ? rect.left + rect.width / 2 : 0,
+    y: rect ? rect.bottom : 0,
+    nodeId: id,
+  });
 }
 
 // Native HTML5 drag and drop (requires dragDropEnabled: false in
@@ -432,6 +510,7 @@ const deleteMessage = computed(() => {
       :aria-label="t('explorer.title')"
       @contextmenu.prevent="handleContextMenu($event, null)"
       @dragleave="handleTreeDragLeave"
+      @keydown="handleTreeKeydown"
     >
     <p v-if="!rows.length && !inlineCreate" class="explorer-empty">
       {{ t("explorer.empty") }}
@@ -503,6 +582,13 @@ const deleteMessage = computed(() => {
             row.node.kind !== 'folder' && operationBusy && row.node.id !== openNodeId
           "
           :title="rowTitle(row.node.id)"
+          role="treeitem"
+          :aria-level="row.depth + 1"
+          :aria-setsize="row.setSize"
+          :aria-posinset="row.posInSet"
+          :aria-selected="row.node.id === focusedNodeId"
+          :aria-expanded="row.node.kind === 'folder' ? expandedFolders.has(row.node.id) : undefined"
+          :tabindex="isTabStop(row.node.id) ? 0 : -1"
           @click="handleClick(row.node)"
           @keydown.f2.prevent="handleF2(row.node)"
         >
