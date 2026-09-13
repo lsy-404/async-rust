@@ -38,6 +38,10 @@ const NOTES_OVERLAP_CHARS: usize = 200;
 // before one request is sent for everything that accumulated - never one
 // request per sentence.
 const TRANSLATION_DEBOUNCE_MS: u64 = 1200;
+// Backoff after a translation batch error: the normal debounce for the first
+// retry, doubling per additional consecutive failure, capped so a persistent
+// outage never waits longer than this between attempts.
+const TRANSLATION_MAX_BACKOFF_MS: u64 = 30_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -231,6 +235,12 @@ struct NotesTracker {
     // the session); picked up as one more round once that clears, so jobs
     // never stack for the same session.
     pending: bool,
+    // Set synchronously by stop_recording under the same lock
+    // on_transcript_appended checks before starting a round, so a transcript
+    // append racing the stop sweep can never start (or spend tokens on) a job
+    // for a session that has already stopped. Cleared by the next
+    // start_recording for this session.
+    stopped: bool,
 }
 // Keyed by `translation_key(session_id, target_language)`: one batch queue per
 // session+language pair, so switching languages mid-recording starts a fresh
@@ -243,6 +253,11 @@ struct TranslationTracker {
     // loop finds the pending queue empty; guards against spawning a second
     // debounce timer while one is already outstanding or running.
     scheduled: bool,
+    // Consecutive request failures for this session+language, reset to 0 on
+    // the next success; drives the backoff delay between retries so a
+    // persistent provider failure can't turn the debounce loop into a tight
+    // hammering loop.
+    consecutive_failures: u32,
 }
 
 impl AppState {
@@ -958,7 +973,13 @@ fn notes_generation_token(state: &AppState, session_id: &str) -> Result<Cancella
 }
 fn stop_notes_for_session(state: &AppState, session_id: &str) {
     if let Ok(mut jobs) = state.notes.lock() {
-        jobs.remove(session_id);
+        // Marked under this same lock so a transcript append racing this
+        // sweep either loses the race entirely (sees `stopped` and refuses to
+        // start) or already started strictly before this sweep ran.
+        let entry = jobs.entry(session_id.to_string()).or_default();
+        entry.running = false;
+        entry.pending = false;
+        entry.stopped = true;
     }
     if let Ok(mut tokens) = state.notes_cancellations.lock() {
         if let Some(token) = tokens.remove(session_id) {
@@ -1234,6 +1255,13 @@ async fn on_transcript_appended(
                 return;
             };
             let entry = jobs.entry(session_id.to_string()).or_default();
+            // Closes the stop_recording race: whichever of the two writers
+            // reaches this lock first wins, and a stopped session can never
+            // flip back to running without a fresh start_recording clearing
+            // this flag first.
+            if entry.stopped {
+                return;
+            }
             if entry.running {
                 entry.pending = true;
                 return;
@@ -1288,13 +1316,19 @@ async fn on_transcript_appended(
                 return;
             };
             match jobs.get_mut(session_id) {
-                // Removed means recording stopped, notes were disabled, the
-                // session was deleted, or an explicit summarize preempted
-                // this job while it ran; never start another round for it.
+                // Never happens in practice (stop marks `stopped` rather than
+                // removing the entry) but handled defensively.
                 None => false,
                 Some(entry) => {
                     entry.running = false;
-                    std::mem::take(&mut entry.pending)
+                    // Stopped while this round was in flight: never start
+                    // another for it, regardless of pending.
+                    if entry.stopped {
+                        entry.pending = false;
+                        false
+                    } else {
+                        std::mem::take(&mut entry.pending)
+                    }
                 }
             }
         };
@@ -1484,18 +1518,59 @@ async fn run_translation_batch(
         };
         let result = translate_batch_impl(state, session_id, target_language, &batch).await;
         match result {
-            Ok(translations) => on_event(TranslationBatchResult {
-                sentences: batch,
-                translations,
-                error: None,
-            }),
-            Err(error) => on_event(TranslationBatchResult {
-                sentences: batch,
-                translations: HashMap::new(),
-                error: Some(error),
-            }),
+            // Only success loops back immediately to drain whatever queued
+            // while the request was in flight.
+            Ok(translations) => {
+                if let Ok(mut jobs) = state.translations.lock() {
+                    if let Some(entry) = jobs.get_mut(&key) {
+                        entry.consecutive_failures = 0;
+                    }
+                }
+                on_event(TranslationBatchResult {
+                    sentences: batch,
+                    translations,
+                    error: None,
+                });
+            }
+            // On error the batch stays queued (retried, never dropped) and
+            // the loop waits out a debounce/backoff delay before its next
+            // attempt, instead of hammering the provider as fast as new
+            // sentences keep arriving.
+            Err(error) => {
+                let delay = {
+                    let Ok(mut jobs) = state.translations.lock() else {
+                        return;
+                    };
+                    let entry = jobs.entry(key.clone()).or_default();
+                    for text in batch.iter().rev() {
+                        if !entry.pending.iter().any(|existing| existing == text) {
+                            entry.pending.insert(0, text.clone());
+                        }
+                    }
+                    entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+                    entry.scheduled = true;
+                    translation_backoff_delay(entry.consecutive_failures)
+                };
+                on_event(TranslationBatchResult {
+                    sentences: batch,
+                    translations: HashMap::new(),
+                    error: Some(error),
+                });
+                tokio::time::sleep(delay).await;
+            }
         }
     }
+}
+/// Delay before the next retry after a translation batch error: the normal
+/// debounce for the first failure, doubling per additional consecutive
+/// failure, capped at TRANSLATION_MAX_BACKOFF_MS so a persistent outage never
+/// waits longer than that between attempts.
+fn translation_backoff_delay(consecutive_failures: u32) -> Duration {
+    let factor = 1u64 << consecutive_failures.saturating_sub(1).min(6);
+    let millis = TRANSLATION_DEBOUNCE_MS
+        .saturating_mul(factor)
+        .min(TRANSLATION_MAX_BACKOFF_MS);
+    Duration::from_millis(millis)
 }
 /// Turns one batch result into a "translation-status" event the frontend
 /// listens for, matching the sentences it asked about so it can clear their
@@ -1731,6 +1806,12 @@ async fn start_recording(
         .map_err(|e| e.to_string())?;
     if !exists {
         return Err("找不到会话。".into());
+    }
+    // Clears any `stopped` mark (and stale cursor/pending) a previous
+    // recording on this session left behind, so the background notes job can
+    // run for this fresh recording.
+    if let Ok(mut jobs) = state.notes.lock() {
+        jobs.remove(&session_id);
     }
     let database = state.db_path.clone();
     let active_session = session_id.clone();

@@ -558,16 +558,87 @@ fn stop_notes_for_session_cancels_the_token_and_clears_tracking() {
             cursor: 42,
             running: true,
             pending: true,
+            stopped: false,
         },
     );
 
     stop_notes_for_session(&state, "s");
 
     assert!(token.is_cancelled());
-    assert!(state.notes.lock().unwrap().get("s").is_none());
+    {
+        let jobs = state.notes.lock().unwrap();
+        let entry = jobs.get("s").expect("stop marks the tracker, not removes it");
+        assert!(entry.stopped);
+        assert!(!entry.running);
+        assert!(!entry.pending);
+    }
     assert!(state.notes_cancellations.lock().unwrap().get("s").is_none());
-    // Not sticky: a fresh job can be reserved again right away.
+    // The cancellation slot itself is not sticky: a fresh job can be reserved
+    // again right away (a new recording clears `stopped` separately).
     assert!(notes_generation_token(&state, "s").is_ok());
+}
+
+// Reproduces the race: stop_recording's cleanup sweep (stop_notes_for_session)
+// can complete before one last transcript segment - already in flight from
+// the recording worker - reaches on_transcript_appended. That append must
+// never start (or spend tokens on) a background notes round for a session
+// that has already stopped.
+#[tokio::test]
+async fn transcript_append_after_stop_sweep_never_starts_a_notes_job() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::open(dir.path().join("state.sqlite3")).unwrap();
+    seed_notes_fixture(&state, &server.uri());
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(sse_answer("Notes."), "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+
+    // stop_recording's cleanup sweep already ran...
+    stop_notes_for_session(&state, "s");
+    // ...and only afterward does the last transcript segment land.
+    append_transcription(&state, "s", &"z".repeat(NOTES_THRESHOLD_CHARS + 50)).unwrap();
+    on_transcript_appended(&state, "s", &|_| {}).await;
+
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "a transcript append racing the stop sweep must never spend tokens on a notes round for a stopped session"
+    );
+    let (session, _, _) = session_context(&state, "s").unwrap();
+    assert!(session.summary.is_none());
+}
+
+// The other half of the same fix: a `stopped` mark must not be permanent -
+// the next start_recording (exercised here as it does, by clearing the
+// tracker entry) lets the notes job resume normally.
+#[tokio::test]
+async fn a_fresh_start_recording_clears_the_stopped_mark_so_notes_resume() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::open(dir.path().join("state.sqlite3")).unwrap();
+    seed_notes_fixture(&state, &server.uri());
+
+    stop_notes_for_session(&state, "s");
+    state.notes.lock().unwrap().remove("s");
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(sse_answer("Notes."), "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    append_transcription(&state, "s", &"z".repeat(NOTES_THRESHOLD_CHARS + 50)).unwrap();
+    on_transcript_appended(&state, "s", &|_| {}).await;
+
+    let (session, _, _) = session_context(&state, "s").unwrap();
+    assert_eq!(session.summary.as_deref(), Some("Notes."));
 }
 
 #[test]
@@ -884,6 +955,7 @@ fn stop_translation_for_session_cancels_only_that_sessions_keys() {
         TranslationTracker {
             pending: vec!["x".into()],
             scheduled: true,
+            consecutive_failures: 0,
         },
     );
 
@@ -957,4 +1029,84 @@ fn set_translation_settings_persists_fields_and_stops_a_running_job_when_disable
     let err =
         set_translation_settings_impl(&state, "missing", true, None, "side-by-side").unwrap_err();
     assert_eq!(err, "找不到会话。");
+}
+
+// Reproduces the tight-loop hazard: a sentence arrives while a batch request
+// is in flight, that request errors, and (before this fix) the loop retried
+// the next batch immediately with no delay - a persistent provider failure
+// would hammer it as fast as new sentences kept arriving. The retry must
+// instead wait out the backoff. (The credential-health cooldown a request
+// failure also triggers, in connections.rs, is a separate, coarser mechanism
+// - the on_event hook below clears it after each error so this test isolates
+// the translation-specific backoff being added here.)
+#[tokio::test]
+async fn translation_error_backs_off_instead_of_retrying_immediately() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState::open(dir.path().join("state.sqlite3")).unwrap());
+    seed_notes_fixture(&state, &server.uri());
+
+    let request_times: Arc<std::sync::Mutex<Vec<std::time::Instant>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = request_times.clone();
+    let injected = state.clone();
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let call = {
+                let mut times = seen.lock().unwrap();
+                times.push(std::time::Instant::now());
+                times.len()
+            };
+            if call == 1 {
+                // A new sentence (the next VAD segment) arrives while the
+                // first request is in flight - the queue must not be dropped
+                // on error, and must not be retried faster than the backoff.
+                injected
+                    .translations
+                    .lock()
+                    .unwrap()
+                    .entry(translation_key("s", "zh"))
+                    .or_default()
+                    .pending
+                    .push("Later sentence.".to_string());
+                ResponseTemplate::new(500)
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_raw(sse_answer("1: 你好。"), "text/event-stream")
+            }
+        })
+        .mount(&server)
+        .await;
+
+    enqueue_translations(&state, "s", "zh", &["Hello.".to_string()]).unwrap();
+    run_translation_batch(&state, "s", "zh", &|result| {
+        if result.error.is_some() {
+            state
+                .db()
+                .unwrap()
+                .execute(
+                    "UPDATE credentials SET healthy=1,cooldown_until=NULL WHERE provider_id='custom'",
+                    [],
+                )
+                .unwrap();
+        }
+    })
+    .await;
+
+    let times = request_times.lock().unwrap();
+    assert_eq!(
+        times.len(),
+        2,
+        "expected the errored sentence's retry plus the newly arrived one, batched together"
+    );
+    let gap = times[1].duration_since(times[0]);
+    assert!(
+        gap >= Duration::from_millis(900),
+        "retry fired after only {gap:?} - it must wait out the backoff instead of hammering the provider"
+    );
+    assert!(
+        gap < Duration::from_secs(10),
+        "retry took {gap:?} - far longer than the expected ~1.2s backoff, something else is gating it"
+    );
 }
