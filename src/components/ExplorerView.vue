@@ -47,6 +47,7 @@ const emit = defineEmits<{
   "drag-end": [];
   drop: [payload: { id: string; parentId: string | null }];
   "auto-expand-folder": [id: string];
+  "collapse-all": [];
 }>();
 
 type DisplayRow =
@@ -355,13 +356,78 @@ const deleteMessage = computed(() => {
 </script>
 
 <template>
-  <aside
-    class="explorer"
-    role="tree"
-    :aria-label="t('explorer.title')"
-    @contextmenu.prevent="handleContextMenu($event, null)"
-    @dragleave="handleTreeDragLeave"
-  >
+  <div class="explorer-panel">
+    <div class="explorer-title-row">
+      <span class="explorer-title">{{ t("explorer.title") }}</span>
+      <div class="explorer-title-actions">
+        <button
+          type="button"
+          class="explorer-title-btn"
+          :disabled="operationBusy"
+          :title="operationBusy ? t('quickTranscription.busyTitle') : t('explorer.newSession')"
+          :aria-label="t('explorer.newSession')"
+          @click="emit('start-create', 'session')"
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path
+              d="M2 3.5h7l1.5 1.5H14v7.5H2Z"
+              stroke="currentColor"
+              stroke-width="1.2"
+              stroke-linejoin="round"
+            />
+            <path d="M8 6.5v3.5M6.25 8.25h3.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          class="explorer-title-btn"
+          :disabled="operationBusy"
+          :title="operationBusy ? t('quickTranscription.busyTitle') : t('explorer.newFolder')"
+          :aria-label="t('explorer.newFolder')"
+          @click="emit('start-create', 'folder')"
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path
+              d="M2 4.5A1 1 0 0 1 3 3.5h3.2l1 1.2H13a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1Z"
+              stroke="currentColor"
+              stroke-width="1.2"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </button>
+        <button
+          type="button"
+          class="explorer-title-btn"
+          :disabled="operationBusy"
+          :title="operationBusy ? t('quickTranscription.busyTitle') : t('explorer.importMaterial')"
+          :aria-label="t('explorer.importMaterial')"
+          @click="emit('start-import')"
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M8 2v7M5.2 6.2 8 9l2.8-2.8" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
+            <path d="M2.5 11v1.5a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1V11" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          class="explorer-title-btn"
+          :title="t('explorer.collapseAll')"
+          :aria-label="t('explorer.collapseAll')"
+          @click="emit('collapse-all')"
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M4 6.5 8 3l4 3.5M4 12.5 8 9l4 3.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </button>
+      </div>
+    </div>
+    <aside
+      class="explorer"
+      role="tree"
+      :aria-label="t('explorer.title')"
+      @contextmenu.prevent="handleContextMenu($event, null)"
+      @dragleave="handleTreeDragLeave"
+    >
     <p v-if="!rows.length && !inlineCreate" class="explorer-empty">
       {{ t("explorer.empty") }}
     </p>
@@ -495,6 +561,7 @@ const deleteMessage = computed(() => {
       </template>
     </div>
   </aside>
+  </div>
   <FluentDialog v-if="deleteTarget" :open="true" :label="t('explorer.delete.dialogTitle')">
     <template #title>
       <h2>{{ t("explorer.delete.dialogTitle") }}</h2>
@@ -514,11 +581,52 @@ const deleteMessage = computed(() => {
 </template>
 
 <style scoped>
+.explorer-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+.explorer-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex: 0 0 auto;
+  padding: 6px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fluent-text-secondary, #666);
+}
+.explorer-title-actions {
+  display: flex;
+  gap: 2px;
+}
+.explorer-title-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.explorer-title-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--fluent-accent) 12%, transparent);
+}
+.explorer-title-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
 .explorer {
   display: flex;
   flex-direction: column;
   overflow-y: auto;
-  height: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
   position: relative;
 }
 .explorer-empty {

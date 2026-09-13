@@ -303,6 +303,13 @@ describe("explorer node actions", () => {
     if (!match) throw new Error(`Missing ${selector}: ${name}`);
     return match;
   }
+  function titleButton(wrapper: VueWrapper, ariaLabel: string) {
+    const match = wrapper
+      .findAll(".explorer-title-btn")
+      .find((item) => item.attributes("aria-label") === ariaLabel);
+    if (!match) throw new Error(`Missing title-row button: ${ariaLabel}`);
+    return match;
+  }
 
   let data: AppData;
   beforeEach(() => {
@@ -441,6 +448,87 @@ describe("explorer node actions", () => {
     await wrapper.get(".inline-input").trigger("keydown", { key: "Enter" });
     await flushPromises();
     expect(invoke).toHaveBeenCalledWith("create_folder", { parentId: null, name: "New folder" });
+  });
+
+  it("shows a title row with Explorer's label and New Session/New Folder/Import/Collapse All buttons", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    expect(wrapper.find(".explorer-title").text()).toBe("资源管理器");
+    expect(titleButton(wrapper, "新建会话").exists()).toBe(true);
+    expect(titleButton(wrapper, "新建文件夹").exists()).toBe(true);
+    expect(titleButton(wrapper, "导入材料…").exists()).toBe(true);
+    expect(titleButton(wrapper, "全部折叠").exists()).toBe(true);
+  });
+
+  it("starts an inline create from the title row's New Session/New Folder buttons", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await titleButton(wrapper, "新建会话").trigger("click");
+    await wrapper.get(".inline-input").setValue("From title row");
+    await wrapper.get(".inline-input").trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("create_session", {
+      parentId: null,
+      name: "From title row",
+    });
+
+    await titleButton(wrapper, "新建文件夹").trigger("click");
+    await wrapper.get(".inline-input").setValue("Folder from title row");
+    await wrapper.get(".inline-input").trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("create_folder", {
+      parentId: null,
+      name: "Folder from title row",
+    });
+  });
+
+  it("imports a material from the title row's Import button", async () => {
+    vi.mocked(open).mockResolvedValueOnce("/tmp/picked.md");
+    const wrapper = mountApp();
+    await flushPromises();
+    await titleButton(wrapper, "导入材料…").trigger("click");
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("import_material", {
+      parentId: null,
+      path: "/tmp/picked.md",
+    });
+  });
+
+  it("disables New Session/New Folder/Import (with a title) while busy, but keeps Collapse All enabled", async () => {
+    const wrapper = mountApp();
+    await flushPromises();
+    await treeRow(wrapper, ".tree-session", "Session One").trigger("click");
+    await flushPromises();
+    await buttonWithText(wrapper, "开始录音").trigger("click");
+    await flushPromises();
+    expect((titleButton(wrapper, "新建会话").element as HTMLButtonElement).disabled).toBe(true);
+    expect(titleButton(wrapper, "新建会话").attributes("title")).toBe(
+      "请先停止录音或等待当前任务完成",
+    );
+    expect((titleButton(wrapper, "新建文件夹").element as HTMLButtonElement).disabled).toBe(true);
+    expect((titleButton(wrapper, "导入材料…").element as HTMLButtonElement).disabled).toBe(true);
+    expect((titleButton(wrapper, "全部折叠").element as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("collapses every expanded folder from the title row, hiding their rows", async () => {
+    // Fake timers so the 500ms explorerExpanded persistence debounce this
+    // triggers never fires for real and leaks a stray save_settings call
+    // (against this test's own now-out-of-scope `data`) into a later test.
+    vi.useFakeTimers();
+    try {
+      const wrapper = mountApp();
+      await flushPromises();
+      expect(treeRow(wrapper, ".tree-session", "Session Two").exists()).toBe(true);
+      await titleButton(wrapper, "全部折叠").trigger("click");
+      expect(wrapper.findAll(".tree-session").find((item) => item.text() === "Session Two")).toBe(
+        undefined,
+      );
+      expect(wrapper.findAll(".tree-folder").find((item) => item.text() === "Nested")).toBe(
+        undefined,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("Escape cancels inline create; a blank blur invokes nothing", async () => {

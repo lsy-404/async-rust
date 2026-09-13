@@ -35,6 +35,7 @@ export default {
     newSession: "新建会话",
     newFolder: "新建文件夹",
     importMaterial: "导入材料…",
+    collapseAll: "全部折叠",
     open: "打开",
     rename: "重命名",
     deleteAction: "删除",

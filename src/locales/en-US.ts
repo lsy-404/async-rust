@@ -35,6 +35,7 @@ export default {
     newSession: "New Session",
     newFolder: "New Folder",
     importMaterial: "Import Material…",
+    collapseAll: "Collapse All",
     open: "Open",
     rename: "Rename",
     deleteAction: "Delete",

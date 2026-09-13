@@ -473,6 +473,10 @@ function toggleFolder(id: string) {
   else expandedFolders.value.add(id);
   schedulePersistExpandedFolders();
 }
+function collapseAll() {
+  expandedFolders.value.clear();
+  schedulePersistExpandedFolders();
+}
 function focusNode(id: string | null) {
   focusedNodeId.value = id;
 }
@@ -1502,6 +1506,7 @@ onUnmounted(() => {
           @drag-end="handleDragEnd"
           @drop="handleNodeDrop"
           @auto-expand-folder="autoExpandFolder"
+          @collapse-all="collapseAll"
         />
         <SearchView
           v-if="sidebarOpen && activeView === 'search'"
