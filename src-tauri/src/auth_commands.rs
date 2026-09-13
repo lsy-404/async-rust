@@ -1,6 +1,7 @@
 use crate::{
     connections::{self, Credential, Failure},
-    generation_token, load_data, oauth, provider, AppState, Provider, StreamEvent, ToolCall,
+    generation_token, load_data, oauth, provider, text_match, AppState, Provider, StreamEvent,
+    ToolCall,
 };
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -8,7 +9,7 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -589,7 +590,7 @@ pub async fn stream(
     provider_id: &str,
     model: &str,
     messages: Vec<Value>,
-    tool_workspace_id: Option<&str>,
+    tool_session_id: Option<&str>,
     cancel: CancellationToken,
     channel: Channel<StreamEvent>,
 ) -> Result<(String, Vec<ToolCall>), String> {
@@ -600,7 +601,7 @@ pub async fn stream(
         model,
         messages,
         StreamOptions {
-            tool_workspace_id,
+            tool_session_id,
             cancel,
         },
         |text| {
@@ -622,7 +623,7 @@ pub async fn stream(
     Ok((answer, tool_calls.into_inner().unwrap()))
 }
 struct StreamOptions<'a> {
-    tool_workspace_id: Option<&'a str>,
+    tool_session_id: Option<&'a str>,
     cancel: CancellationToken,
 }
 async fn stream_with(
@@ -635,7 +636,7 @@ async fn stream_with(
     on_tool: impl Fn(StreamEvent) -> Result<(), String> + Send + Sync,
 ) -> Result<String, String> {
     let StreamOptions {
-        tool_workspace_id,
+        tool_session_id,
         cancel,
     } = options;
     let p = provider(state, provider_id)?;
@@ -683,15 +684,7 @@ async fn stream_with(
                     model,
                     cancel: cancel.clone(),
                 };
-                api_stream(
-                    state,
-                    &req,
-                    tool_workspace_id,
-                    &messages,
-                    delta,
-                    &tool_guard,
-                )
-                .await
+                api_stream(state, &req, tool_session_id, &messages, delta, &tool_guard).await
             }
         }
         .await;
@@ -721,7 +714,7 @@ async fn stream_with(
 async fn api_stream(
     state: &AppState,
     req: &ApiRequest<'_>,
-    tool_workspace_id: Option<&str>,
+    tool_session_id: Option<&str>,
     messages: &[Value],
     on_delta: impl Fn(String) -> Result<(), String> + Send + Sync,
     on_tool: impl Fn(StreamEvent) -> Result<(), String> + Send + Sync,
@@ -741,7 +734,7 @@ async fn api_stream(
     // discarded on failover can never collide with a retried attempt's ids.
     let attempt_token = Uuid::new_v4().simple().to_string();
     loop {
-        let allow_tools = tool_workspace_id.is_some() && attempt < MAX_TOOL_ROUNDS;
+        let allow_tools = tool_session_id.is_some() && attempt < MAX_TOOL_ROUNDS;
         let tools = allow_tools.then(retrieval_tool_schema);
         let round_id = format!("{attempt_token}_{attempt}");
         let mut round_sent_tools = tools.is_some();
@@ -779,7 +772,7 @@ async fn api_stream(
                     // The request that produced this outcome carried no tools array, so there is nothing to execute.
                     return Ok(answer);
                 }
-                let workspace_id = tool_workspace_id.expect("allow_tools implies Some");
+                let session_id = tool_session_id.expect("allow_tools implies Some");
                 working.push(json!({
                     "role": "assistant",
                     "content": if text.is_empty() { Value::Null } else { json!(text) },
@@ -792,7 +785,7 @@ async fn api_stream(
                 for call in &calls {
                     on_tool(tool_event(call, "requested", None))?;
                     on_tool(tool_event(call, "running", None))?;
-                    match run_tool(state, workspace_id, call) {
+                    match run_tool(state, session_id, call) {
                         Ok(result) => {
                             on_tool(tool_event(call, "finished", Some(&result)))?;
                             working.push(json!({
@@ -847,11 +840,7 @@ fn retrieval_tool_schema() -> Value {
         },
     }])
 }
-fn run_tool(
-    state: &AppState,
-    workspace_id: &str,
-    call: &PendingToolCall,
-) -> Result<String, String> {
+fn run_tool(state: &AppState, session_id: &str, call: &PendingToolCall) -> Result<String, String> {
     if call.name != RETRIEVAL_TOOL_NAME {
         return Err(format!("未知工具：{}。", call.name));
     }
@@ -865,70 +854,116 @@ fn run_tool(
     if query.is_empty() {
         return Err("查询内容不能为空。".into());
     }
-    search_local(state, workspace_id, query)
+    search_local(state, session_id, query)
 }
-fn escape_like(input: &str) -> String {
-    input
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-fn excerpt(content: &str, query: &str) -> String {
-    const RADIUS: usize = 200;
-    let at = content
-        .to_lowercase()
-        .find(&query.to_lowercase())
-        .unwrap_or(0);
-    let from = (0..=at.saturating_sub(RADIUS))
-        .rev()
-        .find(|i| content.is_char_boundary(*i))
-        .unwrap_or(0);
-    let to = ((at + query.len() + RADIUS).min(content.len())..=content.len())
-        .find(|i| content.is_char_boundary(*i))
-        .unwrap_or(content.len());
-    let mut piece = content[from..to].trim().to_string();
-    if from > 0 {
-        piece.insert(0, '…');
-    }
-    if to < content.len() {
-        piece.push('…');
-    }
-    piece
-}
-fn search_local(state: &AppState, workspace_id: &str, query: &str) -> Result<String, String> {
+const RETRIEVAL_EXCERPT_RADIUS: usize = 200;
+/// Scope: the subtree of `session_id`'s top-level folder (that folder plus
+/// every descendant), or the whole library when `session_id` is itself a root
+/// session. Every node id is loaded once for building the `" / "` path shown
+/// with each hit, so same-named items in different folders stay distinguishable.
+fn search_local(state: &AppState, session_id: &str, query: &str) -> Result<String, String> {
     let db = state.db()?;
-    let pattern = format!("%{}%", escape_like(query));
-    let mut results = Vec::new();
-    let mut materials_stmt = db
-        .prepare("SELECT name,content FROM materials WHERE workspace_id=?1 AND (name LIKE ?2 ESCAPE '\\' OR content LIKE ?2 ESCAPE '\\') ORDER BY rowid LIMIT ?3")
+    let pattern = format!("%{}%", text_match::escape_like(query));
+    let is_root: bool = db
+        .query_row(
+            "SELECT parent_id IS NULL FROM nodes WHERE id=?1",
+            [session_id],
+            |r| r.get(0),
+        )
         .map_err(|e| e.to_string())?;
+    let scope_cte = "WITH RECURSIVE up(id, parent_id) AS (
+          SELECT id, parent_id FROM nodes WHERE id = ?1
+          UNION ALL
+          SELECT n.id, n.parent_id FROM nodes n JOIN up ON n.id = up.parent_id
+        ), scope(id) AS (
+          SELECT id FROM up WHERE parent_id IS NULL
+          UNION ALL
+          SELECT n.id FROM nodes n JOIN scope s ON n.parent_id = s.id
+        ) ";
+    let materials_sql = if is_root {
+        "SELECT n.id, m.content FROM nodes n JOIN materials m ON m.id=n.id
+           WHERE n.kind='material' AND (n.name LIKE ?2 ESCAPE '\\' OR m.content LIKE ?2 ESCAPE '\\')
+           ORDER BY n.rowid LIMIT ?3"
+            .to_string()
+    } else {
+        format!(
+            "{scope_cte} SELECT n.id, m.content FROM nodes n JOIN materials m ON m.id=n.id
+               WHERE n.kind='material' AND n.id IN scope AND (n.name LIKE ?2 ESCAPE '\\' OR m.content LIKE ?2 ESCAPE '\\')
+               ORDER BY n.rowid LIMIT ?3"
+        )
+    };
+    let sessions_sql = if is_root {
+        "SELECT n.id, s.transcription FROM nodes n JOIN sessions s ON s.id=n.id
+           WHERE n.kind='session' AND s.transcription LIKE ?2 ESCAPE '\\'
+           ORDER BY n.rowid LIMIT ?3"
+            .to_string()
+    } else {
+        format!(
+            "{scope_cte} SELECT n.id, s.transcription FROM nodes n JOIN sessions s ON s.id=n.id
+               WHERE n.kind='session' AND n.id IN scope AND s.transcription LIKE ?2 ESCAPE '\\'
+               ORDER BY n.rowid LIMIT ?3"
+        )
+    };
+    let mut edges: HashMap<String, (Option<String>, String)> = HashMap::new();
+    {
+        let mut stmt = db
+            .prepare("SELECT id,parent_id,name FROM nodes")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let (id, parent_id, name) = row.map_err(|e| e.to_string())?;
+            edges.insert(id, (parent_id, name));
+        }
+    }
+    let path_label = |id: &str| -> String {
+        let mut parts = Vec::new();
+        let mut current = Some(id.to_string());
+        while let Some(cur) = current {
+            let Some((parent, name)) = edges.get(&cur) else {
+                break;
+            };
+            parts.push(name.clone());
+            current = parent.clone();
+        }
+        parts.reverse();
+        parts.join(" / ")
+    };
+    let mut results = Vec::new();
+    let mut materials_stmt = db.prepare(&materials_sql).map_err(|e| e.to_string())?;
     let materials = materials_stmt
         .query_map(
-            params![workspace_id, pattern, RETRIEVAL_RESULT_LIMIT],
+            params![session_id, pattern, RETRIEVAL_RESULT_LIMIT],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
-    for (name, content) in materials {
-        results.push(format!("[Material] {name}: {}", excerpt(&content, query)));
+    for (id, content) in materials {
+        if let Some(excerpt) = text_match::excerpt(&content, query, RETRIEVAL_EXCERPT_RADIUS) {
+            results.push(format!("[Material] {}: {excerpt}", path_label(&id)));
+        }
     }
-    let mut sessions_stmt = db
-        .prepare("SELECT title,transcription FROM sessions WHERE workspace_id=?1 AND transcription LIKE ?2 ESCAPE '\\' ORDER BY rowid LIMIT ?3")
-        .map_err(|e| e.to_string())?;
+    let mut sessions_stmt = db.prepare(&sessions_sql).map_err(|e| e.to_string())?;
     let sessions = sessions_stmt
         .query_map(
-            params![workspace_id, pattern, RETRIEVAL_RESULT_LIMIT],
+            params![session_id, pattern, RETRIEVAL_RESULT_LIMIT],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
-    for (title, transcript) in sessions {
-        results.push(format!(
-            "[Session transcript] {title}: {}",
-            excerpt(&transcript, query)
-        ));
+    for (id, transcript) in sessions {
+        if let Some(excerpt) = text_match::excerpt(&transcript, query, RETRIEVAL_EXCERPT_RADIUS) {
+            results.push(format!("[Session] {}: {excerpt}", path_label(&id)));
+        }
     }
     if results.is_empty() {
         return Ok(format!(

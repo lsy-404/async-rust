@@ -165,6 +165,21 @@ impl Drop for ActiveRecording {
         }
     }
 }
+#[cfg(test)]
+impl ActiveRecording {
+    /// No worker thread and no real hardware: only `session_id` is
+    /// meaningful. Used to exercise `delete_node`'s busy guard.
+    fn for_test(session_id: &str) -> Self {
+        let (control, _receiver) = mpsc::channel();
+        Self {
+            session_id: session_id.to_string(),
+            control,
+            canceled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            callback_gate: Arc::new(StdMutex::new(())),
+            worker: None,
+        }
+    }
+}
 
 struct CompletedCapture(Option<PathBuf>);
 impl CompletedCapture {
@@ -286,6 +301,25 @@ impl RecordingManager {
                 .map_err(|e| e.to_string())??;
         }
         Ok(())
+    }
+
+    /// The session currently recording, if any. Used by `delete_node` to
+    /// refuse deleting a subtree that holds it, and by `start_quick_transcription`
+    /// to refuse starting a second recording.
+    pub async fn active_session_id(&self) -> Option<String> {
+        self.active
+            .lock()
+            .await
+            .as_ref()
+            .map(|a| a.session_id.clone())
+    }
+
+    /// Test-only: seeds an active session id with no real audio hardware, so
+    /// `delete_node`'s busy guard can be exercised without a device.
+    #[cfg(test)]
+    pub(crate) async fn seed_active_for_test(&self, session_id: &str) {
+        let mut current = self.active.lock().await;
+        *current = Some(ActiveRecording::for_test(session_id));
     }
 }
 

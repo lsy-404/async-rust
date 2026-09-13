@@ -271,13 +271,13 @@ async fn missing_models_do_not_need_api_credentials_or_leave_busy_session() {
     let temp = tempfile::tempdir().unwrap();
     let state = crate::AppState::open(temp.path().join("state.sqlite3")).unwrap();
     let db = state.db().unwrap();
-    db.execute("INSERT INTO workspaces VALUES('w','Class')", [])
-        .unwrap();
     db.execute(
-        "INSERT INTO sessions(id,workspace_id,title) VALUES('s','w','Lesson')",
+        "INSERT INTO nodes(id,parent_id,parent_kind,kind,name) VALUES('s',NULL,NULL,'session','Lesson')",
         [],
     )
     .unwrap();
+    db.execute("INSERT INTO sessions(id) VALUES('s')", [])
+        .unwrap();
     for _ in 0..2 {
         let failure = crate::transcribe(
             &state,
@@ -320,15 +320,12 @@ async fn actual_whisper_jfk_recognizes_capture_rates_and_persists_without_key() 
     }
     let db = state.db().unwrap();
     db.execute(
-        "INSERT OR IGNORE INTO workspaces VALUES('fixture','Speech test')",
+        "INSERT OR IGNORE INTO nodes(id,parent_id,parent_kind,kind,name) VALUES('jfk',NULL,NULL,'session','Speech')",
         [],
     )
     .unwrap();
-    db.execute(
-        "INSERT OR REPLACE INTO sessions(id,workspace_id,title) VALUES('jfk','fixture','Speech')",
-        [],
-    )
-    .unwrap();
+    db.execute("INSERT OR IGNORE INTO sessions(id) VALUES('jfk')", [])
+        .unwrap();
     let original = fs::read(&fixture).unwrap();
     let samples = decode_audio("jfk.wav", original.clone(), &CancellationToken::new()).unwrap();
     for rate in [16_000, 44_100, 48_000] {

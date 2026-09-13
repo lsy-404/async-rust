@@ -4,11 +4,14 @@ mod credential_store;
 mod models_catalog;
 mod oauth;
 mod recording;
+mod schema;
 mod stt;
+mod text_match;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
+    future::Future,
     io::Read,
     path::{Path, PathBuf},
     sync::Mutex,
@@ -21,6 +24,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{ipc::Channel, Emitter, Manager};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zip::ZipArchive;
@@ -42,11 +46,40 @@ const TRANSLATION_DEBOUNCE_MS: u64 = 1200;
 // retry, doubling per additional consecutive failure, capped so a persistent
 // outage never waits longer than this between attempts.
 const TRANSLATION_MAX_BACKOFF_MS: u64 = 30_000;
+// search_library caps its result count at this many hits (spec: "measure").
+const SEARCH_RESULT_LIMIT: usize = 100;
+const SEARCH_EXCERPT_RADIUS: usize = 60;
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeKind {
+    Folder,
+    Session,
+    Material,
+}
+impl NodeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            NodeKind::Folder => "folder",
+            NodeKind::Session => "session",
+            NodeKind::Material => "material",
+        }
+    }
+}
+fn parse_node_kind(value: &str) -> Result<NodeKind, String> {
+    match value {
+        "folder" => Ok(NodeKind::Folder),
+        "session" => Ok(NodeKind::Session),
+        "material" => Ok(NodeKind::Material),
+        other => Err(format!("未知节点类型：{other}")),
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Workspace {
+pub struct Node {
     pub id: String,
+    pub parent_id: Option<String>,
+    pub kind: NodeKind,
     pub name: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -77,8 +110,6 @@ pub struct Message {
 #[serde(rename_all = "camelCase")]
 pub struct Session {
     pub id: String,
-    pub workspace_id: String,
-    pub title: String,
     #[serde(default)]
     pub messages: Vec<Message>,
     pub transcription: Option<String>,
@@ -109,8 +140,6 @@ fn default_translation_mode() -> String {
 #[serde(rename_all = "camelCase")]
 pub struct Material {
     pub id: String,
-    pub workspace_id: String,
-    pub name: String,
     pub content: String,
     pub path: Option<String>,
 }
@@ -125,6 +154,9 @@ pub struct Settings {
     pub main_panel_ratio: f64,
     #[serde(default = "default_sidebar_open")]
     pub sidebar_open: bool,
+    // Persisted expanded-folder ids for the explorer tree view.
+    #[serde(default)]
+    pub explorer_expanded: Vec<String>,
 }
 fn default_main_panel_ratio() -> f64 {
     0.62
@@ -141,6 +173,7 @@ impl Default for Settings {
             language: "zh".into(),
             main_panel_ratio: default_main_panel_ratio(),
             sidebar_open: default_sidebar_open(),
+            explorer_expanded: Vec::new(),
         }
     }
 }
@@ -159,11 +192,41 @@ pub struct Provider {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppData {
-    pub workspaces: Vec<Workspace>,
+    pub nodes: Vec<Node>,
     pub sessions: Vec<Session>,
     pub materials: Vec<Material>,
     pub settings: Settings,
     pub providers: Vec<Provider>,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchField {
+    Name,
+    Transcription,
+    Summary,
+    Content,
+    Message,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchPiece {
+    pub before: String,
+    pub matched: String,
+    pub after: String,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    pub node_id: String,
+    pub kind: NodeKind,
+    pub field: SearchField,
+    pub piece: SearchPiece,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResults {
+    pub hits: Vec<SearchHit>,
+    pub truncated: bool,
 }
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -261,33 +324,34 @@ struct TranslationTracker {
 }
 
 impl AppState {
-    pub fn open(db_path: PathBuf) -> Result<Self, String> {
+    pub fn open(db_path: PathBuf) -> Result<Self, schema::InitError> {
+        schema::initialize_database(&db_path)?;
         let stt_root = db_path
             .parent()
-            .ok_or("本地数据路径无效。")?
+            .ok_or_else(|| schema::InitError::from("本地数据路径无效。".to_string()))?
             .join("voice-models");
-        let state = Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(120))
+            .build()
+            .map_err(|e| schema::InitError::from(e.to_string()))?;
+        Ok(Self {
             stt: stt::SttManager::new(stt_root),
             recording: recording::RecordingManager::new(),
             db_path,
-            client: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(15))
-                .timeout(Duration::from_secs(120))
-                .build()
-                .map_err(|e| e.to_string())?,
+            client,
             cancellations: Mutex::new(HashMap::new()),
             notes_cancellations: Mutex::new(HashMap::new()),
             notes: Mutex::new(HashMap::new()),
             translation_cancellations: Mutex::new(HashMap::new()),
             translations: Mutex::new(HashMap::new()),
-        };
-        state.db().map(|_| state)
+        })
     }
     pub fn database_path(&self) -> &Path {
         &self.db_path
     }
     fn db(&self) -> Result<Connection, String> {
-        open_database(&self.db_path)
+        schema::open_connection(&self.db_path)
     }
     fn key(&self, id: &str) -> Result<Entry, String> {
         Entry::new(
@@ -301,81 +365,6 @@ impl AppState {
     }
 }
 
-fn open_database(path: &Path) -> Result<Connection, String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let db = Connection::open(path).map_err(|e| e.to_string())?;
-    db.execute_batch("PRAGMA foreign_keys = ON;
-      CREATE TABLE IF NOT EXISTS workspaces(id TEXT PRIMARY KEY, name TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE, title TEXT NOT NULL, transcription TEXT, summary TEXT, summary_updated_at TEXT);
-      CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, role TEXT NOT NULL, content TEXT NOT NULL, position INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS materials(id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE, name TEXT NOT NULL, content TEXT NOT NULL, path TEXT);
-      CREATE TABLE IF NOT EXISTS providers(id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, models_json TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS settings(singleton INTEGER PRIMARY KEY CHECK(singleton=1), json TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS sentence_translations(source_text TEXT NOT NULL, target_language TEXT NOT NULL, translation TEXT NOT NULL, PRIMARY KEY(source_text, target_language));") .map_err(|e| e.to_string())?;
-    // Additive migrations for columns that postdate a user's existing database;
-    // guarded so they only ever run once and never touch existing rows.
-    ensure_column(&db, "sessions", "summary_updated_at", "TEXT")?;
-    ensure_column(&db, "sessions", "transcription_words", "TEXT")?;
-    ensure_column(
-        &db,
-        "sessions",
-        "notes_enabled",
-        "INTEGER NOT NULL DEFAULT 1",
-    )?;
-    ensure_column(
-        &db,
-        "sessions",
-        "translation_enabled",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
-    ensure_column(&db, "sessions", "translation_target_language", "TEXT")?;
-    ensure_column(
-        &db,
-        "sessions",
-        "translation_mode",
-        "TEXT NOT NULL DEFAULT 'side-by-side'",
-    )?;
-    ensure_column(&db, "messages", "created_at", "TEXT NOT NULL DEFAULT ''")?;
-    ensure_column(&db, "messages", "tool_calls", "TEXT")?;
-    for (id, name, base) in [
-        ("workbuddy", "WorkBuddy", "https://copilot.tencent.com/v2"),
-        ("traecode", "TraeCode", "https://www.trae.ai"),
-    ] {
-        db.execute(
-            "INSERT OR IGNORE INTO providers(id,name,base_url,models_json) VALUES(?,?,?,'[]')",
-            params![id, name, base],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    connections::initialize(&db)?;
-    Ok(db)
-}
-
-fn ensure_column(
-    db: &Connection,
-    table: &str,
-    column: &str,
-    definition: &str,
-) -> Result<(), String> {
-    let exists: i64 = db
-        .query_row(
-            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name=?"),
-            [column],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-    if exists == 0 {
-        db.execute(
-            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
-            [],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
 fn id() -> String {
     Uuid::new_v4().to_string()
 }
@@ -385,59 +374,222 @@ fn limit(value: String) -> String {
     }
     value[..value.floor_char_boundary(CONTEXT_LIMIT)].to_string()
 }
-fn row_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspace> {
-    Ok(Workspace {
-        id: row.get(0)?,
-        name: row.get(1)?,
-    })
+/// Trim, require non-empty, at most 255 chars, no control characters.
+fn normalize_name(input: &str) -> Result<String, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().count() > 255
+        || trimmed.chars().any(|c| c.is_control())
+    {
+        return Err("名称不能为空、不能超过 255 个字符，也不能包含控制字符。".into());
+    }
+    Ok(trimmed.to_string())
 }
 fn row_material(row: &rusqlite::Row<'_>) -> rusqlite::Result<Material> {
     Ok(Material {
         id: row.get(0)?,
-        workspace_id: row.get(1)?,
-        name: row.get(2)?,
-        content: row.get(3)?,
-        path: row.get(4)?,
+        content: row.get(1)?,
+        path: row.get(2)?,
     })
+}
+fn load_messages(db: &Connection, session_id: &str) -> Result<Vec<Message>, String> {
+    db.prepare(
+        "SELECT id,role,content,created_at,tool_calls FROM messages WHERE session_id=?1 ORDER BY position",
+    )
+    .map_err(|e| e.to_string())?
+    .query_map([session_id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, Option<String>>(4)?,
+        ))
+    })
+    .map_err(|e| e.to_string())?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .map(|(id, role, content, created_at, tool_calls)| {
+        let tool_calls = tool_calls
+            .map(|raw| serde_json::from_str(&raw).map_err(|e| e.to_string()))
+            .transpose()?;
+        Ok(Message {
+            id,
+            role,
+            content,
+            created_at,
+            tool_calls,
+        })
+    })
+    .collect()
+}
+#[allow(clippy::too_many_arguments)]
+fn session_row_to_session(
+    db: &Connection,
+    id: String,
+    transcription: Option<String>,
+    summary: Option<String>,
+    summary_updated_at: Option<String>,
+    transcription_words: Option<String>,
+    notes_enabled: bool,
+    translation_enabled: bool,
+    translation_target_language: Option<String>,
+    translation_mode: String,
+) -> Result<Session, String> {
+    let transcription_words = transcription_words
+        .map(|raw| serde_json::from_str(&raw).map_err(|e| e.to_string()))
+        .transpose()?;
+    let messages = load_messages(db, &id)?;
+    Ok(Session {
+        id,
+        messages,
+        transcription,
+        summary,
+        summary_updated_at,
+        transcription_words,
+        notes_enabled,
+        translation_enabled,
+        translation_target_language,
+        translation_mode,
+    })
+}
+fn load_session(db: &Connection, session_id: &str) -> Result<Option<Session>, String> {
+    let row = db
+        .query_row(
+            "SELECT id,transcription,summary,summary_updated_at,transcription_words,notes_enabled,translation_enabled,translation_target_language,translation_mode FROM sessions WHERE id=?1",
+            [session_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, bool>(5)?,
+                    r.get::<_, bool>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, String>(8)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    row.map(
+        |(
+            id,
+            transcription,
+            summary,
+            summary_updated_at,
+            transcription_words,
+            notes_enabled,
+            translation_enabled,
+            translation_target_language,
+            translation_mode,
+        )| {
+            session_row_to_session(
+                db,
+                id,
+                transcription,
+                summary,
+                summary_updated_at,
+                transcription_words,
+                notes_enabled,
+                translation_enabled,
+                translation_target_language,
+                translation_mode,
+            )
+        },
+    )
+    .transpose()
+}
+fn node_by_id(db: &Connection, id: &str) -> Result<Option<Node>, String> {
+    let row = db
+        .query_row(
+            "SELECT id,parent_id,kind,name FROM nodes WHERE id=?1",
+            [id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    row.map(|(id, parent_id, kind, name)| {
+        Ok(Node {
+            id,
+            parent_id,
+            kind: parse_node_kind(&kind)?,
+            name,
+        })
+    })
+    .transpose()
+}
+fn subtree_ids(db: &Connection, id: &str) -> Result<Vec<String>, String> {
+    db.prepare(
+        "WITH RECURSIVE sub(id) AS (SELECT id FROM nodes WHERE id=?1 UNION ALL SELECT n.id FROM nodes n JOIN sub s ON n.parent_id=s.id) SELECT id FROM sub",
+    )
+    .map_err(|e| e.to_string())?
+    .query_map([id], |r| r.get::<_, String>(0))
+    .map_err(|e| e.to_string())?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|e| e.to_string())
 }
 
 fn load_data(state: &AppState) -> Result<AppData, String> {
     let db = state.db()?;
-    let workspaces = db
-        .prepare("SELECT id,name FROM workspaces ORDER BY rowid")
+    let nodes = db
+        .prepare("SELECT id,parent_id,kind,name FROM nodes ORDER BY rowid")
         .map_err(|e| e.to_string())?
-        .query_map([], row_workspace)
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|(id, parent_id, kind, name)| {
+            Ok(Node {
+                id,
+                parent_id,
+                kind: parse_node_kind(&kind)?,
+                name,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let mut sessions = Vec::new();
     let mut statement = db
         .prepare(
-            "SELECT id,workspace_id,title,transcription,summary,summary_updated_at,transcription_words,notes_enabled,translation_enabled,translation_target_language,translation_mode FROM sessions ORDER BY rowid",
+            "SELECT id,transcription,summary,summary_updated_at,transcription_words,notes_enabled,translation_enabled,translation_target_language,translation_mode FROM sessions ORDER BY rowid",
         )
         .map_err(|e| e.to_string())?;
     let rows = statement
         .query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
                 r.get::<_, Option<String>>(3)?,
                 r.get::<_, Option<String>>(4)?,
-                r.get::<_, Option<String>>(5)?,
-                r.get::<_, Option<String>>(6)?,
-                r.get::<_, bool>(7)?,
-                r.get::<_, bool>(8)?,
-                r.get::<_, Option<String>>(9)?,
-                r.get::<_, String>(10)?,
+                r.get::<_, bool>(5)?,
+                r.get::<_, bool>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, String>(8)?,
             ))
         })
         .map_err(|e| e.to_string())?;
     for row in rows {
         let (
             sid,
-            workspace_id,
-            title,
             transcription,
             summary,
             summary_updated_at,
@@ -447,45 +599,9 @@ fn load_data(state: &AppState) -> Result<AppData, String> {
             translation_target_language,
             translation_mode,
         ) = row.map_err(|e| e.to_string())?;
-        let transcription_words = transcription_words
-            .map(|raw| serde_json::from_str(&raw).map_err(|e| e.to_string()))
-            .transpose()?;
-        let messages = db
-            .prepare(
-                "SELECT id,role,content,created_at,tool_calls FROM messages WHERE session_id=? ORDER BY position",
-            )
-            .map_err(|e| e.to_string())?
-            .query_map([&sid], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, Option<String>>(4)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .map(|(id, role, content, created_at, tool_calls)| {
-                let tool_calls = tool_calls
-                    .map(|raw| serde_json::from_str(&raw).map_err(|e| e.to_string()))
-                    .transpose()?;
-                Ok(Message {
-                    id,
-                    role,
-                    content,
-                    created_at,
-                    tool_calls,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        sessions.push(Session {
-            id: sid,
-            workspace_id,
-            title,
-            messages,
+        sessions.push(session_row_to_session(
+            &db,
+            sid,
             transcription,
             summary,
             summary_updated_at,
@@ -494,10 +610,10 @@ fn load_data(state: &AppState) -> Result<AppData, String> {
             translation_enabled,
             translation_target_language,
             translation_mode,
-        });
+        )?);
     }
     let materials = db
-        .prepare("SELECT id,workspace_id,name,content,path FROM materials ORDER BY rowid")
+        .prepare("SELECT id,content,path FROM materials ORDER BY rowid")
         .map_err(|e| e.to_string())?
         .query_map([], row_material)
         .map_err(|e| e.to_string())?
@@ -545,7 +661,7 @@ fn load_data(state: &AppState) -> Result<AppData, String> {
         });
     }
     Ok(AppData {
-        workspaces,
+        nodes,
         sessions,
         materials,
         settings,
@@ -557,98 +673,243 @@ fn load_data(state: &AppState) -> Result<AppData, String> {
 fn load_state(state: tauri::State<'_, AppState>) -> Result<AppData, String> {
     load_data(&state)
 }
-#[tauri::command]
-fn create_workspace(name: String, state: tauri::State<'_, AppState>) -> Result<Workspace, String> {
-    let item = Workspace { id: id(), name };
-    state
-        .db()?
-        .execute(
-            "INSERT INTO workspaces(id,name) VALUES(?,?)",
-            params![item.id, item.name],
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(item)
-}
-fn rename_workspace_impl(state: &AppState, id: &str, name: &str) -> Result<(), String> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err("名称不能为空。".into());
+
+/// Shared create path for `create_folder`, `create_session` and
+/// `import_material`: validates the name, validates the parent (when given)
+/// is an existing folder, inserts the node, then lets the caller insert its
+/// payload row in the same transaction.
+fn create_node(
+    state: &AppState,
+    parent_id: Option<&str>,
+    name: &str,
+    kind: NodeKind,
+    insert_payload: impl FnOnce(&rusqlite::Transaction, &str) -> Result<(), String>,
+) -> Result<Node, String> {
+    let name = normalize_name(name)?;
+    let mut db = state.db()?;
+    let tx = db.transaction().map_err(|e| e.to_string())?;
+    if let Some(parent) = parent_id {
+        let is_folder: Option<bool> = tx
+            .query_row(
+                "SELECT kind='folder' FROM nodes WHERE id=?1",
+                [parent],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if is_folder != Some(true) {
+            return Err("目标不是文件夹。".into());
+        }
     }
-    let updated = state
-        .db()?
-        .execute("UPDATE workspaces SET name=? WHERE id=?", params![name, id])
-        .map_err(|e| e.to_string())?;
-    if updated == 0 {
-        return Err("找不到工作区。".into());
-    }
-    Ok(())
+    let new_id = id();
+    tx.execute(
+        "INSERT INTO nodes(id,parent_id,parent_kind,kind,name) VALUES(?1,?2,CASE WHEN ?2 IS NULL THEN NULL ELSE 'folder' END,?3,?4)",
+        params![new_id, parent_id, kind.as_str(), name],
+    )
+    .map_err(|e| e.to_string())?;
+    insert_payload(&tx, &new_id)?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(Node {
+        id: new_id,
+        parent_id: parent_id.map(str::to_string),
+        kind,
+        name,
+    })
 }
 #[tauri::command]
-fn rename_workspace(
-    id: String,
+fn create_folder(
+    parent_id: Option<String>,
     name: String,
     state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    rename_workspace_impl(&state, &id, &name)
-}
-#[tauri::command]
-fn delete_workspace(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state
-        .db()?
-        .execute("DELETE FROM workspaces WHERE id=?", [id])
-        .map_err(|e| e.to_string())?;
-    Ok(())
+) -> Result<Node, String> {
+    create_node(
+        &state,
+        parent_id.as_deref(),
+        &name,
+        NodeKind::Folder,
+        |_, _| Ok(()),
+    )
 }
 #[tauri::command]
 fn create_session(
-    workspace_id: String,
-    title: String,
+    parent_id: Option<String>,
+    name: String,
     state: tauri::State<'_, AppState>,
-) -> Result<Session, String> {
-    let item = Session {
-        id: id(),
-        workspace_id,
-        title,
-        messages: vec![],
-        transcription: None,
-        summary: None,
-        summary_updated_at: None,
-        transcription_words: None,
-        notes_enabled: true,
-        translation_enabled: false,
-        translation_target_language: None,
-        translation_mode: default_translation_mode(),
-    };
-    state
-        .db()?
-        .execute(
-            "INSERT INTO sessions(id,workspace_id,title) VALUES(?,?,?)",
-            params![item.id, item.workspace_id, item.title],
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(item)
+) -> Result<Node, String> {
+    create_node(
+        &state,
+        parent_id.as_deref(),
+        &name,
+        NodeKind::Session,
+        |tx, new_id| {
+            tx.execute("INSERT INTO sessions(id) VALUES(?1)", [new_id])
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        },
+    )
 }
-fn rename_session_impl(state: &AppState, id: &str, title: &str) -> Result<(), String> {
-    let title = title.trim();
-    if title.is_empty() {
-        return Err("名称不能为空。".into());
-    }
-    let updated = state
-        .db()?
-        .execute("UPDATE sessions SET title=? WHERE id=?", params![title, id])
+fn rename_node_impl(state: &AppState, id: &str, name: &str) -> Result<Node, String> {
+    let name = normalize_name(name)?;
+    let db = state.db()?;
+    let updated = db
+        .execute("UPDATE nodes SET name=?1 WHERE id=?2", params![name, id])
         .map_err(|e| e.to_string())?;
     if updated == 0 {
-        return Err("找不到会话。".into());
+        return Err("找不到项目。".into());
     }
+    node_by_id(&db, id)?.ok_or_else(|| "找不到项目。".into())
+}
+#[tauri::command]
+fn rename_node(
+    id: String,
+    name: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Node, String> {
+    rename_node_impl(&state, &id, &name)
+}
+fn move_node_impl(state: &AppState, id: &str, parent_id: Option<&str>) -> Result<Node, String> {
+    let mut db = state.db()?;
+    let tx = db.transaction().map_err(|e| e.to_string())?;
+    let current_parent: Option<Option<String>> = tx
+        .query_row("SELECT parent_id FROM nodes WHERE id=?1", [id], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some(current_parent) = current_parent else {
+        return Err("找不到项目。".into());
+    };
+    if let Some(parent) = parent_id {
+        let is_folder: Option<bool> = tx
+            .query_row(
+                "SELECT kind='folder' FROM nodes WHERE id=?1",
+                [parent],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if is_folder != Some(true) {
+            return Err("目标不是文件夹。".into());
+        }
+        let would_cycle: bool = tx
+            .query_row(
+                "WITH RECURSIVE up(id) AS (SELECT ?1 UNION SELECT n.parent_id FROM nodes n JOIN up ON n.id=up.id WHERE n.parent_id IS NOT NULL) SELECT EXISTS(SELECT 1 FROM up WHERE id=?2)",
+                params![parent, id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if would_cycle {
+            return Err("不能移动到自身或其子文件夹中。".into());
+        }
+    }
+    if current_parent.as_deref() != parent_id {
+        tx.execute(
+            "UPDATE nodes SET parent_id=?1, parent_kind=CASE WHEN ?1 IS NULL THEN NULL ELSE 'folder' END WHERE id=?2",
+            params![parent_id, id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    node_by_id(&state.db()?, id)?.ok_or_else(|| "找不到项目。".into())
+}
+#[tauri::command]
+fn move_node(
+    id: String,
+    parent_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Node, String> {
+    move_node_impl(&state, &id, parent_id.as_deref())
+}
+/// The recording/generation busy guard shared by `delete_node`: every session
+/// id currently recording or running a chat/summary/file-transcription job.
+async fn busy_session_ids(state: &AppState) -> Result<HashSet<String>, String> {
+    let mut busy = HashSet::new();
+    if let Some(active) = state.recording.active_session_id().await {
+        busy.insert(active);
+    }
+    let cancelling = state
+        .cancellations
+        .lock()
+        .map_err(|_| "生成状态不可用。")?
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    busy.extend(cancelling);
+    Ok(busy)
+}
+async fn delete_node_impl(state: &AppState, id: &str) -> Result<(), String> {
+    let subtree = subtree_ids(&state.db()?, id)?;
+    if subtree.is_empty() {
+        return Err("找不到项目。".into());
+    }
+    let busy = busy_session_ids(state).await?;
+    if subtree.iter().any(|nid| busy.contains(nid)) {
+        return Err("该项目中有会话正在录音或生成，请先停止。".into());
+    }
+    let deleted = state
+        .db()?
+        .execute("DELETE FROM nodes WHERE id=?1", [id])
+        .map_err(|e| e.to_string())?;
+    if deleted == 0 {
+        return Err("找不到项目。".into());
+    }
+    stop_notes_for_session(state, id);
+    stop_translation_for_session(state, id);
     Ok(())
 }
 #[tauri::command]
-fn rename_session(
-    id: String,
-    title: String,
+async fn delete_node(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    delete_node_impl(&state, &id).await
+}
+fn save_messages_impl(
+    state: &AppState,
+    session_id: &str,
+    messages: &[Message],
+) -> Result<(), String> {
+    let mut db = state.db()?;
+    let tx = db.transaction().map_err(|e| e.to_string())?;
+    let exists: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)",
+            [session_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if !exists {
+        return Err("找不到会话。".into());
+    }
+    tx.execute("DELETE FROM messages WHERE session_id=?1", [session_id])
+        .map_err(|e| e.to_string())?;
+    for (position, m) in messages.iter().enumerate() {
+        // Reinserted on every save, so a blank created_at (edit/regenerate of an
+        // existing message) keeps its original value instead of being reset here;
+        // only a genuinely new message without one gets stamped now.
+        let created_at = if m.created_at.trim().is_empty() {
+            chrono::Utc::now().to_rfc3339()
+        } else {
+            m.created_at.clone()
+        };
+        let tool_calls = m
+            .tool_calls
+            .as_ref()
+            .filter(|calls| !calls.is_empty())
+            .map(|calls| serde_json::to_string(calls).map_err(|e| e.to_string()))
+            .transpose()?;
+        tx.execute(
+            "INSERT INTO messages(id,session_id,position,role,content,created_at,tool_calls) VALUES(?,?,?,?,?,?,?)",
+            params![m.id, session_id, position, m.role, m.content, created_at, tool_calls],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())
+}
+#[tauri::command]
+fn save_messages(
+    session_id: String,
+    messages: Vec<Message>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    rename_session_impl(&state, &id, &title)
+    save_messages_impl(&state, &session_id, &messages)
 }
 fn set_notes_enabled_impl(state: &AppState, id: &str, enabled: bool) -> Result<(), String> {
     let updated = state
@@ -710,83 +971,27 @@ fn set_translation_settings(
     set_translation_settings_impl(&state, &id, enabled, target_language.as_deref(), &mode)
 }
 #[tauri::command]
-fn delete_session(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    stop_notes_for_session(&state, &id);
-    stop_translation_for_session(&state, &id);
-    state
-        .db()?
-        .execute("DELETE FROM sessions WHERE id=?", [id])
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-#[tauri::command]
-fn save_session(session: Session, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    save_session_with(session, &state)
-}
-fn save_session_with(session: Session, state: &AppState) -> Result<(), String> {
-    let mut db = state.db()?;
-    let tx = db.transaction().map_err(|e| e.to_string())?;
-    let updated = tx
-        .execute(
-            "UPDATE sessions SET title=?,transcription=?,summary=?,summary_updated_at=?,notes_enabled=?,translation_enabled=?,translation_target_language=?,translation_mode=? WHERE id=?",
-            params![
-                session.title,
-                session.transcription,
-                session.summary,
-                session.summary_updated_at,
-                session.notes_enabled,
-                session.translation_enabled,
-                session.translation_target_language,
-                session.translation_mode,
-                session.id
-            ],
-        )
-        .map_err(|e| e.to_string())?;
-    if updated == 0 {
-        return Err("找不到会话。".into());
-    }
-    tx.execute("DELETE FROM messages WHERE session_id=?", [&session.id])
-        .map_err(|e| e.to_string())?;
-    for (position, m) in session.messages.iter().enumerate() {
-        // Reinserted on every save, so a blank created_at (edit/regenerate of an
-        // existing message) keeps its original value instead of being reset here;
-        // only a genuinely new message without one gets stamped now.
-        let created_at = if m.created_at.trim().is_empty() {
-            chrono::Utc::now().to_rfc3339()
-        } else {
-            m.created_at.clone()
-        };
-        let tool_calls = m
-            .tool_calls
-            .as_ref()
-            .filter(|calls| !calls.is_empty())
-            .map(|calls| serde_json::to_string(calls).map_err(|e| e.to_string()))
-            .transpose()?;
-        tx.execute(
-            "INSERT INTO messages(id,session_id,role,content,position,created_at,tool_calls) VALUES(?,?,?,?,?,?,?)",
-            params![m.id, session.id, m.role, m.content, position, created_at, tool_calls],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    tx.commit().map_err(|e| e.to_string())
-}
-#[tauri::command]
 fn save_settings(settings: Settings, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let json = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
     state.db()?.execute("INSERT INTO settings(singleton,json) VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET json=excluded.json",[json]).map_err(|e|e.to_string())?;
     Ok(())
 }
 #[tauri::command]
-fn save_material(material: Material, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.db()?.execute("INSERT INTO materials(id,workspace_id,name,content,path) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,content=excluded.content,path=excluded.path",params![material.id,material.workspace_id,material.name,material.content,material.path]).map_err(|e|e.to_string())?;
-    Ok(())
-}
-#[tauri::command]
-fn delete_material(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state
+fn save_material(
+    id: String,
+    content: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let updated = state
         .db()?
-        .execute("DELETE FROM materials WHERE id=?", [id])
+        .execute(
+            "UPDATE materials SET content=?1 WHERE id=?2",
+            params![content, id],
+        )
         .map_err(|e| e.to_string())?;
+    if updated == 0 {
+        return Err("找不到材料。".into());
+    }
     Ok(())
 }
 
@@ -835,25 +1040,28 @@ fn read_material(path: &Path) -> Result<String, String> {
 }
 #[tauri::command]
 fn import_material(
-    workspace_id: String,
+    parent_id: Option<String>,
     path: String,
     state: tauri::State<'_, AppState>,
-) -> Result<Material, String> {
+) -> Result<Node, String> {
     let path_buf = PathBuf::from(&path);
-    let name = path_buf
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or("无效文件名。")?
-        .to_string();
-    let item = Material {
-        id: id(),
-        workspace_id,
-        name,
-        content: read_material(&path_buf)?,
-        path: Some(path),
-    };
-    save_material(item.clone(), state)?;
-    Ok(item)
+    let content = read_material(&path_buf)?;
+    let file_name = path_buf.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let name = normalize_name(file_name).unwrap_or_else(|_| "未命名材料".to_string());
+    create_node(
+        &state,
+        parent_id.as_deref(),
+        &name,
+        NodeKind::Material,
+        |tx, new_id| {
+            tx.execute(
+                "INSERT INTO materials(id,content,path) VALUES(?1,?2,?3)",
+                params![new_id, content, path],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        },
+    )
 }
 
 #[tauri::command]
@@ -890,22 +1098,76 @@ async fn discover_models(
     auth_commands::models(&state, &provider_id).await
 }
 
+/// One material reachable from a session's context-injection chain: just the
+/// name and content chat/summarize need, decoupled from the node id so the
+/// caller never has to look the node back up.
+struct ContextMaterial {
+    name: String,
+    content: String,
+}
+/// Context-scoping rule (see agents/008.../spec.md "上下文作用域"): a root
+/// session sees only root-level materials; a nested session sees the
+/// materials of every folder from its own parent up to (but not including)
+/// root, nearest folder first, insertion order within a folder.
+fn context_materials(db: &Connection, session_id: &str) -> Result<Vec<ContextMaterial>, String> {
+    let parent_id: Option<String> = db
+        .query_row(
+            "SELECT parent_id FROM nodes WHERE id=?1",
+            [session_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(String, String)> = if parent_id.is_none() {
+        db.prepare(
+            "SELECT n.name, m.content FROM nodes n JOIN materials m ON m.id = n.id WHERE n.parent_id IS NULL AND n.kind = 'material' ORDER BY n.rowid",
+        )
+        .map_err(|e| e.to_string())?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?
+    } else {
+        db.prepare(
+            "WITH RECURSIVE chain(id, dist) AS (
+               SELECT parent_id, 0 FROM nodes WHERE id = ?1 AND parent_id IS NOT NULL
+               UNION ALL
+               SELECT n.parent_id, c.dist + 1 FROM nodes n JOIN chain c ON n.id = c.id WHERE n.parent_id IS NOT NULL
+             )
+             SELECT n.name, m.content FROM chain c
+             JOIN nodes n ON n.parent_id = c.id AND n.kind = 'material'
+             JOIN materials m ON m.id = n.id
+             ORDER BY c.dist, n.rowid",
+        )
+        .map_err(|e| e.to_string())?
+        .query_map([session_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?
+    };
+    Ok(rows
+        .into_iter()
+        .map(|(name, content)| ContextMaterial { name, content })
+        .collect())
+}
 fn session_context(
     state: &AppState,
     session_id: &str,
-) -> Result<(Session, Vec<Material>, Settings), String> {
-    let all = load_data(state)?;
-    let session = all
-        .sessions
-        .into_iter()
-        .find(|s| s.id == session_id)
-        .ok_or("找不到会话。")?;
-    let materials = all
-        .materials
-        .into_iter()
-        .filter(|m| m.workspace_id == session.workspace_id)
-        .collect();
-    Ok((session, materials, all.settings))
+) -> Result<(Session, Vec<ContextMaterial>, Settings), String> {
+    let db = state.db()?;
+    let session = load_session(&db, session_id)?.ok_or("找不到会话。")?;
+    let materials = context_materials(&db, session_id)?;
+    let settings = db
+        .query_row("SELECT json FROM settings WHERE singleton=1", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(|e| e.to_string())?
+        .map(|raw| serde_json::from_str(&raw).map_err(|e| e.to_string()))
+        .transpose()?
+        .unwrap_or_default();
+    Ok((session, materials, settings))
 }
 fn persist_message(
     state: &AppState,
@@ -1020,7 +1282,7 @@ async fn streamed_completion(
     state: &AppState,
     session_id: &str,
     messages: Vec<Value>,
-    tool_workspace_id: Option<&str>,
+    tool_session_id: Option<&str>,
     channel: Channel<StreamEvent>,
     cancellation: CancellationToken,
 ) -> Result<(String, Vec<ToolCall>), String> {
@@ -1030,7 +1292,7 @@ async fn streamed_completion(
         &settings.provider_id,
         &settings.model,
         messages,
-        tool_workspace_id,
+        tool_session_id,
         cancellation,
         channel,
     )
@@ -1043,7 +1305,6 @@ async fn chat_impl(
     on_event: Channel<StreamEvent>,
 ) -> Result<(), String> {
     let (session, materials, _) = session_context(state, session_id)?;
-    let workspace_id = session.workspace_id.clone();
     // Reserve the generation slot before persisting anything, so a rejected
     // concurrent call never leaves a reply-less user message behind.
     let token = generation_token(state, session_id)?;
@@ -1081,7 +1342,7 @@ async fn chat_impl(
         state,
         session_id,
         messages,
-        Some(&workspace_id),
+        Some(session_id),
         on_event,
         token,
     )
@@ -1692,7 +1953,7 @@ fn append_transcription_at(
     session_id: &str,
     text: &str,
 ) -> Result<String, String> {
-    let mut db = open_database(database_path)?;
+    let mut db = schema::open_connection(database_path)?;
     let tx = db.transaction().map_err(|e| e.to_string())?;
     let existing = tx
         .query_row(
@@ -1828,34 +2089,28 @@ async fn read_audio_file(path: String) -> Result<tauri::ipc::Response, String> {
     Ok(tauri::ipc::Response::new(bytes))
 }
 
-#[tauri::command]
-async fn start_recording(
+/// Holds exactly the callback construction and `RecordingManager::start` call
+/// that both `start_recording` and `start_quick_transcription` need. Unlike
+/// the spec's internal-function list, this also takes `app` (not just
+/// `state`): the transcript callback must spawn the (post-spec) background
+/// notes job via `app.state::<AppState>()`, which needs an owned, 'static
+/// handle rather than the caller's borrowed `&AppState`.
+async fn begin_recording(
     app: tauri::AppHandle,
-    session_id: String,
-    on_event: Channel<RecordingEvent>,
+    state: &AppState,
+    session_id: &str,
     source: recording::RecordingSource,
     language: Option<String>,
-    state: tauri::State<'_, AppState>,
+    on_event: Channel<RecordingEvent>,
 ) -> Result<(), String> {
-    let exists: bool = state
-        .db()?
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?)",
-            [&session_id],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-    if !exists {
-        return Err("找不到会话。".into());
-    }
     // Clears any `stopped` mark (and stale cursor/pending) a previous
     // recording on this session left behind, so the background notes job can
     // run for this fresh recording.
     if let Ok(mut jobs) = state.notes.lock() {
-        jobs.remove(&session_id);
+        jobs.remove(session_id);
     }
     let database = state.db_path.clone();
-    let active_session = session_id.clone();
+    let active_session = session_id.to_string();
     let channel = on_event.clone();
     let notes_app = app.clone();
     let on_transcript = std::sync::Arc::new(move |segment: String| {
@@ -1884,7 +2139,7 @@ async fn start_recording(
         });
         Ok(())
     });
-    let error_session = session_id.clone();
+    let error_session = session_id.to_string();
     let error_channel = on_event.clone();
     let on_error = std::sync::Arc::new(move |text: String| {
         let _ = error_channel.send(RecordingEvent::Error {
@@ -1892,7 +2147,7 @@ async fn start_recording(
             text,
         });
     });
-    let level_session = session_id.clone();
+    let level_session = session_id.to_string();
     let level_channel = on_event.clone();
     let on_level = std::sync::Arc::new(move |level: f32| {
         let _ = level_channel.send(RecordingEvent::Level {
@@ -1900,10 +2155,10 @@ async fn start_recording(
             level,
         });
     });
-    match state
+    state
         .recording
         .start(
-            &session_id,
+            session_id,
             state.db_path.parent().ok_or("本地数据路径无效。")?,
             &state.stt,
             source,
@@ -1913,7 +2168,28 @@ async fn start_recording(
             on_level,
         )
         .await
-    {
+}
+#[tauri::command]
+async fn start_recording(
+    app: tauri::AppHandle,
+    session_id: String,
+    on_event: Channel<RecordingEvent>,
+    source: recording::RecordingSource,
+    language: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let exists: bool = state
+        .db()?
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?)",
+            [&session_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if !exists {
+        return Err("找不到会话。".into());
+    }
+    match begin_recording(app, &state, &session_id, source, language, on_event.clone()).await {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = on_event.send(RecordingEvent::Error {
@@ -1923,6 +2199,87 @@ async fn start_recording(
             Err(error)
         }
     }
+}
+/// Inserts the root session (node + payload) in one transaction, awaits
+/// `start`, and on error compensates by deleting the node it just inserted -
+/// so a failed start never leaves an empty session behind.
+async fn create_then_start<F, Fut>(
+    state: &AppState,
+    id: &str,
+    name: &str,
+    start: F,
+) -> Result<Node, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    {
+        let mut db = state.db()?;
+        let tx = db.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO nodes(id,parent_id,parent_kind,kind,name) VALUES(?1,NULL,NULL,'session',?2)",
+            params![id, name],
+        )
+        .map_err(|e| {
+            if e.to_string().to_lowercase().contains("unique") {
+                "会话已存在。".to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
+        tx.execute("INSERT INTO sessions(id) VALUES(?1)", [id])
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+    }
+    match start().await {
+        Ok(()) => Ok(Node {
+            id: id.to_string(),
+            parent_id: None,
+            kind: NodeKind::Session,
+            name: name.to_string(),
+        }),
+        Err(error) => {
+            let cleanup = schema::open_connection(&state.db_path).and_then(|db| {
+                db.execute("DELETE FROM nodes WHERE id=?1 AND kind='session'", [id])
+                    .map_err(|e| e.to_string())
+            });
+            match cleanup {
+                Ok(_) => Err(error),
+                Err(cleanup_error) => Err(format!("{error}；清理空会话失败：{cleanup_error}")),
+            }
+        }
+    }
+}
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn start_quick_transcription(
+    app: tauri::AppHandle,
+    id: String,
+    name: String,
+    source: recording::RecordingSource,
+    language: Option<String>,
+    on_event: Channel<RecordingEvent>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Node, String> {
+    if Uuid::parse_str(&id).is_err() {
+        return Err("会话标识无效。".into());
+    }
+    let name = normalize_name(&name)?;
+    if matches!(source, recording::RecordingSource::SystemAudio)
+        && !recording::system_audio_capability().available
+    {
+        return Err("当前系统不支持系统音频采集。".into());
+    }
+    if state.recording.active_session_id().await.is_some() {
+        return Err("已有正在进行的录音，请先停止或取消。".into());
+    }
+    if !state.stt.status().await?.ready {
+        return Err("本地语音模型尚未就绪，请先下载。".into());
+    }
+    create_then_start(&state, &id, &name, || {
+        begin_recording(app, &state, &id, source, language, on_event)
+    })
+    .await
 }
 #[tauri::command]
 async fn stop_recording(
@@ -1963,6 +2320,147 @@ fn get_system_audio_capability() -> recording::SystemAudioCapability {
     recording::system_audio_capability()
 }
 
+fn search_library_impl(state: &AppState, query: &str) -> Result<SearchResults, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(SearchResults {
+            hits: vec![],
+            truncated: false,
+        });
+    }
+    let db = state.db()?;
+    let pattern = format!("%{}%", text_match::escape_like(q));
+    let mut hits = Vec::new();
+
+    let mut names_stmt = db
+        .prepare("SELECT id,kind,name FROM nodes WHERE name LIKE ?1 ESCAPE '\\' ORDER BY rowid")
+        .map_err(|e| e.to_string())?;
+    let names = names_stmt
+        .query_map(params![pattern], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    for (node_id, kind, name) in names {
+        if let Some(piece) = text_match::piece(&name, q, SEARCH_EXCERPT_RADIUS) {
+            hits.push(SearchHit {
+                node_id,
+                kind: parse_node_kind(&kind)?,
+                field: SearchField::Name,
+                piece,
+            });
+        }
+    }
+
+    let mut transcription_stmt = db
+        .prepare("SELECT id,transcription FROM sessions WHERE transcription LIKE ?1 ESCAPE '\\' ORDER BY rowid")
+        .map_err(|e| e.to_string())?;
+    let transcriptions = transcription_stmt
+        .query_map(params![pattern], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    for (node_id, transcription) in transcriptions {
+        if let Some(piece) = text_match::piece(&transcription, q, SEARCH_EXCERPT_RADIUS) {
+            hits.push(SearchHit {
+                node_id,
+                kind: NodeKind::Session,
+                field: SearchField::Transcription,
+                piece,
+            });
+        }
+    }
+
+    let mut summary_stmt = db
+        .prepare("SELECT id,summary FROM sessions WHERE summary LIKE ?1 ESCAPE '\\' ORDER BY rowid")
+        .map_err(|e| e.to_string())?;
+    let summaries = summary_stmt
+        .query_map(params![pattern], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    for (node_id, summary) in summaries {
+        if let Some(piece) = text_match::piece(&summary, q, SEARCH_EXCERPT_RADIUS) {
+            hits.push(SearchHit {
+                node_id,
+                kind: NodeKind::Session,
+                field: SearchField::Summary,
+                piece,
+            });
+        }
+    }
+
+    let mut content_stmt = db
+        .prepare(
+            "SELECT id,content FROM materials WHERE content LIKE ?1 ESCAPE '\\' ORDER BY rowid",
+        )
+        .map_err(|e| e.to_string())?;
+    let contents = content_stmt
+        .query_map(params![pattern], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    for (node_id, content) in contents {
+        if let Some(piece) = text_match::piece(&content, q, SEARCH_EXCERPT_RADIUS) {
+            hits.push(SearchHit {
+                node_id,
+                kind: NodeKind::Material,
+                field: SearchField::Content,
+                piece,
+            });
+        }
+    }
+
+    // First matching message per session only.
+    let mut messages_stmt = db
+        .prepare(
+            "SELECT session_id,content FROM messages WHERE content LIKE ?1 ESCAPE '\\' ORDER BY session_id, position",
+        )
+        .map_err(|e| e.to_string())?;
+    let messages = messages_stmt
+        .query_map(params![pattern], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let mut seen_sessions = HashSet::new();
+    for (session_id, content) in messages {
+        if !seen_sessions.insert(session_id.clone()) {
+            continue;
+        }
+        if let Some(piece) = text_match::piece(&content, q, SEARCH_EXCERPT_RADIUS) {
+            hits.push(SearchHit {
+                node_id: session_id,
+                kind: NodeKind::Session,
+                field: SearchField::Message,
+                piece,
+            });
+        }
+    }
+    let truncated = hits.len() > SEARCH_RESULT_LIMIT;
+    hits.truncate(SEARCH_RESULT_LIMIT);
+    Ok(SearchResults { hits, truncated })
+}
+#[tauri::command]
+fn search_library(
+    query: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<SearchResults, String> {
+    search_library_impl(&state, &query)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -1972,7 +2470,28 @@ pub fn run() {
                 .app_data_dir()
                 .map_err(|e| e.to_string())?
                 .join("async.sqlite3");
-            app.manage(AppState::open(data)?);
+            match AppState::open(data) {
+                Ok(state) => {
+                    app.manage(state);
+                }
+                Err(error) => {
+                    eprintln!("{}", error.message);
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.hide();
+                    }
+                    let mut text = format!("Async 无法启动：{}", error.message);
+                    if let Some(backup) = &error.backup {
+                        text.push_str(&format!("\n备份文件：{}", backup.display()));
+                    }
+                    let handle = app.handle().clone();
+                    app.dialog()
+                        .message(text)
+                        .title("Async")
+                        .kind(MessageDialogKind::Error)
+                        .buttons(MessageDialogButtons::Ok)
+                        .show(move |_| handle.exit(1));
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1980,22 +2499,22 @@ pub fn run() {
             auth_commands::model_auth_action,
             auth_commands::cancel_model_auth,
             load_state,
-            create_workspace,
-            rename_workspace,
-            delete_workspace,
+            create_folder,
             create_session,
-            rename_session,
+            rename_node,
+            move_node,
+            delete_node,
             set_notes_enabled,
             set_translation_settings,
             queue_sentence_translations,
-            delete_session,
-            save_session,
+            save_messages,
             import_material,
             save_material,
-            delete_material,
             save_settings,
             delete_provider,
             discover_models,
+            search_library,
+            start_quick_transcription,
             chat,
             cancel_generation,
             summarize,

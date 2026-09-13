@@ -31,21 +31,23 @@ export interface Word {
   start: number;
   end: number;
 }
-export interface Workspace {
+// A generic node tree replaces the old workspace/session/material split:
+// folders nest to any depth, and sessions and materials can live at the root
+// or in any folder. `parentId: null` means root; root itself is never a node.
+export type NodeKind = "folder" | "session" | "material";
+export interface Node {
   id: string;
+  parentId: string | null;
+  kind: NodeKind;
   name: string;
 }
 export interface Material {
   id: string;
-  workspaceId: string;
-  name: string;
   content: string;
-  path: string;
+  path: string | null;
 }
 export interface Session {
   id: string;
-  workspaceId: string;
-  title: string;
   messages: Message[];
   transcription?: string;
   summary?: string;
@@ -96,6 +98,8 @@ export interface Settings {
   language: "zh" | "en";
   mainPanelRatio?: number;
   sidebarOpen?: boolean;
+  // Ids of folders expanded in the explorer tree, persisted across launches.
+  explorerExpanded?: string[];
 }
 export interface SttStatus {
   ready: boolean;
@@ -104,11 +108,29 @@ export interface SttStatus {
   sizeBytes: number;
 }
 export interface AppData {
-  workspaces: Workspace[];
+  nodes: Node[];
   sessions: Session[];
   materials: Material[];
   settings: Settings;
   providers: Provider[];
+}
+export type SearchField = "name" | "transcription" | "summary" | "content" | "message";
+// Pre-split in Rust (ASCII case-insensitive, matching SQLite's LIKE), so
+// rendering a hit never needs UTF-8/UTF-16 offset math or `v-html`.
+export interface SearchPiece {
+  before: string;
+  matched: string;
+  after: string;
+}
+export interface SearchHit {
+  nodeId: string;
+  kind: NodeKind;
+  field: SearchField;
+  piece: SearchPiece;
+}
+export interface SearchResults {
+  hits: SearchHit[];
+  truncated: boolean;
 }
 export interface StreamEvent {
   type: "delta" | "done" | "tool";

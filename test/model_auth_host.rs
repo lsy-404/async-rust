@@ -123,7 +123,7 @@ async fn failover_uses_next_key_before_output_and_never_after_partial_output() {
         "model",
         vec![json!({"role":"user","content":"question"})],
         StreamOptions {
-            tool_workspace_id: None,
+            tool_session_id: None,
             cancel: CancellationToken::new(),
         },
         |_| Ok(()),
@@ -157,7 +157,7 @@ async fn failover_uses_next_key_before_output_and_never_after_partial_output() {
         "model",
         vec![json!({"role":"user","content":"question"})],
         StreamOptions {
-            tool_workspace_id: None,
+            tool_session_id: None,
             cancel: CancellationToken::new(),
         },
         |delta| {
@@ -236,15 +236,40 @@ fn unreadable_secret_returns_auth_error_metadata_without_blocking_offline_state(
     assert_eq!(p["apiKeyCredentials"][0]["healthy"], false);
     assert_eq!(p["apiKeyCredentials"][0]["models"], json!(["model"]));
 }
-fn seed_workspace(state: &AppState, id: &str) {
+fn seed_folder(state: &AppState, id: &str) {
     state
         .db()
         .unwrap()
         .execute(
-            "INSERT INTO workspaces(id,name) VALUES(?,?)",
+            "INSERT INTO nodes(id,parent_id,parent_kind,kind,name) VALUES(?,NULL,NULL,'folder',?)",
             params![id, id],
         )
         .unwrap();
+}
+/// A session node inside `parent` (or at root when `parent` is None), with
+/// `id` used as both its node id and node name for readable fixtures.
+fn seed_session_in(state: &AppState, parent: Option<&str>, id: &str) {
+    let db = state.db().unwrap();
+    db.execute(
+        "INSERT INTO nodes(id,parent_id,parent_kind,kind,name) VALUES(?1,?2,CASE WHEN ?2 IS NULL THEN NULL ELSE 'folder' END,'session',?1)",
+        params![id, parent],
+    )
+    .unwrap();
+    db.execute("INSERT INTO sessions(id) VALUES(?1)", params![id])
+        .unwrap();
+}
+fn seed_material_in(state: &AppState, parent: &str, id: &str, name: &str, content: &str) {
+    let db = state.db().unwrap();
+    db.execute(
+        "INSERT INTO nodes(id,parent_id,parent_kind,kind,name) VALUES(?,?,'folder','material',?)",
+        params![id, parent, name],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO materials(id,content,path) VALUES(?,?,NULL)",
+        params![id, content],
+    )
+    .unwrap();
 }
 fn sse_body(events: &[Value]) -> String {
     let mut out = String::new();
@@ -275,15 +300,15 @@ fn content_chunk(text: &str) -> Value {
 async fn tool_call_arguments_accumulate_across_streamed_chunks_before_the_tool_runs() {
     let server = MockServer::start().await;
     let (_dir, state) = setup(&server.uri());
-    seed_workspace(&state, "ws-accum");
-    state
-        .db()
-        .unwrap()
-        .execute(
-            "INSERT INTO materials(id,workspace_id,name,content) VALUES(?,?,?,?)",
-            params!["m1", "ws-accum", "notes.txt", "Algebra is fun and useful."],
-        )
-        .unwrap();
+    seed_folder(&state, "ws-accum");
+    seed_session_in(&state, Some("ws-accum"), "sess-accum");
+    seed_material_in(
+        &state,
+        "ws-accum",
+        "m1",
+        "notes.txt",
+        "Algebra is fun and useful.",
+    );
     let cred = Credential::new("custom", "api-key", "Key".into(), vec!["model".into()]);
     connections::save(&state, &cred, "key").unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -320,7 +345,7 @@ async fn tool_call_arguments_accumulate_across_streamed_chunks_before_the_tool_r
         "model",
         vec![json!({"role":"user","content":"question"})],
         StreamOptions {
-            tool_workspace_id: Some("ws-accum"),
+            tool_session_id: Some("sess-accum"),
             cancel: CancellationToken::new(),
         },
         |_| Ok(()),
@@ -362,7 +387,7 @@ async fn provider_without_tool_support_falls_back_and_still_completes_the_turn()
     // attempt should retry once without it rather than failing the whole turn.
     let server = MockServer::start().await;
     let (_dir, state) = setup(&server.uri());
-    seed_workspace(&state, "ws-fallback");
+    seed_session_in(&state, None, "ws-fallback");
     let cred = Credential::new("custom", "api-key", "Key".into(), vec!["model".into()]);
     connections::save(&state, &cred, "key").unwrap();
     Mock::given(method("POST"))
@@ -387,7 +412,7 @@ async fn provider_without_tool_support_falls_back_and_still_completes_the_turn()
         "model",
         vec![json!({"role":"user","content":"question"})],
         StreamOptions {
-            tool_workspace_id: Some("ws-fallback"),
+            tool_session_id: Some("ws-fallback"),
             cancel: CancellationToken::new(),
         },
         |_| Ok(()),
@@ -401,7 +426,7 @@ async fn provider_without_tool_support_falls_back_and_still_completes_the_turn()
 async fn tool_loop_stops_after_max_rounds_and_finishes_without_tools() {
     let server = MockServer::start().await;
     let (_dir, state) = setup(&server.uri());
-    seed_workspace(&state, "ws-bound");
+    seed_session_in(&state, None, "ws-bound");
     let cred = Credential::new("custom", "api-key", "Key".into(), vec!["model".into()]);
     connections::save(&state, &cred, "key").unwrap();
     let had_tools = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -436,7 +461,7 @@ async fn tool_loop_stops_after_max_rounds_and_finishes_without_tools() {
         "model",
         vec![json!({"role":"user","content":"question"})],
         StreamOptions {
-            tool_workspace_id: Some("ws-bound"),
+            tool_session_id: Some("ws-bound"),
             cancel: CancellationToken::new(),
         },
         |_| Ok(()),
@@ -465,7 +490,7 @@ async fn failover_never_runs_a_second_credential_once_a_tool_has_already_execute
     // turn should fail instead of quietly discarding that tool history.
     let server = MockServer::start().await;
     let (_dir, state) = setup(&server.uri());
-    seed_workspace(&state, "ws-guard");
+    seed_session_in(&state, None, "ws-guard");
     let a = Credential::new("custom", "api-key", "First".into(), vec!["model".into()]);
     let b = Credential::new("custom", "api-key", "Second".into(), vec!["model".into()]);
     connections::save(&state, &a, "first").unwrap();
@@ -512,7 +537,7 @@ async fn failover_never_runs_a_second_credential_once_a_tool_has_already_execute
         "model",
         vec![json!({"role":"user","content":"question"})],
         StreamOptions {
-            tool_workspace_id: Some("ws-guard"),
+            tool_session_id: Some("ws-guard"),
             cancel: CancellationToken::new(),
         },
         |_| Ok(()),
@@ -537,7 +562,7 @@ async fn a_tools_less_fallback_round_that_echoes_tool_calls_is_not_executed() {
     // treated as a plain (if odd) answer, not routed through tool execution.
     let server = MockServer::start().await;
     let (_dir, state) = setup(&server.uri());
-    seed_workspace(&state, "ws-nonconformant");
+    seed_session_in(&state, None, "ws-nonconformant");
     let cred = Credential::new("custom", "api-key", "Key".into(), vec!["model".into()]);
     connections::save(&state, &cred, "key").unwrap();
     Mock::given(method("POST"))
@@ -569,7 +594,7 @@ async fn a_tools_less_fallback_round_that_echoes_tool_calls_is_not_executed() {
         "model",
         vec![json!({"role":"user","content":"question"})],
         StreamOptions {
-            tool_workspace_id: Some("ws-nonconformant"),
+            tool_session_id: Some("ws-nonconformant"),
             cancel: CancellationToken::new(),
         },
         |_| Ok(()),
@@ -589,96 +614,80 @@ async fn a_tools_less_fallback_round_that_echoes_tool_calls_is_not_executed() {
 #[test]
 fn search_local_finds_real_rows_from_materials_and_session_transcripts() {
     let (_dir, state) = setup("http://localhost");
-    seed_workspace(&state, "ws-search");
-    seed_workspace(&state, "ws-other");
-    let db = state.db().unwrap();
-    db.execute(
-        "INSERT INTO materials(id,workspace_id,name,content) VALUES(?,?,?,?)",
-        params![
-            "m1",
-            "ws-search",
-            "notes.txt",
-            "The mitochondria is the powerhouse of the cell."
-        ],
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO sessions(id,workspace_id,title,transcription) VALUES(?,?,?,?)",
-        params![
-            "s1",
-            "ws-search",
-            "Lecture",
-            "Today we discussed the mitochondria in detail."
-        ],
-    )
-    .unwrap();
-    // A matching row that belongs to a different workspace must never leak in.
-    db.execute(
-        "INSERT INTO materials(id,workspace_id,name,content) VALUES(?,?,?,?)",
-        params![
-            "m2",
-            "ws-other",
-            "other.txt",
-            "mitochondria appears here too"
-        ],
-    )
-    .unwrap();
-    drop(db);
-    let result = search_local(&state, "ws-search", "mitochondria").unwrap();
-    assert!(result.contains("[Material] notes.txt"));
-    assert!(result.contains("[Session transcript] Lecture"));
-    assert!(!result.contains("other.txt"));
-}
-#[test]
-fn escape_like_escapes_backslash_percent_and_underscore_in_that_order() {
-    assert_eq!(escape_like("50%_off"), "50\\%\\_off");
-    assert_eq!(escape_like("a\\b"), "a\\\\b");
-}
-#[test]
-fn like_escaping_prevents_percent_and_underscore_from_matching_everything() {
-    let (_dir, state) = setup("http://localhost");
-    seed_workspace(&state, "ws-escape");
-    let db = state.db().unwrap();
-    db.execute(
-        "INSERT INTO materials(id,workspace_id,name,content) VALUES(?,?,?,?)",
-        params![
-            "m1",
-            "ws-escape",
-            "notes.txt",
-            "Plain notes without special characters."
-        ],
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO materials(id,workspace_id,name,content) VALUES(?,?,?,?)",
-        params![
-            "m2",
-            "ws-escape",
-            "other.txt",
-            "Another plain note, nothing special."
-        ],
-    )
-    .unwrap();
-    drop(db);
-    // Neither material contains a literal '%' or '_'; if either were treated as an
-    // unescaped SQL wildcard it would match both rows instead of finding nothing.
-    assert!(search_local(&state, "ws-escape", "%")
-        .unwrap()
-        .contains("No local materials"));
-    assert!(search_local(&state, "ws-escape", "_")
-        .unwrap()
-        .contains("No local materials"));
+    seed_folder(&state, "ws-search");
+    seed_folder(&state, "ws-other");
+    seed_material_in(
+        &state,
+        "ws-search",
+        "m1",
+        "notes.txt",
+        "The mitochondria is the powerhouse of the cell.",
+    );
+    seed_session_in(&state, Some("ws-search"), "s1");
     state
         .db()
         .unwrap()
         .execute(
-            "INSERT INTO materials(id,workspace_id,name,content) VALUES(?,?,?,?)",
-            params!["m3", "ws-escape", "promo.txt", "Save 100%_off today only."],
+            "UPDATE sessions SET transcription=? WHERE id='s1'",
+            params!["Today we discussed the mitochondria in detail."],
         )
         .unwrap();
+    // A matching row that belongs to a different top-level folder must never leak in.
+    seed_material_in(
+        &state,
+        "ws-other",
+        "m2",
+        "other.txt",
+        "mitochondria appears here too",
+    );
+    let result = search_local(&state, "s1", "mitochondria").unwrap();
+    assert!(result.contains("[Material]"));
+    assert!(result.contains("notes.txt"));
+    assert!(result.contains("[Session]"));
+    assert!(!result.contains("other.txt"));
+}
+#[test]
+fn escape_like_escapes_backslash_percent_and_underscore_in_that_order() {
+    assert_eq!(text_match::escape_like("50%_off"), "50\\%\\_off");
+    assert_eq!(text_match::escape_like("a\\b"), "a\\\\b");
+}
+#[test]
+fn like_escaping_prevents_percent_and_underscore_from_matching_everything() {
+    let (_dir, state) = setup("http://localhost");
+    seed_folder(&state, "ws-escape");
+    seed_session_in(&state, Some("ws-escape"), "s-escape");
+    seed_material_in(
+        &state,
+        "ws-escape",
+        "m1",
+        "notes.txt",
+        "Plain notes without special characters.",
+    );
+    seed_material_in(
+        &state,
+        "ws-escape",
+        "m2",
+        "other.txt",
+        "Another plain note, nothing special.",
+    );
+    // Neither material contains a literal '%' or '_'; if either were treated as an
+    // unescaped SQL wildcard it would match both rows instead of finding nothing.
+    assert!(search_local(&state, "s-escape", "%")
+        .unwrap()
+        .contains("No local materials"));
+    assert!(search_local(&state, "s-escape", "_")
+        .unwrap()
+        .contains("No local materials"));
+    seed_material_in(
+        &state,
+        "ws-escape",
+        "m3",
+        "promo.txt",
+        "Save 100%_off today only.",
+    );
     // A query that legitimately contains those characters must still find the
     // literal text verbatim, and only the material that actually has it.
-    let literal = search_local(&state, "ws-escape", "100%_off").unwrap();
+    let literal = search_local(&state, "s-escape", "100%_off").unwrap();
     assert!(literal.contains("promo.txt"));
     assert!(!literal.contains("notes.txt"));
     assert!(!literal.contains("other.txt"));

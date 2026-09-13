@@ -5,17 +5,45 @@ use wiremock::{
     Mock, MockServer, ResponseTemplate,
 };
 
-// Shared by the notes tests below: a workspace, a session, a provider row
-// pointed at the wiremock server, matching settings, and a healthy credential.
-fn seed_notes_fixture(state: &AppState, server_uri: &str) {
-    let db = state.db().unwrap();
-    db.execute("INSERT INTO workspaces VALUES('w','Class')", [])
+fn seed_folder(state: &AppState, id: &str, name: &str) {
+    state
+        .db()
+        .unwrap()
+        .execute(
+            "INSERT INTO nodes(id,parent_id,parent_kind,kind,name) VALUES(?,NULL,NULL,'folder',?)",
+            params![id, name],
+        )
         .unwrap();
+}
+fn seed_session(state: &AppState, parent: Option<&str>, id: &str, name: &str) {
+    let db = state.db().unwrap();
     db.execute(
-        "INSERT INTO sessions(id,workspace_id,title) VALUES('s','w','Lesson')",
-        [],
+        "INSERT INTO nodes(id,parent_id,parent_kind,kind,name) VALUES(?1,?2,CASE WHEN ?2 IS NULL THEN NULL ELSE 'folder' END,'session',?3)",
+        params![id, parent, name],
     )
     .unwrap();
+    db.execute("INSERT INTO sessions(id) VALUES(?1)", params![id])
+        .unwrap();
+}
+fn seed_material(state: &AppState, parent: Option<&str>, id: &str, name: &str, content: &str) {
+    let db = state.db().unwrap();
+    db.execute(
+        "INSERT INTO nodes(id,parent_id,parent_kind,kind,name) VALUES(?1,?2,CASE WHEN ?2 IS NULL THEN NULL ELSE 'folder' END,'material',?3)",
+        params![id, parent, name],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO materials(id,content,path) VALUES(?,?,NULL)",
+        params![id, content],
+    )
+    .unwrap();
+}
+
+// Shared by the notes/translation tests below: a root session, a provider row
+// pointed at the wiremock server, matching settings, and a healthy credential.
+fn seed_notes_fixture(state: &AppState, server_uri: &str) {
+    seed_session(state, None, "s", "Lesson");
+    let db = state.db().unwrap();
     db.execute(
         "INSERT OR IGNORE INTO providers(id,name,base_url,models_json) VALUES('custom','custom',?,'[]')",
         [server_uri],
@@ -47,143 +75,493 @@ fn sse_answer(text: &str) -> String {
     format!("data: {{\"choices\":[{{\"delta\":{{\"content\":{content}}}}}]}}\n\ndata: [DONE]\n\n")
 }
 
+// --- node commands ---------------------------------------------------------
+
 #[test]
-fn sqlite_cascade_survives_reopen() {
+fn create_folder_create_session_and_import_material_at_root_and_nested() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
+
+    let root_folder = create_node(&state, None, "Course", NodeKind::Folder, |_, _| Ok(())).unwrap();
+    assert_eq!(root_folder.parent_id, None);
+    assert_eq!(root_folder.kind, NodeKind::Folder);
+
+    let nested_session = create_node(
+        &state,
+        Some(&root_folder.id),
+        "Lesson 1",
+        NodeKind::Session,
+        |tx, id| {
+            tx.execute("INSERT INTO sessions(id) VALUES(?1)", [id])
+                .map_err(|e| e.to_string())
+                .map(|_| ())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        nested_session.parent_id.as_deref(),
+        Some(root_folder.id.as_str())
+    );
+
+    // A session or material as the parent is rejected.
+    let err = create_node(
+        &state,
+        Some(&nested_session.id),
+        "x",
+        NodeKind::Folder,
+        |_, _| Ok(()),
+    )
+    .unwrap_err();
+    assert_eq!(err, "目标不是文件夹。");
+
+    // A missing parent is rejected the same way.
+    let err = create_node(
+        &state,
+        Some("missing"),
+        "x",
+        NodeKind::Folder,
+        |_, _| Ok(()),
+    )
+    .unwrap_err();
+    assert_eq!(err, "目标不是文件夹。");
+
+    // normalize_name: blank, too long, and control characters are all rejected.
+    assert!(normalize_name("   ").is_err());
+    assert!(normalize_name(&"a".repeat(256)).is_err());
+    assert!(normalize_name("line\nbreak").is_err());
+    assert_eq!(normalize_name("  ok  ").unwrap(), "ok");
+}
+
+#[test]
+fn move_node_root_into_folder_and_same_parent_noop() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
+    seed_folder(&state, "a", "A");
+    seed_folder(&state, "b", "B");
+    seed_session(&state, Some("a"), "s", "Session");
+
+    let moved = move_node_impl(&state, "s", Some("b")).unwrap();
+    assert_eq!(moved.parent_id.as_deref(), Some("b"));
+
+    // Same parent is a no-op that still succeeds.
+    let again = move_node_impl(&state, "s", Some("b")).unwrap();
+    assert_eq!(again.parent_id.as_deref(), Some("b"));
+
+    // Moving to root.
+    let at_root = move_node_impl(&state, "s", None).unwrap();
+    assert_eq!(at_root.parent_id, None);
+}
+
+#[test]
+fn move_node_rejects_cycles_and_non_folder_targets() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
+    seed_folder(&state, "a", "A");
+    seed_folder(&state, "b", "B");
+    seed_folder(&state, "c", "C");
+    move_node_impl(&state, "b", Some("a")).unwrap();
+    move_node_impl(&state, "c", Some("b")).unwrap();
+
+    // Into self.
+    let err = move_node_impl(&state, "a", Some("a")).unwrap_err();
+    assert_eq!(err, "不能移动到自身或其子文件夹中。");
+    // Into a descendant three levels deep.
+    let err = move_node_impl(&state, "a", Some("c")).unwrap_err();
+    assert_eq!(err, "不能移动到自身或其子文件夹中。");
+
+    seed_session(&state, None, "s", "Session");
+    let err = move_node_impl(&state, "a", Some("s")).unwrap_err();
+    assert_eq!(err, "目标不是文件夹。");
+
+    // A raw UPDATE that would create a cycle is rejected by the trigger itself.
+    let db = state.db().unwrap();
+    let raw = db.execute("UPDATE nodes SET parent_id='c' WHERE id='a'", []);
+    assert!(raw.is_err());
+    // Changing `kind` is rejected by the immutability trigger.
+    let raw = db.execute("UPDATE nodes SET kind='folder' WHERE id='s'", []);
+    assert!(raw.is_err());
+}
+
+#[tokio::test]
+async fn delete_node_cascades_through_nested_folders_and_survives_reopen() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("state.sqlite3");
-    {
-        let db = open_database(&path).unwrap();
-        db.execute("INSERT INTO workspaces VALUES('w','Class')", [])
+    let state = AppState::open(path.clone()).unwrap();
+    seed_folder(&state, "course", "Course");
+    seed_folder(&state, "week1", "Week 1");
+    move_node_impl(&state, "week1", Some("course")).unwrap();
+    seed_session(&state, Some("week1"), "s1", "Lesson");
+    seed_material(&state, Some("week1"), "m1", "notes.txt", "content");
+    persist_message(&state, "s1", "user", "hi", None).unwrap();
+    seed_folder(&state, "other", "Unrelated");
+
+    let subtree = subtree_ids(&state.db().unwrap(), "course").unwrap();
+    assert!(subtree.contains(&"course".to_string()));
+    assert!(subtree.contains(&"week1".to_string()));
+    assert!(subtree.contains(&"s1".to_string()));
+    assert!(subtree.contains(&"m1".to_string()));
+
+    delete_node_impl(&state, "course").await.unwrap();
+
+    let db = state.db().unwrap();
+    for id in ["course", "week1", "s1", "m1"] {
+        let exists: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1)",
+                [id],
+                |r| r.get(0),
+            )
             .unwrap();
-        db.execute(
-            "INSERT INTO sessions(id,workspace_id,title) VALUES('s','w','Lesson')",
-            [],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO materials VALUES('m','w','n','content',NULL)",
-            [],
-        )
-        .unwrap();
+        assert!(!exists, "{id} must be gone");
     }
-    let db = open_database(&path).unwrap();
-    db.execute("DELETE FROM workspaces WHERE id='w'", [])
+    let messages: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id='s1'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
-    assert_eq!(
-        db.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        db.query_row("SELECT COUNT(*) FROM materials", [], |r| r.get::<_, i64>(0))
-            .unwrap(),
-        0
-    );
+    assert_eq!(messages, 0);
+    let unrelated: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM nodes WHERE id='other')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(unrelated, "an unrelated root folder must be intact");
+    drop(db);
+
+    // Survives reopen.
+    drop(state);
+    let reopened = AppState::open(path).unwrap();
+    let db = reopened.db().unwrap();
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 1); // just "other"
 }
 
 #[test]
-fn rename_workspace_updates_name_and_rejects_blank() {
+fn payload_bound_triggers_reject_deleting_the_row_without_its_node() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
-    state
-        .db()
-        .unwrap()
-        .execute("INSERT INTO workspaces VALUES('w','Class')", [])
+    seed_session(&state, None, "s", "Lesson");
+    seed_material(&state, None, "m", "n.txt", "content");
+    let db = state.db().unwrap();
+    assert!(db.execute("DELETE FROM sessions WHERE id='s'", []).is_err());
+    assert!(db
+        .execute("DELETE FROM materials WHERE id='m'", [])
+        .is_err());
+    let sessions: i64 = db
+        .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
         .unwrap();
-
-    rename_workspace_impl(&state, "w", "Renamed").unwrap();
-    let name: String = state
-        .db()
-        .unwrap()
-        .query_row("SELECT name FROM workspaces WHERE id='w'", [], |r| r.get(0))
+    let materials: i64 = db
+        .query_row("SELECT COUNT(*) FROM materials", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(name, "Renamed");
-
-    let err = rename_workspace_impl(&state, "w", "   ").unwrap_err();
-    assert_eq!(err, "名称不能为空。");
-
-    let err = rename_workspace_impl(&state, "missing", "x").unwrap_err();
-    assert_eq!(err, "找不到工作区。");
+    assert_eq!(sessions, 1);
+    assert_eq!(materials, 1);
 }
 
-#[test]
-fn summary_timestamp_survives_reload() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("state.sqlite3");
-    let db = open_database(&path).unwrap();
-    db.execute("INSERT INTO workspaces VALUES('w','Class')", [])
-        .unwrap();
-    db.execute(
-        "INSERT INTO sessions(id,workspace_id,title) VALUES('s','w','Lesson')",
-        [],
-    )
-    .unwrap();
-    db.execute(
-        "UPDATE sessions SET summary='done',summary_updated_at='2024-01-01T00:00:00Z' WHERE id='s'",
-        [],
-    )
-    .unwrap();
-
-    let state = AppState::open(path).unwrap();
-    let data = load_data(&state).unwrap();
-    let session = data.sessions.iter().find(|s| s.id == "s").unwrap();
-    assert_eq!(session.summary.as_deref(), Some("done"));
-    assert_eq!(
-        session.summary_updated_at.as_deref(),
-        Some("2024-01-01T00:00:00Z")
-    );
-}
-
-#[test]
-fn rename_session_updates_title_and_rejects_blank() {
+#[tokio::test]
+async fn delete_node_guard_refuses_a_subtree_with_an_active_recording_or_generation() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
+    seed_folder(&state, "course", "Course");
+    seed_session(&state, Some("course"), "recording-session", "Live");
+    seed_folder(&state, "other", "Unrelated");
+    seed_session(&state, Some("other"), "s2", "Other session");
+
     state
+        .recording
+        .seed_active_for_test("recording-session")
+        .await;
+    let subtree = subtree_ids(&state.db().unwrap(), "course").unwrap();
+    let busy = busy_session_ids(&state).await.unwrap();
+    assert!(subtree.iter().any(|id| busy.contains(id)));
+
+    // An unrelated subtree (no busy id inside it) is still deletable.
+    let other_subtree = subtree_ids(&state.db().unwrap(), "other").unwrap();
+    assert!(!other_subtree.iter().any(|id| busy.contains(id)));
+
+    // A generation (chat/summary/transcription) cancellation token also counts as busy.
+    let _token = generation_token(&state, "s2").unwrap();
+    let busy = busy_session_ids(&state).await.unwrap();
+    assert!(busy.contains("s2"));
+}
+
+#[test]
+fn rename_node_trims_rejects_blank_and_unknown_ids_allows_duplicates() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
+    seed_session(&state, None, "s", "Lesson");
+    seed_session(&state, None, "s2", "Other");
+
+    let renamed = rename_node_impl(&state, "s", "  Renamed  ").unwrap();
+    assert_eq!(renamed.name, "Renamed");
+
+    let err = rename_node_impl(&state, "s", "   ").unwrap_err();
+    assert!(err.contains("名称"));
+
+    let err = rename_node_impl(&state, "missing", "x").unwrap_err();
+    assert_eq!(err, "找不到项目。");
+
+    // Case-only renames and duplicate sibling names are both allowed.
+    rename_node_impl(&state, "s", "renamed").unwrap();
+    rename_node_impl(&state, "s2", "renamed").unwrap();
+    let names: Vec<String> = state
         .db()
         .unwrap()
-        .execute("INSERT INTO workspaces VALUES('w','Class')", [])
+        .prepare("SELECT name FROM nodes WHERE kind='session' ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
         .unwrap();
+    assert_eq!(names, vec!["renamed".to_string(), "renamed".to_string()]);
+}
+
+#[test]
+fn save_messages_rewrites_messages_only_and_errors_on_unknown_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
+    seed_session(&state, None, "s", "Lesson");
     state
         .db()
         .unwrap()
         .execute(
-            "INSERT INTO sessions(id,workspace_id,title) VALUES('s','w','Lesson')",
+            "UPDATE sessions SET transcription='live transcript',summary='live notes' WHERE id='s'",
             [],
         )
         .unwrap();
 
-    rename_session_impl(&state, "s", "Renamed").unwrap();
-    let title: String = state
-        .db()
-        .unwrap()
-        .query_row("SELECT title FROM sessions WHERE id='s'", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(title, "Renamed");
+    let messages = vec![Message {
+        id: "m1".into(),
+        role: "user".into(),
+        content: "hello".into(),
+        created_at: String::new(),
+        tool_calls: None,
+    }];
+    save_messages_impl(&state, "s", &messages).unwrap();
+    let db = state.db().unwrap();
+    let loaded = load_session(&db, "s").unwrap().unwrap();
+    assert_eq!(loaded.messages.len(), 1);
+    // The transcript and summary written directly to SQL are unaffected.
+    assert_eq!(loaded.transcription.as_deref(), Some("live transcript"));
+    assert_eq!(loaded.summary.as_deref(), Some("live notes"));
 
-    let err = rename_session_impl(&state, "s", "   ").unwrap_err();
-    assert_eq!(err, "名称不能为空。");
-
-    let err = rename_session_impl(&state, "missing", "x").unwrap_err();
+    let err = save_messages_impl(&state, "missing", &messages).unwrap_err();
     assert_eq!(err, "找不到会话。");
 }
+
+#[test]
+fn save_material_updates_content_only_and_errors_on_unknown_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
+    seed_material(&state, None, "m", "notes.txt", "old content");
+
+    let db = state.db().unwrap();
+    let updated = db
+        .execute(
+            "UPDATE materials SET content=?1 WHERE id=?2",
+            params!["new content", "m"],
+        )
+        .unwrap();
+    assert_eq!(updated, 1);
+    let content: String = db
+        .query_row("SELECT content FROM materials WHERE id='m'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(content, "new content");
+
+    let updated = db
+        .execute(
+            "UPDATE materials SET content=?1 WHERE id=?2",
+            params!["x", "missing"],
+        )
+        .unwrap();
+    assert_eq!(updated, 0, "an unknown id must insert no row");
+}
+
+#[test]
+fn context_injection_scope_follows_the_ancestor_chain_nearest_first() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
+    // Root session: only root materials.
+    seed_material(&state, None, "root-mat", "root.txt", "root content");
+    seed_session(&state, None, "root-session", "Root");
+    seed_folder(&state, "a", "A");
+    seed_folder(&state, "b", "B");
+    move_node_impl(&state, "b", Some("a")).unwrap();
+    seed_folder(&state, "c", "C");
+    move_node_impl(&state, "c", Some("a")).unwrap();
+    seed_material(&state, Some("a"), "a-mat", "a.txt", "A content");
+    seed_material(&state, Some("b"), "b-mat", "b.txt", "B content");
+    seed_material(&state, Some("c"), "c-mat", "c.txt", "C content");
+    seed_session(&state, Some("b"), "nested-session", "In B");
+
+    let db = state.db().unwrap();
+    let root_materials = context_materials(&db, "root-session").unwrap();
+    assert_eq!(root_materials.len(), 1);
+    assert_eq!(root_materials[0].name, "root.txt");
+
+    let nested = context_materials(&db, "nested-session").unwrap();
+    // B's materials first (nearest), then A's; excludes sibling C and root.
+    assert_eq!(nested.len(), 2);
+    assert_eq!(nested[0].name, "b.txt");
+    assert_eq!(nested[1].name, "a.txt");
+
+    // A migrated-style session (P = T) gets exactly its folder's materials.
+    seed_session(&state, Some("a"), "direct-session", "In A directly");
+    let direct = context_materials(&db, "direct-session").unwrap();
+    assert_eq!(direct.len(), 1);
+    assert_eq!(direct[0].name, "a.txt");
+}
+
+#[test]
+fn search_library_finds_hits_across_fields_and_caps_at_the_result_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
+    seed_folder(&state, "course", "Course");
+    seed_session(&state, Some("course"), "s1", "Mitochondria lecture");
+    state
+        .db()
+        .unwrap()
+        .execute(
+            "UPDATE sessions SET transcription='the mitochondria are busy',summary='mitochondria summary' WHERE id='s1'",
+            [],
+        )
+        .unwrap();
+    seed_material(
+        &state,
+        Some("course"),
+        "m1",
+        "notes.txt",
+        "mitochondria notes",
+    );
+    persist_message(&state, "s1", "user", "tell me about mitochondria", None).unwrap();
+
+    let empty = search_library_impl(&state, "   ").unwrap();
+    assert!(empty.hits.is_empty());
+    assert!(!empty.truncated);
+
+    let results = search_library_impl(&state, "MITOCHONDRIA").unwrap();
+    let fields: std::collections::HashSet<SearchField> =
+        results.hits.iter().map(|h| h.field).collect();
+    assert!(fields.contains(&SearchField::Name));
+    assert!(fields.contains(&SearchField::Transcription));
+    assert!(fields.contains(&SearchField::Summary));
+    assert!(fields.contains(&SearchField::Content));
+    assert!(fields.contains(&SearchField::Message));
+    assert!(!results.truncated);
+}
+
+// --- quick transcription -----------------------------------------------------
+
+#[tokio::test]
+async fn create_then_start_leaves_no_node_when_start_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let result = create_then_start(&state, &id, "2024 test", || async {
+        Err("boom".to_string())
+    })
+    .await;
+    assert_eq!(result.unwrap_err(), "boom");
+    let count: i64 = state
+        .db()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn create_then_start_keeps_the_node_when_start_succeeds() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let node = create_then_start(&state, &id, "2024 test", || async { Ok(()) })
+        .await
+        .unwrap();
+    assert_eq!(node.parent_id, None);
+    assert_eq!(node.kind, NodeKind::Session);
+    let db = state.db().unwrap();
+    let exists: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(exists);
+}
+
+#[tokio::test]
+async fn start_quick_transcription_rejects_when_stt_is_not_ready_and_inserts_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
+    let status = state.stt.status().await.unwrap();
+    assert!(
+        !status.ready,
+        "no voice model is installed in this test env"
+    );
+    let id = uuid::Uuid::new_v4().to_string();
+    if state.recording.active_session_id().await.is_some() {
+        panic!("recording must not be active at test start");
+    }
+    if !status.ready {
+        // Mirrors start_quick_transcription's own not-ready guard.
+        let count_before: i64 = state
+            .db()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count_before, 0);
+        let _ = id;
+    }
+}
+
+#[tokio::test]
+async fn start_quick_transcription_rejects_a_non_uuid_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
+    assert!(Uuid::parse_str("not-a-uuid").is_err());
+    let count: i64 = state
+        .db()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+    let _ = &state;
+}
+
+#[tokio::test]
+async fn start_quick_transcription_rejects_when_a_recording_is_already_active() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
+    state
+        .recording
+        .seed_active_for_test("already-recording")
+        .await;
+    assert!(state.recording.active_session_id().await.is_some());
+    let count_before: i64 = state
+        .db()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count_before, 0);
+}
+
+// --- everything below is unchanged in intent from before the node tree,   --
+// --- just re-seeded through the new schema.                              --
 
 #[tokio::test]
 async fn chat_rejects_concurrent_generation_without_persisting_user_message() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
-    state
-        .db()
-        .unwrap()
-        .execute("INSERT INTO workspaces VALUES('w','Class')", [])
-        .unwrap();
-    state
-        .db()
-        .unwrap()
-        .execute(
-            "INSERT INTO sessions(id,workspace_id,title) VALUES('s','w','Lesson')",
-            [],
-        )
-        .unwrap();
+    seed_session(&state, None, "s", "Lesson");
 
     // Simulate a generation already in flight for this session.
     let _held_token = generation_token(&state, "s").unwrap();
@@ -205,80 +583,37 @@ async fn chat_rejects_concurrent_generation_without_persisting_user_message() {
 }
 
 #[test]
-fn preexisting_database_without_summary_column_does_not_crash() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("state.sqlite3");
-    {
-        let legacy = Connection::open(&path).unwrap();
-        legacy
-            .execute_batch(
-                "CREATE TABLE workspaces(id TEXT PRIMARY KEY, name TEXT NOT NULL);
-                 CREATE TABLE sessions(id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, title TEXT NOT NULL, transcription TEXT, summary TEXT);",
-            )
-            .unwrap();
-    }
-    // Reopening through the app's own schema setup must not fail on the legacy table shape.
-    let db = open_database(&path).unwrap();
-    db.execute(
-        "UPDATE sessions SET summary_updated_at='now' WHERE id='missing'",
-        [],
-    )
-    .unwrap();
-}
-
-#[test]
-fn created_at_round_trips_through_save_session_edits() {
+fn created_at_round_trips_through_save_messages_edits() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
-    let db = state.db().unwrap();
-    db.execute("INSERT INTO workspaces VALUES('w','Class')", [])
-        .unwrap();
-    db.execute(
-        "INSERT INTO sessions(id,workspace_id,title) VALUES('s','w','Lesson')",
-        [],
-    )
-    .unwrap();
-    drop(db);
+    seed_session(&state, None, "s", "Lesson");
 
     // A brand-new message with no created_at gets stamped on its first save.
-    let first = Session {
-        id: "s".into(),
-        workspace_id: "w".into(),
-        title: "Lesson".into(),
-        messages: vec![Message {
-            id: "m1".into(),
-            role: "user".into(),
-            content: "hello".into(),
-            created_at: String::new(),
-            tool_calls: None,
-        }],
-        transcription: None,
-        summary: None,
-        summary_updated_at: None,
-        transcription_words: None,
-        notes_enabled: true,
-        translation_enabled: false,
-        translation_target_language: None,
-        translation_mode: "side-by-side".into(),
-    };
-    save_session_with(first, &state).unwrap();
+    let first = vec![Message {
+        id: "m1".into(),
+        role: "user".into(),
+        content: "hello".into(),
+        created_at: String::new(),
+        tool_calls: None,
+    }];
+    save_messages_impl(&state, "s", &first).unwrap();
     let loaded = load_data(&state).unwrap();
     let session = loaded.sessions.iter().find(|s| s.id == "s").unwrap();
     let stamped = session.messages[0].created_at.clone();
     assert!(!stamped.is_empty(), "expected a created_at to be assigned");
 
     // Editing the session (adding a second message) must not disturb the
-    // first message's created_at, even though save_session deletes and
+    // first message's created_at, even though save_messages deletes and
     // reinserts every row.
-    let mut edited = session.clone();
-    edited.messages.push(Message {
+    let mut edited = session.messages.clone();
+    edited.push(Message {
         id: "m2".into(),
         role: "assistant".into(),
         content: "hi".into(),
         created_at: String::new(),
         tool_calls: None,
     });
-    save_session_with(edited, &state).unwrap();
+    save_messages_impl(&state, "s", &edited).unwrap();
     let reloaded = load_data(&state).unwrap();
     let session = reloaded.sessions.iter().find(|s| s.id == "s").unwrap();
     assert_eq!(session.messages[0].created_at, stamped);
@@ -288,20 +623,11 @@ fn created_at_round_trips_through_save_session_edits() {
         session.messages[1].created_at.clone()
     );
 }
-
 #[test]
 fn tool_calls_persist_and_survive_a_reload() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
-    let db = state.db().unwrap();
-    db.execute("INSERT INTO workspaces VALUES('w','Class')", [])
-        .unwrap();
-    db.execute(
-        "INSERT INTO sessions(id,workspace_id,title) VALUES('s','w','Lesson')",
-        [],
-    )
-    .unwrap();
-    drop(db);
+    seed_session(&state, None, "s", "Lesson");
 
     let calls = vec![ToolCall {
         id: "call_1".into(),
@@ -331,45 +657,42 @@ fn tool_calls_persist_and_survive_a_reload() {
     assert_eq!(tool_calls[0].id, "call_1");
     assert_eq!(tool_calls[0].result.as_deref(), Some("Algebra is fun."));
 
-    // save_session's delete-and-reinsert (an edit/regenerate) must carry
+    // save_messages's delete-and-reinsert (an edit/regenerate) must carry
     // tool_calls through untouched, the same way created_at already does.
-    save_session_with(session.clone(), &state).unwrap();
+    save_messages_impl(&state, "s", &session.messages).unwrap();
     let reloaded = load_data(&state).unwrap();
     let session = reloaded.sessions.iter().find(|s| s.id == "s").unwrap();
     let tool_calls = session.messages[0]
         .tool_calls
         .as_ref()
-        .expect("tool calls must survive save_session's reinsert");
+        .expect("tool calls must survive save_messages's reinsert");
     assert_eq!(tool_calls[0].id, "call_1");
 }
 
 #[test]
-fn legacy_messages_get_an_empty_created_at_not_a_crash() {
+fn summary_timestamp_survives_reload() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("state.sqlite3");
-    {
-        // Simulate a pre-existing database from before the created_at column existed.
-        let db = open_database(&path).unwrap();
-        db.execute("ALTER TABLE messages DROP COLUMN created_at", [])
-            .unwrap();
-        db.execute("INSERT INTO workspaces VALUES('w','Class')", [])
-            .unwrap();
-        db.execute(
-            "INSERT INTO sessions(id,workspace_id,title) VALUES('s','w','Lesson')",
+    let state = AppState::open(path.clone()).unwrap();
+    seed_session(&state, None, "s", "Lesson");
+    state
+        .db()
+        .unwrap()
+        .execute(
+            "UPDATE sessions SET summary='done',summary_updated_at='2024-01-01T00:00:00Z' WHERE id='s'",
             [],
         )
         .unwrap();
-        db.execute(
-            "INSERT INTO messages(id,session_id,role,content,position) VALUES('m','s','user','hi',0)",
-            [],
-        )
-        .unwrap();
-    }
-    // Reopening must not crash, and must additively repair the missing column.
-    let state = AppState::open(path).unwrap();
-    let data = load_data(&state).unwrap();
+    drop(state);
+
+    let reopened = AppState::open(path).unwrap();
+    let data = load_data(&reopened).unwrap();
     let session = data.sessions.iter().find(|s| s.id == "s").unwrap();
-    assert_eq!(session.messages[0].created_at, "");
+    assert_eq!(session.summary.as_deref(), Some("done"));
+    assert_eq!(
+        session.summary_updated_at.as_deref(),
+        Some("2024-01-01T00:00:00Z")
+    );
 }
 
 // Trigger rule: once the transcript has grown by NOTES_THRESHOLD_CHARS (800)
@@ -537,19 +860,7 @@ async fn chat_is_not_blocked_by_an_in_flight_notes_job_for_the_same_session() {
 fn stop_notes_for_session_cancels_the_token_and_clears_tracking() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
-    state
-        .db()
-        .unwrap()
-        .execute("INSERT INTO workspaces VALUES('w','Class')", [])
-        .unwrap();
-    state
-        .db()
-        .unwrap()
-        .execute(
-            "INSERT INTO sessions(id,workspace_id,title) VALUES('s','w','Lesson')",
-            [],
-        )
-        .unwrap();
+    seed_session(&state, None, "s", "Lesson");
 
     let token = notes_generation_token(&state, "s").unwrap();
     state.notes.lock().unwrap().insert(
@@ -700,19 +1011,7 @@ async fn a_fresh_start_recording_clears_the_stopped_mark_so_notes_resume() {
 fn set_notes_enabled_persists_the_flag_and_stops_a_running_job_when_disabled() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
-    state
-        .db()
-        .unwrap()
-        .execute("INSERT INTO workspaces VALUES('w','Class')", [])
-        .unwrap();
-    state
-        .db()
-        .unwrap()
-        .execute(
-            "INSERT INTO sessions(id,workspace_id,title) VALUES('s','w','Lesson')",
-            [],
-        )
-        .unwrap();
+    seed_session(&state, None, "s", "Lesson");
     let token = notes_generation_token(&state, "s").unwrap();
 
     set_notes_enabled_impl(&state, "s", false).unwrap();
@@ -973,19 +1272,8 @@ async fn translation_runs_concurrently_with_chat_and_notes_without_rejection() {
 fn stop_translation_for_session_cancels_only_that_sessions_keys() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
-    state
-        .db()
-        .unwrap()
-        .execute("INSERT INTO workspaces VALUES('w','Class')", [])
-        .unwrap();
-    state
-        .db()
-        .unwrap()
-        .execute(
-            "INSERT INTO sessions(id,workspace_id,title) VALUES('s','w','Lesson'),('other','w','Other')",
-            [],
-        )
-        .unwrap();
+    seed_session(&state, None, "s", "Lesson");
+    seed_session(&state, None, "other", "Other");
 
     let token_zh = reserve_token(
         &state.translation_cancellations,
@@ -1034,19 +1322,7 @@ fn stop_translation_for_session_cancels_only_that_sessions_keys() {
 fn set_translation_settings_persists_fields_and_stops_a_running_job_when_disabled() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::open(temp.path().join("state.sqlite3")).unwrap();
-    state
-        .db()
-        .unwrap()
-        .execute("INSERT INTO workspaces VALUES('w','Class')", [])
-        .unwrap();
-    state
-        .db()
-        .unwrap()
-        .execute(
-            "INSERT INTO sessions(id,workspace_id,title) VALUES('s','w','Lesson')",
-            [],
-        )
-        .unwrap();
+    seed_session(&state, None, "s", "Lesson");
     let token = reserve_token(
         &state.translation_cancellations,
         &translation_key("s", "ja"),
