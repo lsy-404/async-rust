@@ -920,3 +920,60 @@ fn rehearse_real_database_rejects_orphan_session() {
         "an aborted migration must leave the file byte-identical"
     );
 }
+
+/// Replays the copy step with the session summary and summary_updated_at
+/// values swapped - the exact class of column-mapping mistake
+/// verify_migration's IS-joins exist to catch - then asserts verify_migration
+/// itself rejects it. Before the fix, verify_migration never compared those
+/// columns against the backup at all, so this same swap would pass silently.
+#[test]
+fn verify_migration_catches_a_mismapped_summary_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("async.sqlite3");
+    let mut conn = open_legacy(&path, LEGACY_FULL_DDL);
+    conn.execute("INSERT INTO workspaces VALUES('w1','Course A')", [])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO sessions(id,workspace_id,title,transcription,summary,summary_updated_at,transcription_words) VALUES('s1','w1','Lesson','hi','right-summary','2024-01-01T00:00:00Z',NULL)",
+        [],
+    )
+    .unwrap();
+
+    let legacy = introspect_legacy_columns(&conn).unwrap();
+    let expected = preflight(&conn, &legacy).unwrap();
+    let backup = create_verified_backup(&conn, &path, expected).unwrap();
+    conn.execute("ATTACH DATABASE ?1 AS pre", [readonly_uri(&backup)])
+        .unwrap();
+
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Exclusive)
+        .unwrap();
+    tx.execute_batch(
+        "ALTER TABLE messages RENAME TO legacy_messages;
+         ALTER TABLE sessions RENAME TO legacy_sessions;
+         ALTER TABLE materials RENAME TO legacy_materials;
+         ALTER TABLE workspaces RENAME TO legacy_workspaces;",
+    )
+    .unwrap();
+    tx.execute_batch(SCHEMA_SQL).unwrap();
+    tx.execute_batch(
+        "INSERT INTO main.nodes(id,parent_id,parent_kind,kind,name)
+           SELECT id,NULL,NULL,'folder',name FROM legacy_workspaces;
+         INSERT INTO main.nodes(id,parent_id,parent_kind,kind,name)
+           SELECT id,workspace_id,'folder','session',title FROM legacy_sessions;",
+    )
+    .unwrap();
+    // Deliberately swapped, reproducing a col_or expression mix-up: this must
+    // be caught by the session IS-join, not slip through as a silent commit.
+    tx.execute_batch(
+        "INSERT INTO main.sessions(id,transcription,transcription_words,summary,summary_updated_at,notes_enabled,translation_enabled,translation_target_language,translation_mode)
+           SELECT id,transcription,transcription_words,summary_updated_at,summary,1,0,NULL,'side-by-side' FROM legacy_sessions;",
+    )
+    .unwrap();
+
+    let err = verify_migration(&tx, &legacy, expected).unwrap_err();
+    assert!(
+        err.contains("会话"),
+        "expected the session mismatch error, got: {err}"
+    );
+}

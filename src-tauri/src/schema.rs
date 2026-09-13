@@ -710,7 +710,7 @@ fn migrate_within_transaction(
         return Err("injected test failure after copy".into());
     }
 
-    verify_migration(&tx, expected)?;
+    verify_migration(&tx, legacy, expected)?;
 
     let fk_violations: i64 = tx
         .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
@@ -734,7 +734,23 @@ fn migrate_within_transaction(
     tx.commit().map_err(|e| e.to_string())
 }
 
-fn verify_migration(tx: &Connection, expected: MigrationCounts) -> Result<(), String> {
+/// The same present-or-default choice `col_or` makes for the copy INSERT,
+/// but qualified with `alias.` for a present column so it can be compared
+/// against the backup in a multi-table join without colliding with a
+/// same-named column on another joined table (e.g. `main.sessions.summary`).
+fn col_or_qualified(cols: &[String], name: &str, alias: &str, default_literal: &str) -> String {
+    if has_column(cols, name) {
+        format!("{alias}.{name}")
+    } else {
+        default_literal.to_string()
+    }
+}
+
+fn verify_migration(
+    tx: &Connection,
+    legacy: &LegacyColumns,
+    expected: MigrationCounts,
+) -> Result<(), String> {
     let MigrationCounts {
         folders,
         sessions,
@@ -763,13 +779,37 @@ fn verify_migration(tx: &Connection, expected: MigrationCounts) -> Result<(), St
         return Err("迁移后的文件夹数量或内容与源数据不一致。".into());
     }
 
+    let summary_pre = col_or_qualified(&legacy.sessions_cols, "summary", "o", "NULL");
+    let sua_pre = col_or_qualified(&legacy.sessions_cols, "summary_updated_at", "o", "NULL");
+    let tw_pre = col_or_qualified(&legacy.sessions_cols, "transcription_words", "o", "NULL");
+    let notes_pre = col_or_qualified(&legacy.sessions_cols, "notes_enabled", "o", "1");
+    let trenabled_pre = col_or_qualified(&legacy.sessions_cols, "translation_enabled", "o", "0");
+    let trlang_pre = col_or_qualified(
+        &legacy.sessions_cols,
+        "translation_target_language",
+        "o",
+        "NULL",
+    );
+    let trmode_pre = col_or_qualified(
+        &legacy.sessions_cols,
+        "translation_mode",
+        "o",
+        "'side-by-side'",
+    );
     let session_match: i64 = tx
         .query_row(
-            "SELECT count(*) FROM pre.sessions o
-               JOIN main.nodes n ON n.id=o.id
-               JOIN main.sessions s ON s.id=o.id
-               WHERE n.kind='session' AND n.parent_id IS o.workspace_id AND n.parent_kind='folder'
-                 AND n.name IS o.title AND s.transcription IS o.transcription",
+            &format!(
+                "SELECT count(*) FROM pre.sessions o
+                   JOIN main.nodes n ON n.id=o.id
+                   JOIN main.sessions s ON s.id=o.id
+                   WHERE n.kind='session' AND n.parent_id IS o.workspace_id AND n.parent_kind='folder'
+                     AND n.name IS o.title AND s.transcription IS o.transcription
+                     AND s.summary IS {summary_pre} AND s.summary_updated_at IS {sua_pre}
+                     AND s.transcription_words IS {tw_pre} AND s.notes_enabled IS {notes_pre}
+                     AND s.translation_enabled IS {trenabled_pre}
+                     AND s.translation_target_language IS {trlang_pre}
+                     AND s.translation_mode IS {trmode_pre}"
+            ),
             [],
             |r| r.get(0),
         )
@@ -816,17 +856,25 @@ fn verify_migration(tx: &Connection, expected: MigrationCounts) -> Result<(), St
         return Err("迁移后的材料数量或内容与源数据不一致。".into());
     }
 
+    let created_at_pre = col_or_qualified(&legacy.messages_cols, "created_at", "o", "''");
+    let tool_calls_pre = col_or_qualified(&legacy.messages_cols, "tool_calls", "o", "NULL");
     let message_match: i64 = tx
         .query_row(
-            "SELECT count(*) FROM pre.messages o
-               JOIN main.messages m ON m.id=o.id
-               WHERE m.session_id IS o.session_id AND m.position IS o.position
-                 AND m.role IS o.role AND m.content IS o.content",
+            &format!(
+                "SELECT count(*) FROM pre.messages o
+                   JOIN main.messages m ON m.id=o.id
+                   WHERE m.session_id IS o.session_id AND m.position IS o.position
+                     AND m.role IS o.role AND m.content IS o.content
+                     AND m.created_at IS {created_at_pre} AND m.tool_calls IS {tool_calls_pre}"
+            ),
             [],
             |r| r.get(0),
         )
         .map_err(|e| e.to_string())?;
-    if message_match != messages {
+    let message_total: i64 = tx
+        .query_row("SELECT count(*) FROM main.messages", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if message_match != messages || message_total != messages {
         return Err("迁移后的消息数量或内容与源数据不一致。".into());
     }
 
