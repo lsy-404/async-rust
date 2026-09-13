@@ -612,6 +612,59 @@ async fn transcript_append_after_stop_sweep_never_starts_a_notes_job() {
     assert!(session.summary.is_none());
 }
 
+// The gap the sweep-vs-append test above does not cover: a stop that lands
+// strictly *after* `on_transcript_appended` has already committed
+// `running = true` under `state.notes` and released that lock, but strictly
+// *before* `generate_notes_impl` registers its own token in the separate
+// `notes_cancellations` map. `stop_notes_for_session` finds nothing there to
+// cancel, so without a re-check inside `generate_notes_impl` itself the round
+// would run to completion and overwrite whatever the stop was meant to freeze
+// (the explicit Generate result, or the session's final post-stop state).
+#[tokio::test]
+async fn a_stop_landing_between_running_commit_and_token_registration_still_wins() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::open(dir.path().join("state.sqlite3")).unwrap();
+    seed_notes_fixture(&state, &server.uri());
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(sse_answer("Notes."), "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+
+    // The exact state on_transcript_appended leaves behind right after
+    // committing to run a round and releasing the `state.notes` lock, before
+    // calling generate_notes_impl.
+    state
+        .notes
+        .lock()
+        .unwrap()
+        .entry("s".to_string())
+        .or_default()
+        .running = true;
+    // stop_recording (or the explicit Generate button) sweeps in that gap:
+    // `notes_cancellations` is still empty, so there is nothing to cancel yet.
+    stop_notes_for_session(&state, "s");
+
+    let channel = Channel::<StreamEvent>::new(|_| Ok(()));
+    generate_notes_impl(&state, "s", "some transcript chunk", channel)
+        .await
+        .unwrap();
+
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "a round that lost the race in this gap must bail before spending a model call"
+    );
+    let (session, _, _) = session_context(&state, "s").unwrap();
+    assert!(
+        session.summary.is_none(),
+        "a round stopped in the running/token-registration gap must never persist notes"
+    );
+}
+
 // The other half of the same fix: a `stopped` mark must not be permanent -
 // the next start_recording (exercised here as it does, by clearing the
 // tracker entry) lets the notes job resume normally.

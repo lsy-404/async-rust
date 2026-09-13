@@ -142,6 +142,7 @@ export default {
       separate: "Split",
       translating: "Translating…",
       needsProvider: "Connect a model to enable translation",
+      error: "Translation failed, retrying…",
     },
   },
   stt: {

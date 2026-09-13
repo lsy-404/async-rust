@@ -115,6 +115,16 @@ function translationKey(targetLanguage: string, sentence: string): string {
 }
 const sentenceTranslations = reactive<Record<string, string>>({});
 const translatingKeys = reactive<Set<string>>(new Set());
+// Set from a `translation-status` event's `error`, keyed by session+target
+// language so switching either never shows another pair's stale failure;
+// cleared by the next error-free event for that same pair. Mirrors
+// notesStatusBySession's "error" state for the identical failure mode: a
+// batch keeps failing and retrying in the background with nothing in the UI
+// to show it.
+const translationErrorBySession = reactive<Record<string, string>>({});
+function translationStatusKey(sessionId: string, targetLanguage: string): string {
+  return `${sessionId}${TRANSLATION_KEY_SEP}${targetLanguage}`;
+}
 let unlistenTranslationStatus: UnlistenFn | undefined;
 const transcriptionLoading = ref(false);
 const stt = ref<SttStatus>({
@@ -289,6 +299,12 @@ const currentTranslatingSentences = computed<Set<string>>(() => {
     if (key.startsWith(prefix)) out.add(key.slice(prefix.length));
   }
   return out;
+});
+const translationError = computed<string | undefined>(() => {
+  if (!session.value) return undefined;
+  return translationErrorBySession[
+    translationStatusKey(session.value.id, translationTargetLanguage.value)
+  ];
 });
 async function setTranslationSettings(
   partial: Partial<{
@@ -1218,6 +1234,12 @@ onMounted(() => {
     for (const [sentence, translation] of Object.entries(payload.translations)) {
       sentenceTranslations[translationKey(payload.targetLanguage, sentence)] = translation;
     }
+    const statusKey = translationStatusKey(payload.sessionId, payload.targetLanguage);
+    if (payload.error) {
+      translationErrorBySession[statusKey] = payload.error;
+    } else {
+      delete translationErrorBySession[statusKey];
+    }
   })
     .then((unlisten) => {
       unlistenTranslationStatus = unlisten;
@@ -1430,6 +1452,7 @@ onUnmounted(() => {
               :translation-target-language="translationTargetLanguage"
               :translation-mode="translationMode"
               :translator-ready="providerConnected"
+              :translation-error="translationError"
               :sentence-translations="currentSentenceTranslations"
               :translating-sentences="currentTranslatingSentences"
               @upload-audio="uploadAudio"

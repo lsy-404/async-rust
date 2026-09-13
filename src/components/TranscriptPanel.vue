@@ -31,6 +31,10 @@ const props = defineProps<{
   // Whether a language model is configured to actually run a translation
   // request right now (distinct from the toggle itself being on).
   translatorReady: boolean;
+  // Set once the current session+target-language pair's last translation
+  // batch failed; the backend keeps retrying with backoff, so this is a
+  // "still failing" notice rather than a terminal error.
+  translationError?: string;
   // Keyed by the exact source sentence text, not by index.
   sentenceTranslations: Record<string, string>;
   translatingSentences: Set<string>;
@@ -224,6 +228,9 @@ function formatTime(seconds: number): string {
         </div>
         <span v-if="!translatorReady" class="transcript-translate-status">{{
           t("transcript.translate.needsProvider")
+        }}</span>
+        <span v-else-if="translationError" class="transcript-translate-status">{{
+          t("transcript.translate.error")
         }}</span>
       </template>
     </div>

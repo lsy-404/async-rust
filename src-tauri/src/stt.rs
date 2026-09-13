@@ -142,8 +142,9 @@ fn simplified_converter() -> &'static OpenCC {
 }
 
 // Fraction of non-whitespace, non-punctuation characters that are CJK Unified
-// Ideographs; used to recognise auto-detected Chinese output by its script.
-fn cjk_ratio(text: &str) -> f32 {
+// Ideographs, alongside how many such characters were scanned; used to
+// recognise auto-detected Chinese output by its script.
+fn cjk_ratio(text: &str) -> (f32, usize) {
     let mut total = 0usize;
     let mut cjk = 0usize;
     for ch in text.chars() {
@@ -156,9 +157,9 @@ fn cjk_ratio(text: &str) -> f32 {
         }
     }
     if total == 0 {
-        0.0
+        (0.0, 0)
     } else {
-        cjk as f32 / total as f32
+        (cjk as f32 / total as f32, total)
     }
 }
 
@@ -169,9 +170,26 @@ fn contains_kana(text: &str) -> bool {
     text.chars().any(|ch| ('\u{3040}'..='\u{30FF}').contains(&ch))
 }
 
+// A recognizer VAD segment is often a single short phrase, and a kanji-heavy
+// Japanese one (a proper noun, a title, a terse instruction) can easily go
+// this many characters without a single kana; continuous Japanese speech
+// practically never does. So under auto-detect, the CJK-ratio/no-kana
+// heuristic only fires past this length, where absence of kana is actually
+// informative.
+const MIN_AUTO_DETECT_CJK_CHARS: usize = 12;
+
 fn should_normalize_chinese_script(text: &str, requested_language: &str) -> bool {
-    !contains_kana(text)
-        && (requested_language == "zh" || (requested_language.is_empty() && cjk_ratio(text) > 0.5))
+    if contains_kana(text) {
+        return false;
+    }
+    if requested_language == "zh" {
+        return true;
+    }
+    if !requested_language.is_empty() {
+        return false;
+    }
+    let (ratio, total) = cjk_ratio(text);
+    ratio > 0.5 && total >= MIN_AUTO_DETECT_CJK_CHARS
 }
 
 // Single point where recognised segment text leaves this module on both the

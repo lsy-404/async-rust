@@ -140,6 +140,7 @@ export default {
       separate: "分栏",
       translating: "翻译中…",
       needsProvider: "连接模型后可启用翻译",
+      error: "翻译失败，正在自动重试…",
     },
   },
   stt: {

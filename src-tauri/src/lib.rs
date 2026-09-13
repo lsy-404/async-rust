@@ -971,6 +971,17 @@ fn notes_generation_token(state: &AppState, session_id: &str) -> Result<Cancella
         "该会话已有笔记生成任务。",
     )
 }
+/// Reads the shared `stopped` flag directly, for a round that must re-check it
+/// after the gap between `on_transcript_appended` releasing `state.notes` and
+/// this round registering its own cancellation token (see `generate_notes_impl`).
+fn notes_stopped(state: &AppState, session_id: &str) -> bool {
+    state
+        .notes
+        .lock()
+        .ok()
+        .and_then(|jobs| jobs.get(session_id).map(|entry| entry.stopped))
+        .unwrap_or(false)
+}
 fn stop_notes_for_session(state: &AppState, session_id: &str) {
     if let Ok(mut jobs) = state.notes.lock() {
         // Marked under this same lock so a transcript append racing this
@@ -1195,6 +1206,20 @@ async fn generate_notes_impl(
 ) -> Result<(), String> {
     let (session, _, _) = session_context(state, session_id)?;
     let token = notes_generation_token(state, session_id)?;
+    // `on_transcript_appended` commits `running=true` under `state.notes` and
+    // releases that lock before this call reserves its own token in the
+    // separate `notes_cancellations` map, so a `stop_notes_for_session` landing
+    // in that gap finds no token to cancel. Re-check the flag directly here so
+    // the round bails out before spending a model call on a session that was
+    // stopped out from under it.
+    if notes_stopped(state, session_id) {
+        state
+            .notes_cancellations
+            .lock()
+            .map_err(|_| "笔记生成状态不可用。")?
+            .remove(session_id);
+        return Ok(());
+    }
     let mut user_content = String::new();
     if let Some(existing) = session.summary.as_deref().filter(|s| !s.trim().is_empty()) {
         user_content.push_str("Notes so far:\n");
@@ -1214,7 +1239,26 @@ async fn generate_notes_impl(
         .map_err(|_| "笔记生成状态不可用。")?
         .remove(session_id);
     let (notes, _) = result?;
-    persist_notes(state, session_id, &notes)
+    persist_notes_unless_stopped(state, session_id, &notes)
+}
+/// Re-checks `stopped` and writes the notes while still holding `state.notes`,
+/// the same lock `stop_notes_for_session` takes to set that flag, so a stop
+/// landing after the model call finishes still wins the write instead of
+/// racing this round's `persist_notes` (see `generate_notes_impl`).
+fn persist_notes_unless_stopped(
+    state: &AppState,
+    session_id: &str,
+    notes: &str,
+) -> Result<(), String> {
+    let jobs = state.notes.lock().map_err(|_| "笔记生成状态不可用。")?;
+    if jobs
+        .get(session_id)
+        .map(|entry| entry.stopped)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    persist_notes(state, session_id, notes)
 }
 /// Fires once per notes round so the caller can push a "notes-status" event
 /// to the frontend without polling the database.

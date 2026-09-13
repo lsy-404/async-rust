@@ -651,6 +651,21 @@ fn chinese_script_normalization_leaves_japanese_untouched() {
 }
 
 #[test]
+fn chinese_script_normalization_leaves_a_short_kanji_only_auto_detected_segment_untouched() {
+    // A single VAD segment is often just one short phrase, and a kanji-heavy
+    // Japanese one (a proper noun, a title, a terse instruction) can easily go
+    // this short without a single kana -- unlike the longer sample above, so
+    // ratio-and-no-kana alone would still mistake it for auto-detected
+    // Chinese and run it through a Traditional-to-Simplified table meant only
+    // for Chinese.
+    let short_japanese_title = "東京都議会"; // "Tokyo Metropolitan Assembly", no kana at all.
+    assert_eq!(
+        normalize_chinese_script(short_japanese_title, ""),
+        short_japanese_title
+    );
+}
+
+#[test]
 fn chinese_script_normalization_leaves_english_and_other_languages_untouched() {
     assert_eq!(
         normalize_chinese_script("hello world", ""),

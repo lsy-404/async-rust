@@ -494,4 +494,55 @@ describe("desktop workbench interactions", () => {
     expect(wrapper.text()).not.toContain("翻译中");
     wrapper.unmount();
   });
+
+  it("surfaces a translation-status event's error instead of silently clearing the translating state", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "load_state") return structuredClone(data);
+      if (command === "stt_status")
+        return { ready: true, modelName: "fixture", modelPath: "/tmp/model", sizeBytes: 1 };
+      if (command === "queue_sentence_translations") return {};
+      return undefined;
+    });
+    data.sessions[0]!.transcription = "Fresh.";
+    const wrapper = mountApp();
+    await flushPromises();
+    await wrapper.get('button[role="switch"]').trigger("click");
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("翻译中");
+    expect(wrapper.text()).not.toContain("翻译失败");
+
+    const handler = listen.mock.calls.find(
+      ([name]) => name === "translation-status",
+    )![1];
+    handler({
+      payload: {
+        sessionId: "s1",
+        targetLanguage: "zh",
+        sentences: ["Fresh."],
+        translations: {},
+        error: "provider unavailable",
+      },
+    });
+    await nextTick();
+    // The "translating…" indicator must not just vanish with nothing to show
+    // for it: a failed batch surfaces its own status instead.
+    expect(wrapper.text()).not.toContain("翻译中");
+    expect(wrapper.text()).toContain("翻译失败");
+
+    // A later successful batch for the same pair clears the error again.
+    handler({
+      payload: {
+        sessionId: "s1",
+        targetLanguage: "zh",
+        sentences: ["Fresh."],
+        translations: { "Fresh.": "全新翻译。" },
+        error: null,
+      },
+    });
+    await nextTick();
+    expect(wrapper.text()).not.toContain("翻译失败");
+    expect(wrapper.text()).toContain("全新翻译。");
+    wrapper.unmount();
+  });
 });
