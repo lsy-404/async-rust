@@ -225,13 +225,13 @@ describe("desktop workbench interactions", () => {
     await openSessionNode(wrapper, "Lesson");
     await buttonWithText(wrapper, "下载本地转写模型").trigger("click");
     await flushPromises();
-    const progress = wrapper.get("progress.fluent-progress-bar");
-    expect(progress.attributes("value")).toBe("25");
+    const progress = wrapper.get(".fluent-progress-bar");
+    expect(progress.attributes("aria-valuenow")).toBe("25");
     expect(progress.attributes("aria-label")).toBe("本地语音模型下载进度");
     await buttonWithText(wrapper, "取消下载").trigger("click");
     await flushPromises();
     expect(invoke).toHaveBeenCalledWith("cancel_stt_download");
-    expect(wrapper.find("progress.fluent-progress-bar").exists()).toBe(false);
+    expect(wrapper.find(".fluent-progress-bar").exists()).toBe(false);
     wrapper.unmount();
   });
 
