@@ -21,21 +21,21 @@ Async 是一个桌面端课堂工作台，支持：
 需要 Node.js 22.12+、Rust stable 和对应系统的 [Tauri 开发依赖](https://v2.tauri.app/start/prerequisites/)。
 
 ```sh
-npm ci
-npm run tauri dev
+pnpm install --frozen-lockfile
+pnpm run tauri dev
 ```
 
-`npm run dev` 只启动前端开发服务。文件、凭据和模型操作通过 Tauri 的 Rust 宿主执行，请使用桌面程序完成工作。
+`pnpm run dev` 只启动前端开发服务。文件、凭据和模型操作通过 Tauri 的 Rust 宿主执行，请使用桌面程序完成工作。
 
 ## 常用脚本
 
 ```sh
-npm run build
-npm run typecheck
-npm test
+pnpm run build
+pnpm run typecheck
+pnpm test
 cargo test --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-npm run tauri build
+pnpm run tauri build
 ```
 
 ## 仓库文档

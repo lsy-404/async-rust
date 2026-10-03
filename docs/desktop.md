@@ -20,16 +20,16 @@ API Key 与 OAuth 凭据明文存入应用私有目录的凭据文件，采用�
 安装 Node.js 22.12+、Rust stable 和系统 Tauri 开发依赖后运行：
 
 ```sh
-npm ci
-npm run tauri dev
+pnpm install --frozen-lockfile
+pnpm run tauri dev
 ```
 
 ```sh
-npm run build
-npm test
+pnpm run build
+pnpm test
 cargo test --locked --manifest-path src-tauri/Cargo.toml --all-targets
 cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-npm run tauri build
+pnpm run tauri build
 ```
 
 真实语音模型验收测试需要下载公开模型与音频夹具：

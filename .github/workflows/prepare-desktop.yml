@@ -22,10 +22,13 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.6
       - uses: actions/setup-node@v6
         with:
           node-version: "22.19.0"
-          cache: npm
+          cache: pnpm
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -57,13 +60,13 @@ jobs:
         env:
           RELEASE_BUILD: ${{ inputs.release }}
       - name: Install frontend dependencies
-        run: npm ci --no-audit --no-fund
+        run: pnpm install --frozen-lockfile
       - name: Build frontend
-        run: npm run build
+        run: pnpm run build
       - name: Typecheck frontend
-        run: npm run typecheck
+        run: pnpm run typecheck
       - name: Test frontend
-        run: npm test
+        run: pnpm test
       - name: Check Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
       - uses: actions/upload-artifact@v4
@@ -74,7 +77,8 @@ jobs:
           path: |
             dist
             package.json
-            package-lock.json
+            pnpm-lock.yaml
+            pnpm-workspace.yaml
             src-tauri/Cargo.toml
             src-tauri/Cargo.lock
             src-tauri/tauri.conf.json
