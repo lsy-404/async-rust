@@ -11,8 +11,8 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@model-auth/vue": "https://github.com/lsy-404/platform-kit/releases/download/v0.6.1/model-auth-vue-0.6.1.tgz",
-    "@platform-kit/fluent": "https://github.com/lsy-404/platform-kit/releases/download/v0.6.4/platform-kit-fluent-0.2.3.tgz",
+    "@model-auth/vue": "https://github.com/lsy-404/platform-kit/releases/download/model-auth-vue-v0.10.3/model-auth-vue-0.10.3.tgz",
+    "@platform-kit/fluent": "https://github.com/lsy-404/platform-kit/releases/download/fluent-v0.2.10/platform-kit-fluent-0.2.10.tgz",
     "@tauri-apps/api": "^2.8.0",
     "@tauri-apps/plugin-dialog": "^2.4.0",
     "katex": "^0.16.47",

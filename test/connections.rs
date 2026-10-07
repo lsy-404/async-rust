@@ -46,7 +46,7 @@ fn provider_ownership_and_method_are_enforced_before_secret_mutation() {
     let (_dir, state) = setup();
     let a = add(&state, "a", 1);
     assert!(get(&state, "second", &a.id).is_err());
-    assert!(update(&state, "second", &a.id, false, 1).is_err());
+    assert!(edit(&state, "second", &a.id, false, None, None).is_err());
     assert!(remove(&state, "first", &a.id, "oauth").is_err());
     assert!(remove(&state, "second", &a.id, "api-key").is_err());
     let mut wrong = a.clone();
@@ -56,8 +56,8 @@ fn provider_ownership_and_method_are_enforced_before_secret_mutation() {
         state.key(&a.id).unwrap().get_password().unwrap(),
         "secret-a"
     );
-    assert!(update(&state, "first", &a.id, true, 0).is_err());
-    assert!(update(&state, "first", &a.id, true, 101).is_err());
+    assert!(edit(&state, "first", &a.id, true, Some(""), None).is_err());
+    assert!(edit(&state, "first", &a.id, true, Some(&"a".repeat(81)), None).is_err());
 }
 #[test]
 fn round_robin_persists_position_and_failover_preserves_order() {
@@ -98,7 +98,7 @@ fn eligibility_filters_disabled_unhealthy_cooling_models_and_oauth_toggle() {
     let (_dir, state) = setup();
     let a = add(&state, "a", 1);
     let b = add(&state, "b", 1);
-    update(&state, "first", &a.id, false, 1).unwrap();
+    edit(&state, "first", &a.id, false, None, None).unwrap();
     assert_eq!(candidates(&state, "first", "model").unwrap()[0].id, b.id);
     report_error(&state, "first", &b.id, Failure::Temporary).unwrap();
     assert!(candidates(&state, "first", "model").unwrap().is_empty());

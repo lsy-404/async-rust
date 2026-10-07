@@ -68,7 +68,8 @@ struct CredentialPayload {
     provider_id: String,
     credential_id: String,
     enabled: bool,
-    weight: u32,
+    label: Option<String>,
+    extend: Option<serde_json::Map<String, Value>>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -111,6 +112,13 @@ enum Action {
     UpdateCredential {
         payload: CredentialPayload,
     },
+    ReorderCredentials {
+        #[serde(rename = "providerId")]
+        provider_id: String,
+        method: String,
+        #[serde(rename = "credentialIds")]
+        credential_ids: Vec<String>,
+    },
     UpdateProvider {
         payload: ProviderPayload,
     },
@@ -142,13 +150,21 @@ fn auth_state(state: &AppState) -> Result<Value, String> {
         let oauth_credentials: Vec<_> = credentials
             .iter()
             .filter(|item| item.auth_method == "oauth")
-            .map(Credential::view)
-            .collect();
+            .map(|item| {
+                let mut view = item.view();
+                view["extend"] = connections::extend(state, &item.id)?;
+                Ok(view)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let api_credentials: Vec<_> = credentials
             .iter()
             .filter(|item| item.auth_method == "api-key")
-            .map(Credential::view)
-            .collect();
+            .map(|item| {
+                let mut view = item.view();
+                view["extend"] = connections::extend(state, &item.id)?;
+                Ok(view)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let method = if oauth::is_oauth(&provider.id) {
             "oauth"
         } else {
@@ -277,13 +293,19 @@ async fn execute_action(
             credential_id,
             auth_method,
         } => connections::remove(state, &provider_id, &credential_id, &auth_method),
-        Action::UpdateCredential { payload } => connections::update(
+        Action::UpdateCredential { payload } => connections::edit(
             state,
             &payload.provider_id,
             &payload.credential_id,
             payload.enabled,
-            payload.weight,
+            payload.label.as_deref(),
+            payload.extend.as_ref(),
         ),
+        Action::ReorderCredentials {
+            provider_id,
+            method,
+            credential_ids,
+        } => connections::reorder(state, &provider_id, &method, &credential_ids),
         Action::UpdateProvider { payload } => {
             if !oauth::is_oauth(&payload.provider_id) {
                 return Err("此供应商不支持 OAuth 开关。".into());

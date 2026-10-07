@@ -25,7 +25,7 @@ const initialState = (): ModelAuthState => ({
       authMethods: ["oauth", "api-key"],
       available: true,
       oauthEnabled: true,
-      loadStrategy: "weighted-round-robin",
+      loadStrategy: "round-robin",
       models: ["classroom-a", "classroom-b"],
       apiKeyModels: ["classroom-a"],
       oauthModels: ["classroom-b"],
@@ -35,7 +35,7 @@ const initialState = (): ModelAuthState => ({
           label: "First key",
           healthy: true,
           enabled: true,
-          weight: 2,
+
           models: ["classroom-a"],
         },
         {
@@ -43,7 +43,7 @@ const initialState = (): ModelAuthState => ({
           label: "Second key",
           healthy: false,
           enabled: false,
-          weight: 4,
+
           models: ["classroom-a"],
           cooldownUntilUtc: "2030-01-01T00:00:00Z",
         },
@@ -55,13 +55,12 @@ const initialState = (): ModelAuthState => ({
           account: "fixture-account",
           healthy: true,
           enabled: true,
-          weight: 3,
+
           models: ["classroom-b"],
         },
       ],
     },
   ],
-  model: { providerId: "fixture", model: "classroom-a" },
   catalogStatus: { state: "error", source: "cached", error: "offline" },
 });
 
@@ -118,11 +117,10 @@ describe("complete shared model authentication UI", () => {
     await mountConnections();
     const panel = wrapper.getComponent(ModelConnectionPanel);
     expect(panel.props("providers")).toEqual(state.providers);
-    expect(panel.props("model")).toEqual(state.model);
     expect(panel.props("theme")).toBe("dark");
+    await wrapper.get('[data-auth-method="api-key"] [data-part="toggle-connection"]').trigger("click");
     expect(wrapper.findAll('[data-part="connection-account"]')).toHaveLength(3);
     expect(wrapper.text()).toContain("Second key");
-    expect(wrapper.text()).toContain("加权轮询");
     await manage("oauth");
     const dialog = wrapper.getComponent(ModelAuthDialog);
     expect(dialog.props("initialConnection")).toEqual({
@@ -136,68 +134,38 @@ describe("complete shared model authentication UI", () => {
     expect(wrapper.find('[data-part="method-list"]').exists()).toBe(false);
     await wrapper.get('[data-part="close"]').trigger("click");
     await flushPromises();
+    await new Promise((resolve) => setTimeout(resolve, 250));
     await wrapper.get('[data-part="add-connection"]').trigger("click");
     await flushPromises();
     expect(dialog.props("initialConnection")).toBeNull();
-    expect(wrapper.get('[data-part="method-list"]').text()).toContain(
-      "API Key",
-    );
+    expect(wrapper.find('[data-part="method-list"]').exists()).toBe(false);
+    expect(wrapper.get('[part="provider-list"]').text()).toContain("API Key");
   });
 
-  it("uses real credential controls, native strategy action and confirmed individual removal", async () => {
+  it("updates and reorders credentials and confirms individual removal", async () => {
     await mountConnections();
     await manage("api-key");
     await wrapper.get('input[aria-label="启用 First key"]').setValue(false);
     await flushPromises();
-    await wrapper.get('input[aria-label="权重 Second key"]').setValue("7");
+    await wrapper.get('[data-part="move-down"]').trigger("click");
     await flushPromises();
     const row = wrapper.findAll('[data-part="api-key-credential"]')[1]!;
     await row.get("button[data-confirmed]").trigger("click");
     expect(actions()).toHaveLength(2);
     await row.get("button[data-confirmed]").trigger("click");
     await flushPromises();
-    await wrapper.get('[aria-label="负载策略"]').trigger("click");
-    await flushPromises();
-    await wrapper.get('[role="option"]').trigger("click");
-    await flushPromises();
     expect(actions()).toEqual([
-      {
-        type: "update-credential",
-        payload: {
-          providerId: "fixture",
-          credentialId: "key-first",
-          enabled: false,
-          weight: 2,
-        },
-      },
-      {
-        type: "update-credential",
-        payload: {
-          providerId: "fixture",
-          credentialId: "key-second",
-          enabled: false,
-          weight: 7,
-        },
-      },
-      {
-        type: "remove-credential",
-        providerId: "fixture",
-        credentialId: "key-second",
-        authMethod: "api-key",
-      },
-      {
-        type: "update-strategy",
-        payload: { providerId: "fixture", strategy: "round-robin" },
-      },
+      { type: "update-credential", payload: { providerId: "fixture", credentialId: "key-first", enabled: false } },
+      { type: "reorder-credentials", providerId: "fixture", method: "api-key", credentialIds: ["key-second", "key-first"] },
+      { type: "remove-credential", providerId: "fixture", credentialId: "key-second", authMethod: "api-key" },
     ]);
-    expect(refreshWorkbench).toHaveBeenCalledTimes(4);
+    expect(refreshWorkbench).toHaveBeenCalledTimes(3);
   });
 
   it("submits a labeled API key through the real form and clears its input", async () => {
     await mountConnections();
     await wrapper.get('[data-part="add-connection"]').trigger("click");
-    await wrapper.get('[data-part="method-api-key"]').trigger("click");
-    await wrapper.get('[part="provider-row"]').trigger("click");
+    await wrapper.get('[part="provider-row"][data-auth-method="api-key"]').trigger("click");
     await wrapper.get('input[aria-label="标签（可选）"]').setValue("Extra key");
     await wrapper.get('input[aria-label="API Key"]').setValue("fixture-secret");
     expect(wrapper.text()).toContain("本机应用数据目录的文件");
@@ -219,66 +187,20 @@ describe("complete shared model authentication UI", () => {
     ]);
   });
 
-  it("forwards OAuth provider toggles, refresh and account removal using the kit host listeners", async () => {
+  it("refreshes and renames a saved account without exposing obsolete model controls", async () => {
     await mountConnections();
     await wrapper.get('[data-part="refresh-connections"]').trigger("click");
     await flushPromises();
     await manage("oauth");
-    await wrapper
-      .get('input[aria-label="启用此提供商的 OAuth"]')
-      .setValue(false);
-    await flushPromises();
-    const row = wrapper.get('[data-part="oauth-credential"]');
-    await row.get("button[data-confirmed]").trigger("click");
-    await row.get("button[data-confirmed]").trigger("click");
+    await wrapper.get('[data-part="credential-label"]').setValue("Renamed account");
+    await wrapper.get('[data-part="save-label"]').trigger("click");
     await flushPromises();
     expect(actions()).toEqual([
       { type: "refresh-catalog" },
-      {
-        type: "update-provider",
-        payload: { providerId: "fixture", oauthEnabled: false },
-      },
-      {
-        type: "remove-credential",
-        providerId: "fixture",
-        credentialId: "account-first",
-        authMethod: "oauth",
-      },
+      { type: "update-credential", payload: { providerId: "fixture", credentialId: "account-first", enabled: true, label: "Renamed account" } },
     ]);
+    expect(wrapper.find('[data-part="model-row"]').exists()).toBe(false);
     expect(wrapper.getComponent(ModelAuthDialog).props("open")).toBe(true);
-  });
-
-  it("persists a real shared model choice and keeps connection controls open", async () => {
-    invoke.mockImplementation(async (command, args) => {
-      if (
-        command === "model_auth_action" &&
-        args.action.type === "select-model"
-      ) {
-        state.model = args.action.payload;
-      }
-      if (command === "get_auth_state") return structuredClone(state);
-    });
-    await mountConnections();
-    await manage("oauth");
-    const choice = wrapper.get(
-      '[data-part="model-row"][data-model-id="classroom-b"]',
-    );
-    expect(choice.attributes("aria-pressed")).toBe("false");
-    await choice.trigger("click");
-    await flushPromises();
-    expect(actions()).toEqual([
-      {
-        type: "select-model",
-        payload: { providerId: "fixture", model: "classroom-b" },
-      },
-    ]);
-    expect(refreshWorkbench).toHaveBeenCalledOnce();
-    expect(wrapper.getComponent(ModelConnectionPanel).props("model")).toEqual(
-      state.model,
-    );
-    expect(choice.attributes("aria-pressed")).toBe("true");
-    expect(wrapper.getComponent(ModelAuthDialog).props("open")).toBe(true);
-    expect(wrapper.find('[aria-label="负载策略"]').exists()).toBe(true);
   });
 
   it.each(["close", "cancel", "unmount"])(
@@ -301,6 +223,7 @@ describe("complete shared model authentication UI", () => {
           rejectAction(new Error("cancelled"));
         return Promise.resolve();
       });
+      state.providers[0]!.oauthCredentials![0]!.healthy = false;
       await mountConnections();
       await manage("oauth");
       await button("重连").trigger("click");
@@ -328,8 +251,7 @@ describe("complete shared model authentication UI", () => {
   it("opens a new OAuth authorization and retains existing native state on failure", async () => {
     await mountConnections();
     await wrapper.get('[data-part="add-connection"]').trigger("click");
-    await wrapper.get('[data-part="method-oauth"]').trigger("click");
-    await wrapper.get('[part="provider-row"]').trigger("click");
+    await wrapper.get('[part="provider-row"][data-auth-method="oauth"]').trigger("click");
     invoke.mockImplementation(async (command) => {
       if (command === "model_auth_action") throw new Error("provider rejected");
       return structuredClone(state);

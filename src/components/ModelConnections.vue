@@ -71,7 +71,6 @@ defineExpose({ refresh });
 <template>
   <ModelConnectionPanel
     :providers="auth.state.value.providers"
-    :model="auth.state.value.model"
     :busy="auth.busy.value"
     :error="auth.error.value"
     :theme="theme"

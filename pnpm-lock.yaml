@@ -9,11 +9,11 @@ importers:
   .:
     dependencies:
       '@model-auth/vue':
-        specifier: https://github.com/lsy-404/platform-kit/releases/download/v0.6.1/model-auth-vue-0.6.1.tgz
-        version: https://github.com/lsy-404/platform-kit/releases/download/v0.6.1/model-auth-vue-0.6.1.tgz(vue@3.5.42(typescript@5.9.3))
+        specifier: https://github.com/lsy-404/platform-kit/releases/download/model-auth-vue-v0.10.3/model-auth-vue-0.10.3.tgz
+        version: https://github.com/lsy-404/platform-kit/releases/download/model-auth-vue-v0.10.3/model-auth-vue-0.10.3.tgz(vue@3.5.42(typescript@5.9.3))
       '@platform-kit/fluent':
-        specifier: https://github.com/lsy-404/platform-kit/releases/download/v0.6.4/platform-kit-fluent-0.2.3.tgz
-        version: https://github.com/lsy-404/platform-kit/releases/download/v0.6.4/platform-kit-fluent-0.2.3.tgz(vue@3.5.42(typescript@5.9.3))
+        specifier: https://github.com/lsy-404/platform-kit/releases/download/fluent-v0.2.10/platform-kit-fluent-0.2.10.tgz
+        version: https://github.com/lsy-404/platform-kit/releases/download/fluent-v0.2.10/platform-kit-fluent-0.2.10.tgz(vue@3.5.42(typescript@5.9.3))
       '@tauri-apps/api':
         specifier: ^2.8.0
         version: 2.11.1
@@ -318,9 +318,9 @@ packages:
   '@jridgewell/sourcemap-codec@1.6.0':
     resolution: {integrity: sha512-T7jf+5zgsZHwNJ4lvQ7/aezbyk0nNX+zJVWpmHA7VYsEx7a7qr5Rg5IbtJFqkgze5Y2sruq1RUY8Q837Od7iFw==}
 
-  '@model-auth/vue@https://github.com/lsy-404/platform-kit/releases/download/v0.6.1/model-auth-vue-0.6.1.tgz':
-    resolution: {integrity: sha512-RlsyxKfoMA56l3RRL+kx9HL4H7BBBuFqc6jBEX/1xUmDygt7SAgNnje5rbZryOsUuM36WoptyJt/jCzSt0PKkw==, tarball: https://github.com/lsy-404/platform-kit/releases/download/v0.6.1/model-auth-vue-0.6.1.tgz}
-    version: 0.6.1
+  '@model-auth/vue@https://github.com/lsy-404/platform-kit/releases/download/model-auth-vue-v0.10.3/model-auth-vue-0.10.3.tgz':
+    resolution: {integrity: sha512-F6tseNpcpsvm6W5FC/nF0ekeU7Tjj2c+JtAbQSYr9Zedq5r6oBUmUqDryw/xP/gAlt4C3I+1i+GJY4DW4uR8FA==, tarball: https://github.com/lsy-404/platform-kit/releases/download/model-auth-vue-v0.10.3/model-auth-vue-0.10.3.tgz}
+    version: 0.10.3
     peerDependencies:
       vue: ^3.5.0
 
@@ -334,9 +334,9 @@ packages:
   '@one-ini/wasm@0.2.1':
     resolution: {integrity: sha512-TUqERXGNTifZ9y2g3wPxQrw3HpHv/02DsW3D90T9x0hhonrL1ZqpSmNrU2XkoIq0fP1N6gZfVQzy2Fw1ZvGBNg==}
 
-  '@platform-kit/fluent@https://github.com/lsy-404/platform-kit/releases/download/v0.6.4/platform-kit-fluent-0.2.3.tgz':
-    resolution: {integrity: sha512-DyTO/qbl4Fc1RcboRLx+TEWnkRE6inKTbD81yn02vH4lM4ydBi+hMFrzgchzmT9NWEi3UQTkhWHVo+KRTdr58Q==, tarball: https://github.com/lsy-404/platform-kit/releases/download/v0.6.4/platform-kit-fluent-0.2.3.tgz}
-    version: 0.2.3
+  '@platform-kit/fluent@https://github.com/lsy-404/platform-kit/releases/download/fluent-v0.2.10/platform-kit-fluent-0.2.10.tgz':
+    resolution: {integrity: sha512-pgWhnGZ3YItZGCqF+5tutYB9S8GtQRrVxpjpVSGj9LdLRK/HhRcfEUuLf6XiyiClgwA38Pf107QEOApJAHA4+g==, tarball: https://github.com/lsy-404/platform-kit/releases/download/fluent-v0.2.10/platform-kit-fluent-0.2.10.tgz}
+    version: 0.2.10
     peerDependencies:
       vue: ^3.5.0
 
@@ -1300,7 +1300,7 @@ snapshots:
 
   '@jridgewell/sourcemap-codec@1.6.0': {}
 
-  '@model-auth/vue@https://github.com/lsy-404/platform-kit/releases/download/v0.6.1/model-auth-vue-0.6.1.tgz(vue@3.5.42(typescript@5.9.3))':
+  '@model-auth/vue@https://github.com/lsy-404/platform-kit/releases/download/model-auth-vue-v0.10.3/model-auth-vue-0.10.3.tgz(vue@3.5.42(typescript@5.9.3))':
     dependencies:
       vue: 3.5.42(typescript@5.9.3)
 
@@ -1309,7 +1309,7 @@ snapshots:
 
   '@one-ini/wasm@0.2.1': {}
 
-  '@platform-kit/fluent@https://github.com/lsy-404/platform-kit/releases/download/v0.6.4/platform-kit-fluent-0.2.3.tgz(vue@3.5.42(typescript@5.9.3))':
+  '@platform-kit/fluent@https://github.com/lsy-404/platform-kit/releases/download/fluent-v0.2.10/platform-kit-fluent-0.2.10.tgz(vue@3.5.42(typescript@5.9.3))':
     dependencies:
       vue: 3.5.42(typescript@5.9.3)
 

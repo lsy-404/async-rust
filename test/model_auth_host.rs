@@ -46,7 +46,7 @@ async fn complete_host_actions_validate_keys_and_persist_metadata_only() {
     let items = connections::list(&state, "custom").unwrap();
     assert_eq!(items.len(), 2);
     assert_ne!(items[0].id, items[1].id);
-    action(&state,json!({"type":"update-credential","payload":{"providerId":"custom","credentialId":items[0].id,"enabled":false,"weight":7}})).await.unwrap();
+    action(&state,json!({"type":"update-credential","payload":{"providerId":"custom","credentialId":items[0].id,"enabled":false,"label":"Renamed","extend":{"team":"class"}}})).await.unwrap();
     action(&state,json!({"type":"update-strategy","payload":{"providerId":"custom","strategy":"weighted-round-robin"}})).await.unwrap();
     let result = auth_state(&state).unwrap();
     let encoded = serde_json::to_string(&result).unwrap();
@@ -59,7 +59,20 @@ async fn complete_host_actions_validate_keys_and_persist_metadata_only() {
         .unwrap();
     assert_eq!(p["loadStrategy"], "weighted-round-robin");
     assert_eq!(p["apiKeyCredentials"][0]["enabled"], false);
-    assert_eq!(p["apiKeyCredentials"][0]["weight"], 7);
+    assert_eq!(p["apiKeyCredentials"][0]["weight"], 1);
+    assert_eq!(p["apiKeyCredentials"][0]["label"], "Renamed");
+    assert_eq!(p["apiKeyCredentials"][0]["extend"]["team"], "class");
+    action(&state,json!({"type":"reorder-credentials","providerId":"custom","method":"api-key","credentialIds":[items[1].id,items[0].id]})).await.unwrap();
+    assert_eq!(
+        connections::list(&state, "custom").unwrap()[0].id,
+        items[1].id
+    );
+    assert!(action(&state,json!({"type":"reorder-credentials","providerId":"other","method":"api-key","credentialIds":[items[0].id]})).await.is_err());
+    assert!(action(&state,json!({"type":"reorder-credentials","providerId":"custom","method":"api-key","credentialIds":[items[0].id,items[0].id]})).await.is_err());
+    assert_eq!(
+        connections::list(&state, "custom").unwrap()[0].id,
+        items[1].id
+    );
     action(&state,json!({"type":"remove-credential","providerId":"custom","credentialId":items[0].id,"authMethod":"api-key"})).await.unwrap();
     assert_eq!(connections::list(&state, "custom").unwrap().len(), 1);
 }
@@ -180,7 +193,7 @@ async fn credential_requests_reject_cross_provider_and_disabled_credentials() {
             .await
             .is_err()
     );
-    connections::update(&state, "custom", &item.id, false, 1).unwrap();
+    connections::edit(&state, "custom", &item.id, false, None, None).unwrap();
     assert!(
         credential_for_request(&state, "custom", &item.id, CancellationToken::new())
             .await

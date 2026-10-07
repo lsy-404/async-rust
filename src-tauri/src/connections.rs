@@ -70,7 +70,10 @@ pub fn initialize(db: &Connection) -> Result<(), String> {
         provider_id TEXT PRIMARY KEY REFERENCES providers(id) ON DELETE CASCADE,
         oauth_enabled INTEGER NOT NULL DEFAULT 1,
         strategy TEXT NOT NULL DEFAULT 'round-robin' CHECK(strategy IN ('round-robin','weighted-round-robin','failover')),
-        cursor INTEGER NOT NULL DEFAULT 0, catalog_error TEXT, checked_at INTEGER);").map_err(storage)
+        cursor INTEGER NOT NULL DEFAULT 0, catalog_error TEXT, checked_at INTEGER);
+        CREATE TABLE IF NOT EXISTS credential_options(
+        credential_id TEXT PRIMARY KEY REFERENCES credentials(id) ON DELETE CASCADE,
+        position INTEGER, extend_json TEXT NOT NULL DEFAULT '{}');").map_err(storage)
 }
 fn require_provider(db: &Connection, provider_id: &str) -> Result<(), String> {
     if !db
@@ -104,7 +107,7 @@ fn row_credential(row: &rusqlite::Row<'_>) -> rusqlite::Result<Credential> {
     })
 }
 fn list_db(db: &Connection, provider_id: &str) -> Result<Vec<Credential>, String> {
-    let mut statement = db.prepare("SELECT id,provider_id,auth_method,label,account,enabled,healthy,weight,cooldown_until,models_json FROM credentials WHERE provider_id=? ORDER BY rowid").map_err(storage)?;
+    let mut statement = db.prepare("SELECT c.id,c.provider_id,c.auth_method,c.label,c.account,c.enabled,c.healthy,c.weight,c.cooldown_until,c.models_json FROM credentials c LEFT JOIN credential_options o ON o.credential_id=c.id WHERE c.provider_id=? ORDER BY o.position IS NULL,o.position,c.rowid").map_err(storage)?;
     let rows = statement
         .query_map([provider_id], row_credential)
         .map_err(storage)?;
@@ -299,25 +302,93 @@ pub fn remove(
     }
     Ok(())
 }
-pub fn update(
+pub fn edit(
     state: &AppState,
     provider_id: &str,
     credential_id: &str,
     enabled: bool,
-    weight: u32,
+    label: Option<&str>,
+    extend: Option<&serde_json::Map<String, Value>>,
 ) -> Result<(), String> {
-    if !(1..=100).contains(&weight) {
-        return Err("凭据权重必须是 1 到 100 的整数。".into());
+    let item = get(state, provider_id, credential_id)?;
+    let label = label.unwrap_or(&item.label).trim();
+    if label.is_empty() || label.chars().count() > 80 {
+        return Err("凭据名称必须是 1 到 80 个字符。".into());
     }
-    get(state, provider_id, credential_id)?;
-    let db = state.db()?;
-    db.execute(
-        "UPDATE credentials SET enabled=?,weight=?,balance=0 WHERE id=? AND provider_id=?",
-        params![enabled, weight, credential_id, provider_id],
+    if extend.is_some_and(|values| {
+        values
+            .values()
+            .any(|value| value.is_array() || value.is_object())
+    }) {
+        return Err("附加信息只能包含字符串、数字、布尔值或 null。".into());
+    }
+    let mut db = state.db()?;
+    let tx = db
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(storage)?;
+    tx.execute(
+        "UPDATE credentials SET enabled=?,label=?,balance=0 WHERE id=? AND provider_id=?",
+        params![enabled, label, credential_id, provider_id],
     )
     .map_err(storage)?;
-    Ok(())
+    if let Some(extend) = extend {
+        let encoded = serde_json::to_string(extend).map_err(|error| error.to_string())?;
+        tx.execute("INSERT INTO credential_options(credential_id,extend_json) VALUES(?,?) ON CONFLICT(credential_id) DO UPDATE SET extend_json=excluded.extend_json", params![credential_id,encoded]).map_err(storage)?;
+    }
+    tx.commit().map_err(storage)
 }
+
+pub fn extend(state: &AppState, credential_id: &str) -> Result<Value, String> {
+    let encoded: Option<String> = state
+        .db()?
+        .query_row(
+            "SELECT extend_json FROM credential_options WHERE credential_id=?",
+            [credential_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    encoded
+        .map(|value| serde_json::from_str(&value).map_err(|error| error.to_string()))
+        .unwrap_or_else(|| Ok(json!({})))
+}
+
+pub fn reorder(
+    state: &AppState,
+    provider_id: &str,
+    method: &str,
+    credential_ids: &[String],
+) -> Result<(), String> {
+    if !matches!(method, "oauth" | "api-key") {
+        return Err("无效的授权方式。".into());
+    }
+    let mut db = state.db()?;
+    let tx = db
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(storage)?;
+    require_provider(&tx, provider_id)?;
+    let mut expected: Vec<_> = list_db(&tx, provider_id)?
+        .into_iter()
+        .filter(|item| item.auth_method == method)
+        .map(|item| item.id)
+        .collect();
+    expected.sort();
+    let mut supplied = credential_ids.to_vec();
+    supplied.sort();
+    if expected != supplied {
+        return Err("排序必须包含此供应商授权方式的全部凭据且不能重复。".into());
+    }
+    for (position, id) in credential_ids.iter().enumerate() {
+        tx.execute("INSERT INTO credential_options(credential_id,position) VALUES(?,?) ON CONFLICT(credential_id) DO UPDATE SET position=excluded.position", params![id,position as i64]).map_err(storage)?;
+    }
+    tx.execute(
+        "UPDATE provider_auth SET cursor=0 WHERE provider_id=?",
+        [provider_id],
+    )
+    .map_err(storage)?;
+    tx.commit().map_err(storage)
+}
+
 pub fn set_oauth_enabled(state: &AppState, provider_id: &str, enabled: bool) -> Result<(), String> {
     let db = state.db()?;
     require_provider(&db, provider_id)?;
